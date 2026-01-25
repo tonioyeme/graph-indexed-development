@@ -27,6 +27,13 @@ This graph serves as a *Single Source of Truth* that is both human-readable and 
 
 Toni Tang (tonitang273@gmail.com)
 
+## Related Repositories
+
+- [GID Methodology](https://github.com/tonioyeme/graph-indexed-development-principle) - Specification and guides
+- [GID CLI](https://github.com/tonioyeme/graph-indexed-development-cli) - Implementation
+
 ## License
 
-This work is provided for academic and educational purposes.
+This paper is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
+For implementation licensing, see the [GID CLI repository](https://github.com/tonioyeme/graph-indexed-development-cli).
