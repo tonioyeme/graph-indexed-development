@@ -135,13 +135,13 @@ The C4 Model \cite{c4model} provides hierarchical views (Context, Container, Com
 
 \subsection{Program Analysis}
 
-Static analysis tools extract dependency graphs from source code. Tools like \texttt{madge} \cite{madge} (JavaScript), \texttt{pydeps} (Python), and Language Server Protocol implementations provide import-level dependencies. GID builds on these for automatic extraction but adds semantic layers---features, architectural boundaries, implementation relationships---that cannot be inferred from syntax alone.
+Static analysis tools extract dependency graphs from source code. Tools like \texttt{madge} \cite{madge} (JavaScript), \texttt{pydeps} (Python), and Language Server Protocol implementations provide import-level dependencies. GID builds on these for automatic extraction but adds semantic layers---features, architectural boundaries, implementation relationships---that cannot be inferred from syntax alone, , echoing the goals of software reflexion models \cite{murphy1995reflexion} which bridge high-level design and source code.
 
 \subsection{Knowledge Graphs}
 
 Knowledge graphs represent entities as typed nodes with semantic edges \cite{hogan2021}. GID applies this paradigm to software systems with a domain-specific schema optimized for engineering queries: impact analysis, dependency traversal, and test coverage mapping.
 
-Recent work like DepsRAG \cite{depsrag2024} uses knowledge graphs for \emph{external} dependency management---helping developers reason about third-party packages (npm, PyPI, Cargo) before importing them. GID addresses a complementary problem: representing \emph{internal} architecture for impact analysis and AI-assisted development. While DepsRAG asks ``Should I use this library?'', GID asks ``What breaks if I change this component?''
+Recent work like DepsRAG \cite{depsrag2024} uses knowledge graphs for \emph{external} dependency management---helping developers reason about third-party packages (npm, PyPI, Cargo) before importing them. Similarly, Paper2Code \cite{paper2code2025} and CodePlan \cite{codeplan2023} employ multi-agent systems and planning algorithms to automate repository-level code generation. GID addresses a complementary problem: representing \emph{internal} architecture for impact analysis and AI-assisted development. While DepsRAG asks ``Should I use this library?'', GID asks ``What breaks if I change this component?''
 
 \subsection{AI-Assisted Development}
 
