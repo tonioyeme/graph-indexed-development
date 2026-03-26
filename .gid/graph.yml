@@ -1,0 +1,224 @@
+project:
+  name: gid-rs
+  description: Rust GID CLI & Library — unified graph-indexed development tool
+nodes:
+- id: workspace-setup
+  title: Cargo workspace + gid-core + gid-cli crates
+  status: done
+  description: Init Cargo.toml workspace with two crates. Add serde, serde_yaml, clap deps.
+  tags:
+  - p0
+  - infra
+- id: graph-types
+  title: 'Core graph types: Node, Edge, TaskGraph, GraphSummary'
+  status: done
+  description: Port from rustclaw/gid.rs. TaskNode, TaskEdge, GidTaskStatus, TaskGraph struct.
+  tags:
+  - p0
+  - core
+- id: yaml-io
+  title: YAML load/save compatible with existing .gid/graph.yml
+  status: done
+  description: Parse existing graph.yml files. Must handle both task-graph and code-graph formats.
+  tags:
+  - p0
+  - core
+- id: graph-crud
+  title: 'Graph CRUD: add/remove/update nodes and edges'
+  status: done
+  description: Port from rustclaw/gid.rs. add_task, remove_task, update_status, add_edge, remove_edges.
+  tags:
+  - p0
+  - core
+- id: query-engine
+  title: 'Query engine: impact, deps, common-cause, path'
+  status: done
+  description: Port impact analysis from swebench working_memory + query logic from rustclaw. Topological sort, BFS traversal.
+  tags:
+  - p0
+  - core
+- id: task-management
+  title: 'Task commands: tasks, task_update, complete'
+  status: done
+  description: List tasks with status filter, update task status/fields, mark complete with cascading deps.
+  tags:
+  - p0
+  - core
+- id: cli-basic
+  title: 'CLI with clap: init, read, tasks, task-update, query subcommands'
+  status: done
+  description: Wire gid-core to clap CLI. gid init, gid read, gid tasks, gid task-update, gid query impact/deps/path.
+  tags:
+  - p0
+  - cli
+- id: edit-graph
+  title: 'edit_graph: batch operations (add/remove/rename nodes+edges)'
+  status: done
+  description: Port gid_edit_graph from GID MCP. Parse operation strings, apply to graph atomically.
+  tags:
+  - p0
+  - core
+- id: code-graph
+  title: 'CodeGraph: extract code dependencies from source'
+  status: done
+  description: Port from swebench repo_map.rs (3337 lines). Parse imports, function calls, class inheritance. Multi-language.
+  tags:
+  - p1
+  - code-intel
+- id: unified-graph
+  title: 'Unified graph: merge CodeGraph + TaskGraph'
+  status: done
+  description: Port from swebench unified_graph.rs. Code nodes + LLM-generated tasks in one graph.
+  tags:
+  - p1
+  - code-intel
+- id: working-memory
+  title: 'Working memory context: files_changed → affected nodes'
+  status: done
+  description: Port from swebench working_memory.rs. GidContext struct, query_gid_context function.
+  tags:
+  - p1
+  - code-intel
+- id: cli-code
+  title: 'CLI: extract, analyze commands'
+  status: done
+  description: gid extract <dir>, gid analyze <file>. Wire code-graph to CLI.
+  tags:
+  - p1
+  - cli
+- id: design-cmd
+  title: 'AI-assisted design: requirements → graph'
+  status: done
+  description: Port gid_design from GID MCP. LLM generates graph from natural language requirements.
+  tags:
+  - p2
+  - ai
+- id: advise-cmd
+  title: Graph validation + improvement suggestions
+  status: done
+  description: Port gid_advise. Circular deps, orphans, layer violations, coupling analysis.
+  tags:
+  - p2
+  - ai
+- id: visual-cmd
+  title: Graph visualization (terminal or browser)
+  status: done
+  description: Port gid_visual. ASCII art for terminal, HTML/SVG for browser.
+  tags:
+  - p2
+  - output
+- id: rustclaw-integration
+  title: RustClaw uses gid-core as dependency
+  status: done
+  description: Replace rustclaw/src/gid.rs with gid-core crate dependency. Native tools call gid-core directly.
+  tags:
+  - p3
+  - integration
+- id: gidterm-integration
+  title: gidterm uses gid-core as dependency
+  status: todo
+  description: Replace gidterm's graph parsing with gid-core. Shared types and logic.
+  tags:
+  - p3
+  - integration
+- id: mcp-server
+  title: MCP server mode using gid-core backend
+  status: todo
+  description: 'Optional: gid serve starts MCP server backed by gid-core. Replaces TypeScript MCP server.'
+  tags:
+  - p3
+  - integration
+- id: history
+  title: 'History: snapshots, diff, restore'
+  status: done
+  tags:
+  - p2
+  - core
+- id: refactor
+  title: 'Refactor: rename, merge, split, extract'
+  status: done
+  tags:
+  - p2
+  - core
+- id: semantify
+  title: 'Semantify: upgrade file-level to semantic graph'
+  status: done
+  tags:
+  - p2
+  - ai
+- id: ignore-list
+  title: 'Ignore-list: .gidignore support'
+  status: done
+  tags:
+  - p2
+  - core
+- id: json-output
+  title: JSON global output flag for CLI
+  status: done
+  tags:
+  - p2
+  - cli
+edges:
+- from: graph-types
+  to: workspace-setup
+  relation: depends_on
+- from: yaml-io
+  to: graph-types
+  relation: depends_on
+- from: graph-crud
+  to: yaml-io
+  relation: depends_on
+- from: query-engine
+  to: graph-types
+  relation: depends_on
+- from: task-management
+  to: graph-crud
+  relation: depends_on
+- from: edit-graph
+  to: graph-crud
+  relation: depends_on
+- from: cli-basic
+  to: task-management
+  relation: depends_on
+- from: cli-basic
+  to: query-engine
+  relation: depends_on
+- from: cli-basic
+  to: edit-graph
+  relation: depends_on
+- from: code-graph
+  to: graph-types
+  relation: depends_on
+- from: unified-graph
+  to: code-graph
+  relation: depends_on
+- from: unified-graph
+  to: task-management
+  relation: depends_on
+- from: working-memory
+  to: code-graph
+  relation: depends_on
+- from: cli-code
+  to: code-graph
+  relation: depends_on
+- from: cli-code
+  to: cli-basic
+  relation: depends_on
+- from: design-cmd
+  to: cli-basic
+  relation: depends_on
+- from: advise-cmd
+  to: query-engine
+  relation: depends_on
+- from: visual-cmd
+  to: graph-types
+  relation: depends_on
+- from: rustclaw-integration
+  to: cli-basic
+  relation: depends_on
+- from: gidterm-integration
+  to: cli-basic
+  relation: depends_on
+- from: mcp-server
+  to: cli-basic
+  relation: depends_on

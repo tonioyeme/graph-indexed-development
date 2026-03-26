@@ -1,0 +1,16 @@
+{
+  "name": "gid-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GID - Graph Indexed Development monorepo (Rust core + TypeScript packages)",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "author": "Toni Tang",
+  "license": "AGPL-3.0-or-later"
+}

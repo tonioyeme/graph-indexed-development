@@ -1,0 +1,16 @@
+# Rust
+target/
+
+# Node.js / TypeScript
+node_modules/
+dist/
+packages/*/node_modules/
+packages/*/dist/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
