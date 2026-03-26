@@ -224,17 +224,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gid-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "gid-core",
- "serde_json",
- "serde_yaml",
-]
-
-[[package]]
 name = "gid-core"
 version = "0.1.0"
 dependencies = [
@@ -249,6 +238,17 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-python",
  "walkdir",
+]
+
+[[package]]
+name = "gid-dev-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gid-core",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

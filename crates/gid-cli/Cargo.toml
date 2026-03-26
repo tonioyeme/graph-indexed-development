@@ -1,5 +1,5 @@
 [package]
-name = "gid-cli"
+name = "gid-dev-cli"
 version = "0.1.0"
 edition = "2021"
 description = "Graph-Indexed Development CLI — graph-based project management and code analysis tool for AI agents"
