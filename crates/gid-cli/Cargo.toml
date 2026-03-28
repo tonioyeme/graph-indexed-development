@@ -1,6 +1,6 @@
 [package]
 name = "gid-dev-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Graph-Indexed Development CLI — graph-based project management and code analysis tool for AI agents"
 license = "MIT"
@@ -13,7 +13,7 @@ name = "gid"
 path = "src/main.rs"
 
 [dependencies]
-gid-core = { path = "../gid-core", version = "0.1.0" }
+gid-core = { path = "../gid-core", version = "0.2.0" }
 clap = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
