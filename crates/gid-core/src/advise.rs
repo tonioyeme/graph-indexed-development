@@ -157,6 +157,9 @@ impl std::fmt::Display for AnalysisResult {
 pub fn analyze(graph: &Graph) -> AnalysisResult {
     let mut items = Vec::new();
     
+    // Code node types — auto-extracted, different rules than project nodes
+    let code_node_types = ["file", "class", "function", "module"];
+    
     // Run validator first
     let validator = Validator::new(graph);
     let validation = validator.validate();
@@ -196,50 +199,75 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
         });
     }
     
-    // Orphan nodes
+    // Orphan nodes — only warn for project-level nodes, not code nodes
     for orphan in &validation.orphan_nodes {
-        items.push(Advice {
-            advice_type: AdviceType::OrphanNode,
-            severity: Severity::Warning,
-            message: format!("Node '{}' has no connections", orphan),
-            nodes: vec![orphan.clone()],
-            suggestion: Some("Connect to related nodes or remove if unused.".to_string()),
-        });
+        let is_code_orphan = orphan.starts_with("code_") 
+            || orphan.starts_with("const_") 
+            || orphan.starts_with("method_")
+            || graph.get_node(orphan)
+                .and_then(|n| n.node_type.as_deref())
+                .map(|t| code_node_types.contains(&t))
+                .unwrap_or(false);
+        
+        if !is_code_orphan {
+            items.push(Advice {
+                advice_type: AdviceType::OrphanNode,
+                severity: Severity::Warning,
+                message: format!("Node '{}' has no connections", orphan),
+                nodes: vec![orphan.clone()],
+                suggestion: Some("Connect to related nodes or remove if unused.".to_string()),
+            });
+        }
     }
     
     // Additional analysis
     
-    // High fan-in/fan-out analysis
+    // High fan-in/fan-out analysis — only for project-level nodes
+    // Code-level coupling (imports, calls, defined_in) is structural and expected
     let (fan_in, fan_out) = compute_fan_metrics(graph);
     const HIGH_FAN_THRESHOLD: usize = 5;
     
     for (node_id, count) in &fan_in {
         if *count >= HIGH_FAN_THRESHOLD {
-            items.push(Advice {
-                advice_type: AdviceType::HighFanIn,
-                severity: Severity::Warning,
-                message: format!("Node '{}' has {} dependents (high coupling)", node_id, count),
-                nodes: vec![node_id.clone()],
-                suggestion: Some("Consider splitting into smaller components or introducing an abstraction layer.".to_string()),
-            });
+            let is_code = node_id.starts_with("code_") || node_id.starts_with("const_");
+            if !is_code {
+                items.push(Advice {
+                    advice_type: AdviceType::HighFanIn,
+                    severity: Severity::Warning,
+                    message: format!("Node '{}' has {} dependents (high coupling)", node_id, count),
+                    nodes: vec![node_id.clone()],
+                    suggestion: Some("Consider splitting into smaller components or introducing an abstraction layer.".to_string()),
+                });
+            }
         }
     }
     
     for (node_id, count) in &fan_out {
         if *count >= HIGH_FAN_THRESHOLD {
-            items.push(Advice {
-                advice_type: AdviceType::HighFanOut,
-                severity: Severity::Warning,
-                message: format!("Node '{}' depends on {} other nodes (high coupling)", node_id, count),
-                nodes: vec![node_id.clone()],
-                suggestion: Some("Consider reducing dependencies or introducing a facade.".to_string()),
-            });
+            let is_code = node_id.starts_with("code_") || node_id.starts_with("const_");
+            if !is_code {
+                items.push(Advice {
+                    advice_type: AdviceType::HighFanOut,
+                    severity: Severity::Warning,
+                    message: format!("Node '{}' depends on {} other nodes (high coupling)", node_id, count),
+                    nodes: vec![node_id.clone()],
+                    suggestion: Some("Consider reducing dependencies or introducing a facade.".to_string()),
+                });
+            }
         }
     }
     
-    // Missing descriptions
+    // Missing descriptions — only for project-level nodes (task, component, feature)
+    // Code nodes (file, class, function, module) are auto-extracted and don't need descriptions
     for node in &graph.nodes {
-        if node.description.is_none() && node.node_type.as_deref() != Some("file") {
+        let is_code_node = node.node_type.as_deref()
+            .map(|t| code_node_types.contains(&t))
+            .unwrap_or(false)
+            || node.id.starts_with("code_")
+            || node.id.starts_with("const_")
+            || node.id.starts_with("method_");
+        
+        if node.description.is_none() && !is_code_node {
             items.push(Advice {
                 advice_type: AdviceType::MissingDescription,
                 severity: Severity::Info,
@@ -330,16 +358,17 @@ pub fn analyze(graph: &Graph) -> AnalysisResult {
     // Sort by severity (errors first)
     items.sort_by(|a, b| b.severity.cmp(&a.severity));
     
-    // Calculate health score
+    // Calculate health score based on severity
     let error_count = items.iter().filter(|a| a.severity == Severity::Error).count();
     let warning_count = items.iter().filter(|a| a.severity == Severity::Warning).count();
     let info_count = items.iter().filter(|a| a.severity == Severity::Info).count();
     
-    // Base score of 100, deduct for issues
+    // Scoring: errors are critical, warnings matter, info is advisory
+    // Cap deductions so a few info items don't tank the score
     let mut score = 100i32;
-    score -= (error_count * 20) as i32;      // -20 per error
-    score -= (warning_count * 5) as i32;     // -5 per warning
-    score -= (info_count * 1) as i32;        // -1 per info
+    score -= (error_count * 25) as i32;          // -25 per error (critical)
+    score -= (warning_count * 10) as i32;        // -10 per warning (significant)
+    score -= (info_count.min(10) * 2) as i32;    // -2 per info, max -20 (advisory, capped)
     let health_score = score.max(0).min(100) as u8;
     
     AnalysisResult {
