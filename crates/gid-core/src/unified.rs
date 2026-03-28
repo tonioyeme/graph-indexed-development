@@ -14,20 +14,21 @@ use std::collections::HashMap;
 /// Code edges become task edges with appropriate relation strings.
 pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph {
     let mut nodes = Vec::new();
+    let mut seen_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_edges: std::collections::HashSet<(String, String, String)> = std::collections::HashSet::new();
     let mut edges = Vec::new();
     
     // Track existing task node IDs to avoid duplicates
-    let task_ids: std::collections::HashSet<String> = task_graph.nodes.iter()
-        .map(|n| n.id.clone())
-        .collect();
+    for task_node in &task_graph.nodes {
+        seen_node_ids.insert(task_node.id.clone());
+    }
     
-    // Convert code nodes to task nodes
+    // Convert code nodes to task nodes (with dedup)
     for code_node in &code_graph.nodes {
-        // Generate a clean ID for the unified graph
         let id = code_node_to_task_id(&code_node.id);
         
-        // Skip if task graph already has a node with this ID
-        if task_ids.contains(&id) {
+        // Skip duplicates (same code node extracted twice, e.g. trait def + impl)
+        if !seen_node_ids.insert(id.clone()) {
             continue;
         }
         
@@ -51,7 +52,7 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         nodes.push(Node {
             id,
             title: code_node.name.clone(),
-            status: NodeStatus::Done, // Code exists, so it's "done"
+            status: NodeStatus::Done,
             description: code_node.docstring.clone(),
             assigned_to: None,
             tags: if code_node.is_test { vec!["test".to_string()] } else { vec![] },
@@ -67,10 +68,15 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         nodes.push(task_node.clone());
     }
     
-    // Convert code edges
+    // Convert code edges (with dedup, skip edges referencing non-existent nodes)
     for code_edge in &code_graph.edges {
         let from = code_node_to_task_id(&code_edge.from);
         let to = code_node_to_task_id(&code_edge.to);
+        
+        // Skip edges that reference nodes not in the graph
+        if !seen_node_ids.contains(&from) || !seen_node_ids.contains(&to) {
+            continue;
+        }
         
         let relation = match code_edge.relation {
             EdgeRelation::Imports => "imports",
@@ -81,6 +87,11 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
             EdgeRelation::Overrides => "overrides",
         };
         
+        let edge_key = (from.clone(), to.clone(), relation.to_string());
+        if !seen_edges.insert(edge_key) {
+            continue; // Skip duplicate edge
+        }
+        
         edges.push(Edge {
             from,
             to,
@@ -89,8 +100,12 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         });
     }
     
-    // Add all task edges
+    // Add task edges (with dedup)
     for task_edge in &task_graph.edges {
+        let edge_key = (task_edge.from.clone(), task_edge.to.clone(), task_edge.relation.clone());
+        if !seen_edges.insert(edge_key) {
+            continue;
+        }
         edges.push(task_edge.clone());
     }
     
