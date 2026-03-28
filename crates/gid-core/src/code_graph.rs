@@ -3619,7 +3619,7 @@ fn extract_rust_node(
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 match child.kind() {
-                    "type_identifier" | "generic_type" => {
+                    "type_identifier" | "generic_type" | "primitive_type" | "scoped_type_identifier" => {
                         // This could be either the trait or the type
                         let name = if child.kind() == "generic_type" {
                             // Get the base type from generic: Vec<T> -> Vec
@@ -3627,6 +3627,11 @@ fn extract_rust_node(
                                 .and_then(|n| n.utf8_text(source).ok())
                                 .unwrap_or("")
                                 .to_string()
+                        } else if child.kind() == "scoped_type_identifier" {
+                            // Handle paths like std::fmt::Display -> Display
+                            child.utf8_text(source).ok()
+                                .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+                                .unwrap_or_default()
                         } else {
                             text(child)
                         };
