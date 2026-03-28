@@ -1,10 +1,15 @@
 //! Code Graph Extraction — extract code dependencies from source files
 //!
-//! Multi-language support with tree-sitter AST parsing for Python,
-//! and regex-based parsing for Rust/TypeScript.
+//! Multi-language support with tree-sitter AST parsing for Python, Rust, and TypeScript.
 //! Builds a code structure graph:
-//! - Nodes: files, classes/structs, functions/methods
+//! - Nodes: files, classes/structs/traits, functions/methods
 //! - Edges: imports, calls, inherits, defined_in
+//!
+//! Rust extraction handles: structs, enums, traits, impl blocks (with method-type association),
+//! functions, modules, type aliases, const/static items, and macros.
+//!
+//! TypeScript/JavaScript extraction handles: classes, interfaces, functions, arrow functions,
+//! enums, type aliases, namespaces, and export statements.
 
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -407,8 +412,24 @@ impl CodeGraph {
                         &mut class_map,
                     )
                 }
-                Language::Rust => extract_rust(rel_path, content),
-                Language::TypeScript => extract_typescript(rel_path, content),
+                Language::Rust => {
+                    extract_rust_tree_sitter(
+                        rel_path,
+                        content,
+                        &mut parser,
+                        &mut class_map,
+                    )
+                }
+                Language::TypeScript => {
+                    let ext = rel_path.rsplit('.').next().unwrap_or("ts");
+                    extract_typescript_tree_sitter(
+                        rel_path,
+                        content,
+                        &mut parser,
+                        &mut class_map,
+                        ext,
+                    )
+                }
                 Language::Unknown => continue,
             };
 
@@ -3372,8 +3393,1181 @@ fn add_override_edges(nodes: &[CodeNode], edges: &mut Vec<CodeEdge>) {
 
 // ═══ Language-Specific Extractors (Rust, TypeScript) ═══
 
-/// Extract from Rust source (regex-based).
-fn extract_rust(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+// ─── Rust Tree-Sitter Extraction ───
+
+/// Extract from Rust source using tree-sitter AST parsing.
+/// Handles structs, enums, traits, impl blocks, functions, modules, and type aliases.
+fn extract_rust_tree_sitter(
+    path: &str,
+    content: &str,
+    parser: &mut Parser,
+    class_id_map: &mut HashMap<String, String>,
+) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut imports = HashSet::new();
+
+    // Set language for parser
+    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_err() {
+        return (nodes, edges, imports);
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return (nodes, edges, imports),
+    };
+
+    let file_id = format!("file:{}", path);
+    let source = content.as_bytes();
+    let root = tree.root_node();
+
+    // Track impl blocks to associate methods with types
+    let mut impl_target_map: HashMap<String, String> = HashMap::new();
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        extract_rust_node(
+            child,
+            source,
+            content,
+            path,
+            &file_id,
+            &mut nodes,
+            &mut edges,
+            class_id_map,
+            &mut impl_target_map,
+            &mut imports,
+            "",  // no parent module prefix at root
+        );
+    }
+
+    (nodes, edges, imports)
+}
+
+/// Recursively extract Rust nodes from AST
+fn extract_rust_node(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_str: &str,
+    path: &str,
+    file_id: &str,
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+    class_id_map: &mut HashMap<String, String>,
+    impl_target_map: &mut HashMap<String, String>,
+    imports: &mut HashSet<String>,
+    module_prefix: &str,
+) {
+    let text = |n: tree_sitter::Node| -> String {
+        n.utf8_text(source).unwrap_or("").to_string()
+    };
+
+    match node.kind() {
+        "use_declaration" => {
+            // Extract import path
+            let use_text = text(node);
+            // Parse: use crate::foo::bar; or use std::collections::HashMap;
+            if let Some(path_part) = use_text.strip_prefix("use ") {
+                let clean_path = path_part.trim_end_matches(';').trim();
+                // Skip std/core library imports
+                if !clean_path.starts_with("std::") && !clean_path.starts_with("core::") && !clean_path.starts_with("alloc::") {
+                    // Handle use paths with braces: use foo::{bar, baz}
+                    let module = if clean_path.contains('{') {
+                        clean_path.split("::").next().unwrap_or(clean_path).to_string()
+                    } else {
+                        clean_path.split("::").take(2).collect::<Vec<_>>().join("::")
+                    };
+                    if !module.is_empty() {
+                        edges.push(CodeEdge {
+                            from: file_id.to_string(),
+                            to: format!("module_ref:{}", module),
+                            relation: EdgeRelation::Imports,
+                            weight: 0.5,
+                            call_count: 1,
+                            in_error_path: false,
+                            confidence: 1.0,
+                        });
+                        imports.insert(module);
+                    }
+                }
+            }
+        }
+
+        "struct_item" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let class_id = format!("class:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+            let docstring = extract_rust_docstring(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: class_id.clone(),
+                kind: NodeKind::Class,
+                name: full_name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring,
+                line_count,
+                is_test: path.contains("/tests/") || full_name.contains("Test"),
+            });
+
+            edges.push(CodeEdge::defined_in(&class_id, file_id));
+            class_id_map.insert(name.clone(), class_id);
+        }
+
+        "enum_item" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let class_id = format!("class:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+            let docstring = extract_rust_docstring(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: class_id.clone(),
+                kind: NodeKind::Class,
+                name: full_name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring,
+                line_count,
+                is_test: path.contains("/tests/") || full_name.contains("Test"),
+            });
+
+            edges.push(CodeEdge::defined_in(&class_id, file_id));
+            class_id_map.insert(name.clone(), class_id);
+        }
+
+        "trait_item" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let trait_id = format!("class:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+            let docstring = extract_rust_docstring(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: trait_id.clone(),
+                kind: NodeKind::Class,
+                name: full_name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring,
+                line_count,
+                is_test: path.contains("/tests/") || full_name.contains("Test"),
+            });
+
+            edges.push(CodeEdge::defined_in(&trait_id, file_id));
+            class_id_map.insert(name.clone(), trait_id.clone());
+
+            // Extract trait methods
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut body_cursor = body.walk();
+                for body_child in body.children(&mut body_cursor) {
+                    if body_child.kind() == "function_item" || body_child.kind() == "function_signature_item" {
+                        extract_rust_method(body_child, source, source_str, path, &trait_id, nodes, edges);
+                    }
+                }
+            }
+        }
+
+        "impl_item" => {
+            // Determine the target type and optional trait
+            let mut trait_name: Option<String> = None;
+            let mut type_name: Option<String> = None;
+
+            // Parse impl structure: impl [Trait for] Type
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "type_identifier" | "generic_type" => {
+                        // This could be either the trait or the type
+                        let name = if child.kind() == "generic_type" {
+                            // Get the base type from generic: Vec<T> -> Vec
+                            child.child_by_field_name("type")
+                                .and_then(|n| n.utf8_text(source).ok())
+                                .unwrap_or("")
+                                .to_string()
+                        } else {
+                            text(child)
+                        };
+                        
+                        if type_name.is_none() {
+                            type_name = Some(name);
+                        } else if trait_name.is_none() {
+                            // If we already have a type, this first one was actually the trait
+                            trait_name = type_name.take();
+                            type_name = Some(name);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let type_name = match type_name {
+                Some(n) => n,
+                None => return,
+            };
+
+            // Look for existing type node or create reference
+            let type_id = class_id_map.get(&type_name)
+                .cloned()
+                .unwrap_or_else(|| format!("class:{}:{}", path, type_name));
+
+            // If this is a trait impl, add inheritance edge
+            if let Some(ref trait_n) = trait_name {
+                edges.push(CodeEdge {
+                    from: type_id.clone(),
+                    to: format!("class_ref:{}", trait_n),
+                    relation: EdgeRelation::Inherits,
+                    weight: 0.5,
+                    call_count: 1,
+                    in_error_path: false,
+                    confidence: 1.0,
+                });
+            }
+
+            // Extract methods from impl block
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut body_cursor = body.walk();
+                for body_child in body.children(&mut body_cursor) {
+                    if body_child.kind() == "function_item" {
+                        extract_rust_method(body_child, source, source_str, path, &type_id, nodes, edges);
+                    }
+                }
+            }
+        }
+
+        "function_item" => {
+            // Top-level function (not in impl block)
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let func_id = format!("func:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+            let docstring = extract_rust_docstring(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+            let is_test = path.contains("/tests/") || full_name.starts_with("test_") ||
+                extract_rust_attributes(node, source).iter().any(|a| a.contains("test"));
+
+            nodes.push(CodeNode {
+                id: func_id.clone(),
+                kind: NodeKind::Function,
+                name: full_name,
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring,
+                line_count,
+                is_test,
+            });
+
+            edges.push(CodeEdge::defined_in(&func_id, file_id));
+        }
+
+        "mod_item" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let new_prefix = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+
+            // If module has a body (inline module), recurse into it
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut body_cursor = body.walk();
+                for body_child in body.children(&mut body_cursor) {
+                    extract_rust_node(
+                        body_child,
+                        source,
+                        source_str,
+                        path,
+                        file_id,
+                        nodes,
+                        edges,
+                        class_id_map,
+                        impl_target_map,
+                        imports,
+                        &new_prefix,
+                    );
+                }
+            }
+        }
+
+        "type_item" => {
+            // Type alias: type Foo = Bar;
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let type_id = format!("class:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: type_id.clone(),
+                kind: NodeKind::Class,
+                name: full_name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring: None,
+                line_count,
+                is_test: false,
+            });
+
+            edges.push(CodeEdge::defined_in(&type_id, file_id));
+            class_id_map.insert(name, type_id);
+        }
+
+        "const_item" | "static_item" => {
+            // Optional: track const/static as class-like nodes
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() || name.starts_with('_') { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let const_id = format!("const:{}:{}", path, full_name);
+
+            let signature = extract_rust_signature(node, source_str);
+
+            nodes.push(CodeNode {
+                id: const_id.clone(),
+                kind: NodeKind::Class,  // Treat as class for graph purposes
+                name: full_name,
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: extract_rust_attributes(node, source),
+                signature,
+                docstring: None,
+                line_count: 1,
+                is_test: false,
+            });
+
+            edges.push(CodeEdge::defined_in(&const_id, file_id));
+        }
+
+        "macro_definition" => {
+            // macro_rules! foo { ... }
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let full_name = if module_prefix.is_empty() { name.clone() } else { format!("{}::{}", module_prefix, name) };
+            let line = node.start_position().row + 1;
+            let macro_id = format!("macro:{}:{}", path, full_name);
+
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: macro_id.clone(),
+                kind: NodeKind::Function,  // Treat macros as function-like
+                name: format!("{}!", full_name),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: vec!["macro".to_string()],
+                signature: Some(format!("macro_rules! {}", name)),
+                docstring: extract_rust_docstring(node, source_str),
+                line_count,
+                is_test: false,
+            });
+
+            edges.push(CodeEdge::defined_in(&macro_id, file_id));
+        }
+
+        _ => {}
+    }
+}
+
+/// Extract method from impl or trait block
+fn extract_rust_method(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_str: &str,
+    path: &str,
+    parent_id: &str,
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    let name = node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() { return; }
+
+    let line = node.start_position().row + 1;
+    let method_id = format!("method:{}:{}", path, name);
+
+    let signature = extract_rust_signature(node, source_str);
+    let docstring = extract_rust_docstring(node, source_str);
+    let line_count = node.end_position().row - node.start_position().row + 1;
+    let attrs = extract_rust_attributes(node, source);
+    let is_test = path.contains("/tests/") || name.starts_with("test_") ||
+        attrs.iter().any(|a| a.contains("test"));
+
+    nodes.push(CodeNode {
+        id: method_id.clone(),
+        kind: NodeKind::Function,
+        name,
+        file_path: path.to_string(),
+        line: Some(line),
+        decorators: attrs,
+        signature,
+        docstring,
+        line_count,
+        is_test,
+    });
+
+    edges.push(CodeEdge {
+        from: method_id,
+        to: parent_id.to_string(),
+        relation: EdgeRelation::DefinedIn,
+        weight: 0.5,
+        call_count: 1,
+        in_error_path: false,
+        confidence: 1.0,
+    });
+}
+
+/// Extract Rust attributes (#[...])
+fn extract_rust_attributes(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut attrs = Vec::new();
+    // Look for attribute_item siblings before this node
+    if let Some(parent) = node.parent() {
+        let mut cursor = parent.walk();
+        let mut prev_was_attr = false;
+        for child in parent.children(&mut cursor) {
+            if child.kind() == "attribute_item" {
+                if let Ok(attr_text) = child.utf8_text(source) {
+                    let clean = attr_text.trim_start_matches("#[").trim_end_matches(']');
+                    attrs.push(clean.to_string());
+                }
+                prev_was_attr = true;
+            } else if child.id() == node.id() && prev_was_attr {
+                break;
+            } else {
+                // Not an attribute and not our target node - reset if we passed attributes
+                if prev_was_attr && child.kind() != "line_comment" {
+                    attrs.clear();
+                }
+                prev_was_attr = false;
+            }
+        }
+    }
+    
+    // Also check for inner attributes
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "attribute_item" {
+            if let Ok(attr_text) = child.utf8_text(source) {
+                let clean = attr_text.trim_start_matches("#[").trim_end_matches(']');
+                attrs.push(clean.to_string());
+            }
+        }
+    }
+    
+    attrs
+}
+
+/// Extract signature from Rust node
+fn extract_rust_signature(node: tree_sitter::Node, source_str: &str) -> Option<String> {
+    let start = node.start_byte();
+    if start >= source_str.len() { return None; }
+    
+    let sig_text = &source_str[start..];
+    // Find the end of signature (before body block or semicolon)
+    let sig_end = sig_text.find(" {")
+        .or_else(|| sig_text.find("\n{"))
+        .or_else(|| sig_text.find(";\n"))
+        .or_else(|| sig_text.find(';'))
+        .unwrap_or(sig_text.len().min(200));
+    
+    let sig = sig_text[..sig_end].trim();
+    if sig.is_empty() { None } else { Some(sig.to_string()) }
+}
+
+/// Extract doc comment from Rust node (/// or //!)
+fn extract_rust_docstring(node: tree_sitter::Node, source_str: &str) -> Option<String> {
+    // Look for line_comment siblings before the node that start with ///
+    let start_line = node.start_position().row;
+    if start_line == 0 { return None; }
+    
+    let lines: Vec<&str> = source_str.lines().collect();
+    let mut doc_lines: Vec<&str> = Vec::new();
+    
+    // Walk backwards from the line before the node
+    for i in (0..start_line).rev() {
+        if i >= lines.len() { continue; }
+        let line = lines[i].trim();
+        if line.starts_with("///") {
+            doc_lines.push(line.trim_start_matches("///").trim());
+        } else if line.starts_with("//!") {
+            doc_lines.push(line.trim_start_matches("//!").trim());
+        } else if line.is_empty() || line.starts_with("#[") {
+            // Skip empty lines and attributes
+            continue;
+        } else {
+            break;
+        }
+    }
+    
+    if doc_lines.is_empty() {
+        return None;
+    }
+    
+    doc_lines.reverse();
+    let first_line = doc_lines.first().copied().unwrap_or("");
+    let truncated = if first_line.len() > 100 {
+        &first_line[..100]
+    } else {
+        first_line
+    };
+    
+    if truncated.is_empty() { None } else { Some(truncated.to_string()) }
+}
+
+// ─── TypeScript Tree-Sitter Extraction ───
+
+/// Extract from TypeScript/JavaScript source using tree-sitter AST parsing.
+/// Handles classes, interfaces, functions, enums, type aliases, and export statements.
+fn extract_typescript_tree_sitter(
+    path: &str,
+    content: &str,
+    parser: &mut Parser,
+    class_id_map: &mut HashMap<String, String>,
+    extension: &str,
+) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut imports = HashSet::new();
+
+    // Choose language based on file extension
+    let lang_result = match extension {
+        "tsx" => parser.set_language(&tree_sitter_typescript::LANGUAGE_TSX.into()),
+        "ts" => parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+        "jsx" => parser.set_language(&tree_sitter_javascript::LANGUAGE.into()),
+        _ => parser.set_language(&tree_sitter_javascript::LANGUAGE.into()),  // .js default
+    };
+    
+    if lang_result.is_err() {
+        return (nodes, edges, imports);
+    }
+
+    let tree = match parser.parse(content, None) {
+        Some(t) => t,
+        None => return (nodes, edges, imports),
+    };
+
+    let file_id = format!("file:{}", path);
+    let source = content.as_bytes();
+    let root = tree.root_node();
+
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        extract_typescript_node(
+            child,
+            source,
+            content,
+            path,
+            &file_id,
+            &mut nodes,
+            &mut edges,
+            class_id_map,
+            &mut imports,
+        );
+    }
+
+    (nodes, edges, imports)
+}
+
+/// Extract TypeScript/JavaScript nodes from AST
+fn extract_typescript_node(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_str: &str,
+    path: &str,
+    file_id: &str,
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+    class_id_map: &mut HashMap<String, String>,
+    imports: &mut HashSet<String>,
+) {
+    let text = |n: tree_sitter::Node| -> String {
+        n.utf8_text(source).unwrap_or("").to_string()
+    };
+
+    match node.kind() {
+        "import_statement" => {
+            // Extract: import { ... } from 'module'; or import x from 'module';
+            let import_text = text(node);
+            if let Some(from_idx) = import_text.rfind(" from ") {
+                let module_part = import_text[from_idx + 6..].trim();
+                let module = module_part.trim_matches(|c| c == '\'' || c == '"' || c == ';');
+                if module.starts_with('.') || module.starts_with("@/") {
+                    edges.push(CodeEdge {
+                        from: file_id.to_string(),
+                        to: format!("module_ref:{}", module),
+                        relation: EdgeRelation::Imports,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 1.0,
+                    });
+                }
+                imports.insert(module.to_string());
+                
+                // Extract imported names
+                if let Some(start) = import_text.find('{') {
+                    if let Some(end) = import_text.find('}') {
+                        let names_part = &import_text[start+1..end];
+                        for name in names_part.split(',') {
+                            let clean = name.trim().split(" as ").next().unwrap_or("").trim();
+                            if !clean.is_empty() {
+                                imports.insert(clean.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        "class_declaration" | "class" => {
+            extract_typescript_class(node, source, source_str, path, file_id, nodes, edges, class_id_map);
+        }
+
+        "abstract_class_declaration" => {
+            extract_typescript_class(node, source, source_str, path, file_id, nodes, edges, class_id_map);
+        }
+
+        "interface_declaration" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let line = node.start_position().row + 1;
+            let interface_id = format!("class:{}:{}", path, name);
+
+            let signature = extract_typescript_signature(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: interface_id.clone(),
+                kind: NodeKind::Class,
+                name: name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: vec!["interface".to_string()],
+                signature,
+                docstring: extract_typescript_docstring(node, source_str),
+                line_count,
+                is_test: path.contains("/test") || name.contains("Test"),
+            });
+
+            edges.push(CodeEdge::defined_in(&interface_id, file_id));
+            class_id_map.insert(name, interface_id);
+        }
+
+        "function_declaration" | "function" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let line = node.start_position().row + 1;
+            let func_id = format!("func:{}:{}", path, name);
+
+            let signature = extract_typescript_signature(node, source_str);
+            let docstring = extract_typescript_docstring(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+            let decorators = extract_typescript_decorators(node, source);
+
+            nodes.push(CodeNode {
+                id: func_id.clone(),
+                kind: NodeKind::Function,
+                name,
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators,
+                signature,
+                docstring,
+                line_count,
+                is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+            });
+
+            edges.push(CodeEdge::defined_in(&func_id, file_id));
+        }
+
+        "lexical_declaration" | "variable_declaration" => {
+            // Check for arrow functions: const foo = () => { ... }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    let name = child.child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("")
+                        .to_string();
+                    
+                    if let Some(value) = child.child_by_field_name("value") {
+                        if value.kind() == "arrow_function" || value.kind() == "function" {
+                            if name.is_empty() { continue; }
+                            
+                            let line = node.start_position().row + 1;
+                            let func_id = format!("func:{}:{}", path, name);
+
+                            let signature = extract_typescript_signature(node, source_str);
+                            let line_count = node.end_position().row - node.start_position().row + 1;
+
+                            nodes.push(CodeNode {
+                                id: func_id.clone(),
+                                kind: NodeKind::Function,
+                                name,
+                                file_path: path.to_string(),
+                                line: Some(line),
+                                decorators: Vec::new(),
+                                signature,
+                                docstring: extract_typescript_docstring(node, source_str),
+                                line_count,
+                                is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+                            });
+
+                            edges.push(CodeEdge::defined_in(&func_id, file_id));
+                        }
+                    }
+                }
+            }
+        }
+
+        "enum_declaration" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let line = node.start_position().row + 1;
+            let enum_id = format!("class:{}:{}", path, name);
+
+            let signature = extract_typescript_signature(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: enum_id.clone(),
+                kind: NodeKind::Class,
+                name: name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: vec!["enum".to_string()],
+                signature,
+                docstring: extract_typescript_docstring(node, source_str),
+                line_count,
+                is_test: false,
+            });
+
+            edges.push(CodeEdge::defined_in(&enum_id, file_id));
+            class_id_map.insert(name, enum_id);
+        }
+
+        "type_alias_declaration" => {
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() { return; }
+
+            let line = node.start_position().row + 1;
+            let type_id = format!("class:{}:{}", path, name);
+
+            let signature = extract_typescript_signature(node, source_str);
+            let line_count = node.end_position().row - node.start_position().row + 1;
+
+            nodes.push(CodeNode {
+                id: type_id.clone(),
+                kind: NodeKind::Class,
+                name: name.clone(),
+                file_path: path.to_string(),
+                line: Some(line),
+                decorators: vec!["type".to_string()],
+                signature,
+                docstring: None,
+                line_count,
+                is_test: false,
+            });
+
+            edges.push(CodeEdge::defined_in(&type_id, file_id));
+            class_id_map.insert(name, type_id);
+        }
+
+        "export_statement" => {
+            // Unwrap export and process inner declaration
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                match child.kind() {
+                    "class_declaration" | "class" | "abstract_class_declaration" |
+                    "interface_declaration" | "function_declaration" | "function" |
+                    "lexical_declaration" | "variable_declaration" | "enum_declaration" |
+                    "type_alias_declaration" => {
+                        extract_typescript_node(child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        "expression_statement" => {
+            // Handle wrapped statements like namespace (which appears as expression_statement → internal_module)
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                extract_typescript_node(child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+            }
+        }
+
+        "module" | "internal_module" | "namespace" => {
+            // namespace/module declarations
+            let name = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or("")
+                .to_string();
+            
+            if !name.is_empty() {
+                let line = node.start_position().row + 1;
+                let module_id = format!("class:{}:{}", path, name);
+
+                nodes.push(CodeNode {
+                    id: module_id.clone(),
+                    kind: NodeKind::Class,
+                    name: name.clone(),
+                    file_path: path.to_string(),
+                    line: Some(line),
+                    decorators: vec!["namespace".to_string()],
+                    signature: Some(format!("namespace {}", name)),
+                    docstring: None,
+                    line_count: node.end_position().row - node.start_position().row + 1,
+                    is_test: false,
+                });
+
+                edges.push(CodeEdge::defined_in(&module_id, file_id));
+            }
+
+            // Recurse into module body
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut body_cursor = body.walk();
+                for body_child in body.children(&mut body_cursor) {
+                    extract_typescript_node(body_child, source, source_str, path, file_id, nodes, edges, class_id_map, imports);
+                }
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// Extract TypeScript class with methods
+fn extract_typescript_class(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_str: &str,
+    path: &str,
+    file_id: &str,
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+    class_id_map: &mut HashMap<String, String>,
+) {
+    let name = node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() { return; }
+
+    let line = node.start_position().row + 1;
+    let class_id = format!("class:{}:{}", path, name);
+
+    let signature = extract_typescript_signature(node, source_str);
+    let docstring = extract_typescript_docstring(node, source_str);
+    let line_count = node.end_position().row - node.start_position().row + 1;
+    let decorators = extract_typescript_decorators(node, source);
+
+    nodes.push(CodeNode {
+        id: class_id.clone(),
+        kind: NodeKind::Class,
+        name: name.clone(),
+        file_path: path.to_string(),
+        line: Some(line),
+        decorators,
+        signature,
+        docstring,
+        line_count,
+        is_test: path.contains("/test") || name.contains("Test"),
+    });
+
+    edges.push(CodeEdge::defined_in(&class_id, file_id));
+    class_id_map.insert(name.clone(), class_id.clone());
+
+    // Find parent class from extends clause
+    fn find_extends_identifier(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            match child.kind() {
+                "identifier" | "type_identifier" => {
+                    return child.utf8_text(source).ok().map(|s| s.to_string());
+                }
+                "extends_clause" | "class_heritage" | "extends_type_clause" => {
+                    if let Some(name) = find_extends_identifier(child, source) {
+                        return Some(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+    
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "class_heritage" || child.kind() == "extends_clause" {
+            if let Some(parent_name) = find_extends_identifier(child, source) {
+                if !parent_name.is_empty() {
+                    edges.push(CodeEdge {
+                        from: class_id.clone(),
+                        to: format!("class_ref:{}", parent_name),
+                        relation: EdgeRelation::Inherits,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 1.0,
+                    });
+                }
+            }
+        }
+    }
+
+    // Extract methods from class body
+    if let Some(body) = node.child_by_field_name("body") {
+        let mut body_cursor = body.walk();
+        for body_child in body.children(&mut body_cursor) {
+            match body_child.kind() {
+                "method_definition" | "public_field_definition" | "method_signature" => {
+                    extract_typescript_method(body_child, source, source_str, path, &class_id, nodes, edges);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Extract method from class
+fn extract_typescript_method(
+    node: tree_sitter::Node,
+    source: &[u8],
+    source_str: &str,
+    path: &str,
+    class_id: &str,
+    nodes: &mut Vec<CodeNode>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    let mut name = node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .unwrap_or("")
+        .to_string();
+    
+    // Handle computed property names [key]
+    if name.is_empty() {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "property_identifier" || child.kind() == "identifier" {
+                if let Ok(text) = child.utf8_text(source) {
+                    name = text.to_string();
+                    break;
+                }
+            }
+        }
+    }
+    
+    if name.is_empty() { return; }
+
+    let line = node.start_position().row + 1;
+    let method_id = format!("method:{}:{}", path, name);
+
+    let signature = extract_typescript_signature(node, source_str);
+    let docstring = extract_typescript_docstring(node, source_str);
+    let line_count = node.end_position().row - node.start_position().row + 1;
+    let decorators = extract_typescript_decorators(node, source);
+
+    nodes.push(CodeNode {
+        id: method_id.clone(),
+        kind: NodeKind::Function,
+        name,
+        file_path: path.to_string(),
+        line: Some(line),
+        decorators,
+        signature,
+        docstring,
+        line_count,
+        is_test: path.contains("/test") || path.contains(".test.") || path.contains(".spec."),
+    });
+
+    edges.push(CodeEdge {
+        from: method_id,
+        to: class_id.to_string(),
+        relation: EdgeRelation::DefinedIn,
+        weight: 0.5,
+        call_count: 1,
+        in_error_path: false,
+        confidence: 1.0,
+    });
+}
+
+/// Extract TypeScript decorators (@decorator)
+fn extract_typescript_decorators(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut decorators = Vec::new();
+    
+    // Look for decorator siblings before this node
+    if let Some(parent) = node.parent() {
+        let mut cursor = parent.walk();
+        for child in parent.children(&mut cursor) {
+            if child.kind() == "decorator" {
+                if let Ok(dec_text) = child.utf8_text(source) {
+                    let name = dec_text.trim_start_matches('@');
+                    let name = name.split('(').next().unwrap_or(name).trim();
+                    if !name.is_empty() {
+                        decorators.push(name.to_string());
+                    }
+                }
+            }
+            if child.id() == node.id() {
+                break;
+            }
+        }
+    }
+    
+    decorators
+}
+
+/// Extract signature from TypeScript node
+fn extract_typescript_signature(node: tree_sitter::Node, source_str: &str) -> Option<String> {
+    let start = node.start_byte();
+    if start >= source_str.len() { return None; }
+    
+    let sig_text = &source_str[start..];
+    // Find the end of signature (before body block)
+    let sig_end = sig_text.find(" {")
+        .or_else(|| sig_text.find("\n{"))
+        .or_else(|| sig_text.find("{\n"))
+        .unwrap_or(sig_text.len().min(200));
+    
+    let sig = sig_text[..sig_end].trim();
+    if sig.is_empty() { None } else { Some(sig.to_string()) }
+}
+
+/// Extract JSDoc comment from TypeScript node
+fn extract_typescript_docstring(node: tree_sitter::Node, source_str: &str) -> Option<String> {
+    let start_line = node.start_position().row;
+    if start_line == 0 { return None; }
+    
+    let lines: Vec<&str> = source_str.lines().collect();
+    
+    // Look for /** ... */ comment before the node
+    for i in (0..start_line).rev() {
+        if i >= lines.len() { continue; }
+        let line = lines[i].trim();
+        
+        if line.ends_with("*/") {
+            // Found end of JSDoc, find the start
+            let mut doc_lines: Vec<&str> = Vec::new();
+            for j in (0..=i).rev() {
+                if j >= lines.len() { continue; }
+                let doc_line = lines[j].trim();
+                if doc_line.starts_with("/**") {
+                    let first = doc_line.trim_start_matches("/**").trim_start_matches('*').trim();
+                    if !first.is_empty() && !first.starts_with('@') {
+                        doc_lines.push(first);
+                    }
+                    break;
+                } else if doc_line.starts_with('*') {
+                    let content = doc_line.trim_start_matches('*').trim();
+                    if !content.is_empty() && !content.starts_with('@') {
+                        doc_lines.push(content);
+                    }
+                }
+            }
+            
+            if doc_lines.is_empty() {
+                return None;
+            }
+            
+            doc_lines.reverse();
+            let first_line = doc_lines.first().copied().unwrap_or("");
+            let truncated = if first_line.len() > 100 {
+                &first_line[..100]
+            } else {
+                first_line
+            };
+            
+            return if truncated.is_empty() { None } else { Some(truncated.to_string()) };
+        } else if line.is_empty() || line.starts_with('@') || line.starts_with("//") {
+            continue;
+        } else {
+            break;
+        }
+    }
+    
+    None
+}
+
+// ─── Regex-Based Fallbacks (kept for reference) ───
+
+/// Extract from Rust source (regex-based fallback, kept for reference).
+#[allow(dead_code)]
+fn extract_rust_regex(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
@@ -3437,8 +4631,9 @@ fn extract_rust(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, Has
     (nodes, edges, HashSet::new())
 }
 
-/// Extract from TypeScript/JavaScript source (regex-based).
-fn extract_typescript(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
+/// Extract from TypeScript/JavaScript source (regex-based fallback, kept for reference).
+#[allow(dead_code)]
+fn extract_typescript_regex(path: &str, content: &str) -> (Vec<CodeNode>, Vec<CodeEdge>, HashSet<String>) {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
 
@@ -3668,12 +4863,104 @@ impl MyTrait for MyStruct {
 
 pub fn top_level() {}
 "#;
-        let (nodes, edges, _) = extract_rust("test.rs", content);
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
 
-        assert!(nodes.iter().any(|n| n.name == "MyStruct"));
-        assert!(nodes.iter().any(|n| n.name == "method"));
-        assert!(nodes.iter().any(|n| n.name == "top_level"));
-        assert!(edges.iter().any(|e| e.to.contains("module")));
+        assert!(nodes.iter().any(|n| n.name == "MyStruct"), "Should find MyStruct");
+        assert!(nodes.iter().any(|n| n.name == "method"), "Should find method");
+        assert!(nodes.iter().any(|n| n.name == "top_level"), "Should find top_level");
+        assert!(edges.iter().any(|e| e.to.contains("module")), "Should have module import edge");
+        
+        // Tree-sitter should also capture trait implementation relationship
+        assert!(edges.iter().any(|e| e.relation == EdgeRelation::Inherits && e.to.contains("MyTrait")),
+            "Should capture trait impl inheritance");
+    }
+
+    #[test]
+    fn test_extract_rust_comprehensive() {
+        let content = r#"
+use crate::foo::bar;
+
+/// A documented struct
+pub struct Person {
+    name: String,
+    age: u32,
+}
+
+/// A documented enum
+pub enum Status {
+    Active,
+    Inactive,
+}
+
+/// A trait
+pub trait Greeter {
+    fn greet(&self) -> String;
+}
+
+impl Greeter for Person {
+    fn greet(&self) -> String {
+        format!("Hello, {}", self.name)
+    }
+}
+
+impl Person {
+    pub fn new(name: String) -> Self {
+        Self { name, age: 0 }
+    }
+    
+    pub fn birthday(&mut self) {
+        self.age += 1;
+    }
+}
+
+mod inner {
+    pub fn nested_fn() {}
+}
+
+type MyAlias = Vec<String>;
+
+pub fn standalone() {}
+
+#[test]
+fn test_something() {}
+"#;
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _) = extract_rust_tree_sitter("test.rs", content, &mut parser, &mut class_map);
+
+        // Structs and enums
+        assert!(nodes.iter().any(|n| n.name == "Person"), "Should find Person struct");
+        assert!(nodes.iter().any(|n| n.name == "Status"), "Should find Status enum");
+        
+        // Traits
+        assert!(nodes.iter().any(|n| n.name == "Greeter"), "Should find Greeter trait");
+        
+        // Methods from impl blocks
+        assert!(nodes.iter().any(|n| n.name == "greet"), "Should find greet method");
+        assert!(nodes.iter().any(|n| n.name == "new"), "Should find new method");
+        assert!(nodes.iter().any(|n| n.name == "birthday"), "Should find birthday method");
+        
+        // Nested module functions
+        assert!(nodes.iter().any(|n| n.name.contains("nested_fn")), "Should find nested_fn");
+        
+        // Type aliases
+        assert!(nodes.iter().any(|n| n.name == "MyAlias"), "Should find type alias");
+        
+        // Standalone function
+        assert!(nodes.iter().any(|n| n.name == "standalone"), "Should find standalone fn");
+        
+        // Test function should be marked as test
+        let test_node = nodes.iter().find(|n| n.name == "test_something");
+        assert!(test_node.is_some(), "Should find test function");
+        assert!(test_node.unwrap().is_test, "Test function should be marked as test");
+        
+        // Methods should be linked to their impl target
+        let greet_edges: Vec<_> = edges.iter()
+            .filter(|e| e.from.contains("greet") && e.relation == EdgeRelation::DefinedIn)
+            .collect();
+        assert!(!greet_edges.is_empty(), "greet should have DefinedIn edge");
     }
 
     #[test]
@@ -3689,11 +4976,105 @@ export function topLevel(): void {}
 
 export const arrowFn = () => {};
 "#;
-        let (nodes, edges, _) = extract_typescript("test.ts", content);
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _) = extract_typescript_tree_sitter("test.ts", content, &mut parser, &mut class_map, "ts");
 
-        assert!(nodes.iter().any(|n| n.name == "MyClass"));
-        assert!(nodes.iter().any(|n| n.name == "topLevel"));
-        assert!(nodes.iter().any(|n| n.name == "arrowFn"));
-        assert!(edges.iter().any(|e| e.to.contains("component")));
+        assert!(nodes.iter().any(|n| n.name == "MyClass"), "Should find MyClass");
+        assert!(nodes.iter().any(|n| n.name == "topLevel"), "Should find topLevel");
+        assert!(nodes.iter().any(|n| n.name == "arrowFn"), "Should find arrowFn");
+        assert!(edges.iter().any(|e| e.to.contains("component")), "Should have component import");
+        
+        // Tree-sitter should also find the method inside the class
+        assert!(nodes.iter().any(|n| n.name == "method"), "Should find method inside class");
+        
+        // Should capture inheritance
+        assert!(edges.iter().any(|e| e.relation == EdgeRelation::Inherits && e.to.contains("BaseClass")),
+            "Should capture class inheritance");
+    }
+
+    #[test]
+    fn test_extract_typescript_comprehensive() {
+        let content = r#"
+import { Injectable } from '@angular/core';
+import type { User } from './types';
+
+/**
+ * A service class
+ */
+@Injectable()
+export class UserService {
+    private users: User[] = [];
+    
+    /**
+     * Get all users
+     */
+    getUsers(): User[] {
+        return this.users;
+    }
+    
+    addUser(user: User): void {
+        this.users.push(user);
+    }
+}
+
+export interface IRepository<T> {
+    find(id: string): T | undefined;
+    save(item: T): void;
+}
+
+export type UserId = string;
+
+export enum UserRole {
+    Admin = 'admin',
+    User = 'user',
+}
+
+export function createUser(name: string): User {
+    return { name };
+}
+
+export const fetchUser = async (id: string) => {
+    return null;
+};
+
+export default class DefaultExport {}
+
+namespace MyNamespace {
+    export function innerFn() {}
+}
+"#;
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _) = extract_typescript_tree_sitter("test.ts", content, &mut parser, &mut class_map, "ts");
+
+        // Classes
+        assert!(nodes.iter().any(|n| n.name == "UserService"), "Should find UserService class");
+        assert!(nodes.iter().any(|n| n.name == "DefaultExport"), "Should find default export class");
+        
+        // Methods inside class
+        assert!(nodes.iter().any(|n| n.name == "getUsers"), "Should find getUsers method");
+        assert!(nodes.iter().any(|n| n.name == "addUser"), "Should find addUser method");
+        
+        // Interfaces
+        assert!(nodes.iter().any(|n| n.name == "IRepository"), "Should find interface");
+        
+        // Type aliases
+        assert!(nodes.iter().any(|n| n.name == "UserId"), "Should find type alias");
+        
+        // Enums
+        assert!(nodes.iter().any(|n| n.name == "UserRole"), "Should find enum");
+        
+        // Functions
+        assert!(nodes.iter().any(|n| n.name == "createUser"), "Should find function");
+        
+        // Arrow functions
+        assert!(nodes.iter().any(|n| n.name == "fetchUser"), "Should find arrow function");
+        
+        // Namespace
+        assert!(nodes.iter().any(|n| n.name == "MyNamespace"), "Should find namespace");
+        
+        // Imports
+        assert!(edges.iter().any(|e| e.relation == EdgeRelation::Imports), "Should have import edges");
     }
 }
