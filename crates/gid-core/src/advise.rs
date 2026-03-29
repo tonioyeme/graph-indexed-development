@@ -836,7 +836,16 @@ fn is_trait_definition_method(node: &Node, graph: &Graph) -> bool {
         .map(|e| &e.to);
     
     if let Some(parent) = parent_id {
-        // Check if parent is a trait (has nodes that inherit FROM it, meaning it's a trait)
+        // Check parent node's signature for "trait" keyword
+        if let Some(parent_node) = graph.get_node(parent) {
+            if let Some(sig) = parent_node.metadata.get("signature").and_then(|v| v.as_str()) {
+                if sig.contains("trait ") {
+                    return true;
+                }
+            }
+        }
+        
+        // Check if parent is a trait (has nodes that inherit FROM it)
         let is_trait = graph.edges.iter()
             .any(|e| e.to == *parent && e.relation == "inherits");
         if is_trait {

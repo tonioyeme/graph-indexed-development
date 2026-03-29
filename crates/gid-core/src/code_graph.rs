@@ -5267,14 +5267,14 @@ fn extract_calls_rust(
                     .and_then(|n| n.utf8_text(source).ok())
                     .unwrap_or("");
 
-                if !macro_name.is_empty() && !is_rust_macro_builtin(macro_name) {
-                    let scope = scope_map
-                        .iter()
-                        .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
-                        .max_by_key(|(start, _, _, _)| *start);
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
 
-                    if let Some((_start, _end, caller_id, _)) = scope {
-                        // Look for macro definition
+                if let Some((_start, _end, caller_id, impl_ctx)) = scope {
+                    // Custom macro call (not built-in)
+                    if !macro_name.is_empty() && !is_rust_macro_builtin(macro_name) {
                         let macro_id_name = format!("{}!", macro_name);
                         if let Some(callee_ids) = func_name_map.get(&macro_id_name) {
                             for callee_id in callee_ids.iter().take(3) {
@@ -5292,6 +5292,39 @@ fn extract_calls_rust(
                             }
                         }
                     }
+
+                    // Scan token_tree for function calls inside the macro
+                    // tree-sitter treats macro args as opaque tokens, but we can
+                    // detect pattern: identifier followed by token_tree starting with '('
+                    let tt = {
+                        let mut found = node.child_by_field_name("tokens");
+                        if found.is_none() {
+                            let count = node.child_count();
+                            for idx in 0..count {
+                                if let Some(ch) = node.child(idx) {
+                                    if ch.kind() == "token_tree" {
+                                        found = Some(ch);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        found
+                    };
+                    if let Some(token_tree) = tt {
+                        extract_calls_from_token_tree(
+                            token_tree,
+                            source,
+                            caller_id,
+                            impl_ctx.as_deref(),
+                            func_name_map,
+                            method_to_class,
+                            file_func_ids,
+                            package_dir,
+                            node_pkg_map,
+                            edges,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -5306,16 +5339,129 @@ fn extract_calls_rust(
     }
 }
 
+/// Extract function calls from macro token_tree (opaque to tree-sitter).
+/// Detects pattern: `identifier` followed by `token_tree` starting with `(` = function call.
+/// Also detects `self.identifier(...)` patterns for self method calls.
+fn extract_calls_from_token_tree(
+    token_tree: tree_sitter::Node,
+    source: &[u8],
+    caller_id: &str,
+    impl_ctx: Option<&str>,
+    func_name_map: &HashMap<String, Vec<String>>,
+    method_to_class: &HashMap<String, String>,
+    file_func_ids: &HashSet<String>,
+    package_dir: &str,
+    node_pkg_map: &HashMap<String, String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    let mut cursor = token_tree.walk();
+    let children: Vec<tree_sitter::Node> = token_tree.children(&mut cursor).collect();
+    
+    let mut i = 0;
+    while i < children.len() {
+        let child = children[i];
+        
+        // Pattern 1: self.method(args) inside token_tree
+        // tokens: self, ., identifier, token_tree(...)
+        if child.kind() == "self" && i + 3 < children.len() {
+            let dot = children[i + 1];
+            let method = children[i + 2];
+            let args = children[i + 3];
+            
+            if dot.utf8_text(source).ok() == Some(".")
+                && method.kind() == "identifier"
+                && args.kind() == "token_tree"
+            {
+                let method_name = method.utf8_text(source).unwrap_or("");
+                if !method_name.is_empty() && !is_rust_builtin(method_name) {
+                    resolve_rust_self_method_call(
+                        caller_id,
+                        method_name,
+                        impl_ctx,
+                        func_name_map,
+                        method_to_class,
+                        file_func_ids,
+                        edges,
+                    );
+                }
+                i += 4;
+                continue;
+            }
+        }
+        
+        // Pattern 2: free_function(args) inside token_tree
+        // tokens: identifier, token_tree(...)
+        if child.kind() == "identifier" && i + 1 < children.len() {
+            let next = children[i + 1];
+            if next.kind() == "token_tree" {
+                let callee_name = child.utf8_text(source).unwrap_or("");
+                if !callee_name.is_empty() 
+                    && !is_rust_builtin(callee_name)
+                    && !is_rust_macro_builtin(callee_name)
+                    // Skip common non-function identifiers in format strings
+                    && callee_name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
+                {
+                    resolve_rust_call_edge(
+                        caller_id,
+                        callee_name,
+                        func_name_map,
+                        file_func_ids,
+                        package_dir,
+                        node_pkg_map,
+                        false,
+                        edges,
+                    );
+                }
+            }
+        }
+        
+        // Recurse into nested token_trees
+        if child.kind() == "token_tree" {
+            extract_calls_from_token_tree(
+                child,
+                source,
+                caller_id,
+                impl_ctx,
+                func_name_map,
+                method_to_class,
+                file_func_ids,
+                package_dir,
+                node_pkg_map,
+                edges,
+            );
+        }
+        
+        i += 1;
+    }
+}
+
 /// Extract the target of a Rust call expression
 fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -> String {
     match node.kind() {
         "identifier" => {
             node.utf8_text(source).unwrap_or("").to_string()
         }
-        "scoped_identifier" | "field_expression" => {
+        "scoped_identifier" => {
             // For path::to::fn or Type::method, get the last segment
             node.utf8_text(source).ok()
                 .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+                .unwrap_or_default()
+        }
+        "field_expression" => {
+            // For obj.method, get the method name (field_identifier child)
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "field_identifier" {
+                    return child.utf8_text(source).unwrap_or("").to_string();
+                }
+            }
+            // Fallback: get last segment after . or ::
+            node.utf8_text(source).ok()
+                .map(|s| {
+                    s.rsplit('.').next()
+                        .unwrap_or_else(|| s.rsplit("::").next().unwrap_or(s))
+                        .to_string()
+                })
                 .unwrap_or_default()
         }
         "generic_function" => {
@@ -5336,25 +5482,42 @@ fn extract_rust_call_target(node: tree_sitter::Node, source: &[u8]) -> String {
 
 /// Extract impl type from impl_item node
 fn extract_impl_type(node: tree_sitter::Node, source: &[u8]) -> Option<String> {
+    // For `impl Type`, return Type. For `impl Trait for Type`, return Type (not Trait).
+    // The `for` keyword separates trait from type in tree-sitter AST.
+    let mut trait_or_type: Option<String> = None;
+    let mut seen_for = false;
+    
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
-            "type_identifier" | "generic_type" | "scoped_type_identifier" => {
-                if child.kind() == "generic_type" {
-                    return child.child_by_field_name("type")
+            "type_identifier" | "generic_type" | "scoped_type_identifier" | "primitive_type" => {
+                let name = if child.kind() == "generic_type" {
+                    child.child_by_field_name("type")
                         .and_then(|n| n.utf8_text(source).ok())
-                        .map(|s| s.to_string());
+                        .map(|s| s.to_string())
                 } else if child.kind() == "scoped_type_identifier" {
-                    return child.utf8_text(source).ok()
-                        .map(|s| s.rsplit("::").next().unwrap_or(s).to_string());
+                    child.utf8_text(source).ok()
+                        .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
                 } else {
-                    return child.utf8_text(source).ok().map(|s| s.to_string());
+                    child.utf8_text(source).ok().map(|s| s.to_string())
+                };
+                
+                if seen_for {
+                    // This is the type after `for` — this is what we want
+                    return name;
+                }
+                trait_or_type = name;
+            }
+            _ => {
+                if child.utf8_text(source).ok() == Some("for") {
+                    seen_for = true;
                 }
             }
-            _ => {}
         }
     }
-    None
+    
+    // No `for` keyword — this is `impl Type`, return the type
+    trait_or_type
 }
 
 /// Resolve and add Rust call edge
