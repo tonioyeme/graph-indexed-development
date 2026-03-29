@@ -5206,6 +5206,15 @@ fn extract_calls_rust(
                             }
                         }
                     }
+                    
+                    // Scan arguments for function references (fn passed as argument)
+                    // Pattern: foo(bar) where bar is a known function name
+                    if let Some(args_node) = node.child_by_field_name("arguments") {
+                        scan_args_for_fn_refs(
+                            args_node, source, caller_id,
+                            func_name_map, file_func_ids, package_dir, node_pkg_map, edges,
+                        );
+                    }
                 }
             }
             "method_call_expression" => {
@@ -5254,6 +5263,14 @@ fn extract_calls_rust(
                                 edges,
                             );
                         }
+                    }
+                    
+                    // Scan arguments for function references
+                    if let Some(args_node) = node.child_by_field_name("arguments") {
+                        scan_args_for_fn_refs(
+                            args_node, source, caller_id,
+                            func_name_map, file_func_ids, package_dir, node_pkg_map, edges,
+                        );
                     }
                 }
             }
@@ -5334,6 +5351,38 @@ fn extract_calls_rust(
         for i in (0..child_count).rev() {
             if let Some(child) = node.child(i) {
                 stack.push(child);
+            }
+        }
+    }
+}
+
+/// Scan function arguments for identifiers that match known function names.
+/// Detects functions passed as arguments (function pointers, callbacks).
+/// e.g., `.is_some_and(header_value_is_credential)`, `get(verify_webhook)`
+fn scan_args_for_fn_refs(
+    args_node: tree_sitter::Node,
+    source: &[u8],
+    caller_id: &str,
+    func_name_map: &HashMap<String, Vec<String>>,
+    file_func_ids: &HashSet<String>,
+    package_dir: &str,
+    node_pkg_map: &HashMap<String, String>,
+    edges: &mut Vec<CodeEdge>,
+) {
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            let name = child.utf8_text(source).unwrap_or("");
+            // Only match if it's a known function name and looks like a function (snake_case)
+            if !name.is_empty() 
+                && func_name_map.contains_key(name)
+                && !is_rust_builtin(name)
+                && name.chars().next().map(|c| c.is_lowercase()).unwrap_or(false)
+            {
+                resolve_rust_call_edge(
+                    caller_id, name, func_name_map, file_func_ids,
+                    package_dir, node_pkg_map, false, edges,
+                );
             }
         }
     }
