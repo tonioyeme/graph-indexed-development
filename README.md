@@ -99,10 +99,19 @@ edges:
 
 **Top-down:** Design first, then build
 ```bash
+# Step 1: Generate an LLM prompt from requirements
 gid design "E-commerce with auth, payments, orders"
-# → Generates graph with features, components, layers
-# → Build against the architecture
+# → Outputs a structured prompt for your LLM
+
+# Step 2: Feed the prompt to your LLM, get YAML graph back
+
+# Step 3: Parse the LLM's YAML response into the graph
+echo "<yaml from LLM>" | gid design --parse
+# → Merges generated nodes/edges into .gid/graph.yml
 ```
+
+> **For AI agents (MCP/CLI):** The agent calls `gid design` to get the prompt, generates the YAML itself (the agent *is* the LLM), then calls `gid design --parse` to apply it. This is a seamless two-step loop — no human needed.
+
 
 **Bottom-up:** Extract from existing code
 ```bash
