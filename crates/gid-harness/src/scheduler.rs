@@ -16,6 +16,8 @@ use anyhow::Result;
 use chrono::Utc;
 use tracing::{info, warn, error};
 
+use std::path::{Path, PathBuf};
+
 use gid_core::graph::{Graph, NodeStatus};
 use gid_core::harness::types::{
     ExecutionPlan, ExecutionResult, HarnessConfig,
@@ -24,8 +26,10 @@ use gid_core::harness::types::{
 use gid_core::code_graph::CodeGraph;
 use gid_core::unified::build_unified_graph;
 use gid_core::advise::analyze as advise_analyze;
+use gid_core::save_graph;
 
 use crate::executor::TaskExecutor;
+use crate::replanner::Replanner;
 use crate::verifier::Verifier;
 use crate::worktree::WorktreeManager;
 use crate::telemetry::TelemetryLogger;
@@ -51,7 +55,9 @@ pub async fn execute_plan(
     config: &HarnessConfig,
     executor: &dyn TaskExecutor,
     worktree_mgr: &dyn WorktreeManager,
+    gid_root: &Path,
 ) -> Result<ExecutionResult> {
+    let graph_path = gid_root.join("graph.yml");
     let start = Instant::now();
 
     info!(
@@ -60,6 +66,13 @@ pub async fn execute_plan(
         max_concurrent = config.max_concurrent,
         "Starting plan execution"
     );
+
+    // Clean up stale worktrees from previous runs
+    match worktree_mgr.cleanup_stale().await {
+        Ok(0) => {},
+        Ok(n) => info!(count = n, "Cleaned up stale worktrees from previous run"),
+        Err(e) => warn!(error = %e, "Failed to clean up stale worktrees"),
+    }
 
     // Initialize telemetry — log path would come from config in production
     // For now, we skip telemetry if no path is configured
@@ -75,6 +88,7 @@ pub async fn execute_plan(
     let mut tasks_completed: usize = 0;
     let mut tasks_failed: usize = 0;
     let mut retry_counts: HashMap<String, u32> = HashMap::new();
+    let mut replanner = Replanner::new(config.max_replans);
 
     // Initialize verifier
     let verifier = Verifier::new(".")
@@ -88,36 +102,47 @@ pub async fn execute_plan(
         // Process tasks in parallel within the layer (up to max_concurrent)
         let mut layer_results = Vec::new();
 
-        for chunk in layer.tasks.chunks(config.max_concurrent) {
-            for task in chunk {
-                // Skip already-done tasks (idempotent execution — GUARD-7)
-                if let Some(node) = graph.get_node(&task.id) {
-                    if node.status == NodeStatus::Done {
-                        info!(task_id = %task.id, "Task already done, skipping");
-                        continue;
-                    }
-                }
-
-                // Check all dependencies are done
-                let deps_satisfied = task.depends_on.iter().all(|dep_id| {
-                    graph.get_node(dep_id)
-                        .map(|n| n.status == NodeStatus::Done)
-                        .unwrap_or(true) // missing dep = assumed done
-                });
-
-                if !deps_satisfied {
-                    warn!(task_id = %task.id, "Dependencies not satisfied, marking blocked");
-                    if let Some(node) = graph.get_node_mut(&task.id) {
-                        node.status = NodeStatus::Blocked;
-                    }
-                    tasks_failed += 1;
+        // Phase 1: Filter eligible tasks and prepare worktrees
+        let mut eligible_tasks = Vec::new();
+        for task in &layer.tasks {
+            // Skip already-done tasks (idempotent execution — GUARD-7)
+            if let Some(node) = graph.get_node(&task.id) {
+                if node.status == NodeStatus::Done {
+                    info!(task_id = %task.id, "Task already done, skipping");
                     continue;
                 }
+            }
 
-                // Mark task as in-progress
+            // Check all dependencies are done
+            let deps_satisfied = task.depends_on.iter().all(|dep_id| {
+                graph.get_node(dep_id)
+                    .map(|n| n.status == NodeStatus::Done)
+                    .unwrap_or(true)
+            });
+
+            if !deps_satisfied {
+                warn!(task_id = %task.id, "Dependencies not satisfied, marking blocked");
+                if let Some(node) = graph.get_node_mut(&task.id) {
+                    node.status = NodeStatus::Blocked;
+                }
+                save_graph(graph, &graph_path).ok();
+                tasks_failed += 1;
+                continue;
+            }
+
+            eligible_tasks.push(task.clone());
+        }
+
+        // Phase 2: Process in chunks of max_concurrent, spawn in parallel
+        for chunk in eligible_tasks.chunks(config.max_concurrent) {
+            // 2a: Mark all tasks in chunk as in-progress and create worktrees
+            let mut prepared: Vec<(gid_core::harness::types::TaskInfo, PathBuf, gid_core::harness::types::TaskContext)> = Vec::new();
+
+            for task in chunk {
                 if let Some(node) = graph.get_node_mut(&task.id) {
                     node.status = NodeStatus::InProgress;
                 }
+                save_graph(graph, &graph_path).ok();
 
                 telemetry.log_event(&ExecutionEvent::TaskStart {
                     task_id: task.id.clone(),
@@ -125,7 +150,6 @@ pub async fn execute_plan(
                     timestamp: Utc::now(),
                 }).ok();
 
-                // Create worktree
                 let wt_path = match worktree_mgr.create(&task.id).await {
                     Ok(path) => path,
                     Err(e) => {
@@ -133,12 +157,12 @@ pub async fn execute_plan(
                         if let Some(node) = graph.get_node_mut(&task.id) {
                             node.status = NodeStatus::Failed;
                         }
+                        save_graph(graph, &graph_path).ok();
                         tasks_failed += 1;
                         continue;
                     }
                 };
 
-                // Build task context (simplified — in production, use gid_core::context::assemble_task_context)
                 let context = gid_core::harness::types::TaskContext {
                     task_info: task.clone(),
                     goals_text: task.goals.clone(),
@@ -147,19 +171,28 @@ pub async fn execute_plan(
                     guards: vec![],
                 };
 
-                // Spawn sub-agent
-                let task_start = Instant::now();
-                let result = executor.spawn(&context, &wt_path, config).await;
+                prepared.push((task.clone(), wt_path, context));
+            }
+
+            // 2b: Spawn all sub-agents in parallel
+            let task_start = Instant::now();
+            let spawn_futures: Vec<_> = prepared.iter().map(|(_, wt_path, context)| {
+                executor.spawn(context, wt_path, config)
+            }).collect();
+            let results = futures::future::join_all(spawn_futures).await;
+
+            // 2c: Process results sequentially (verify, merge, update graph)
+            for (i, result) in results.into_iter().enumerate() {
+                let (ref task, ref wt_path, _) = prepared[i];
+                let duration = task_start.elapsed();
 
                 match result {
                     Ok(task_result) => {
-                        let duration = task_start.elapsed();
                         total_turns += task_result.turns_used;
                         total_tokens += task_result.tokens_used;
 
                         if task_result.success {
-                            // Verify task
-                            let verify_result = verifier.verify_task(task, &wt_path).await
+                            let verify_result = verifier.verify_task(task, wt_path).await
                                 .unwrap_or(VerifyResult::Fail {
                                     output: "Verify command failed to execute".to_string(),
                                     exit_code: -1,
@@ -167,14 +200,12 @@ pub async fn execute_plan(
 
                             match verify_result {
                                 VerifyResult::Pass => {
-                                    // Merge worktree
                                     match worktree_mgr.merge(&task.id).await {
                                         Ok(()) => {
                                             if let Some(node) = graph.get_node_mut(&task.id) {
                                                 node.status = NodeStatus::Done;
                                             }
                                             tasks_completed += 1;
-
                                             telemetry.log_event(&ExecutionEvent::TaskDone {
                                                 task_id: task.id.clone(),
                                                 turns: task_result.turns_used,
@@ -194,15 +225,12 @@ pub async fn execute_plan(
                                     }
                                 }
                                 VerifyResult::Fail { ref output, exit_code } => {
-                                    // Verification failed — discard worktree (GUARD-9)
                                     warn!(task_id = %task.id, exit_code, "Task verification failed");
                                     worktree_mgr.cleanup(&task.id).await.ok();
-
                                     if let Some(node) = graph.get_node_mut(&task.id) {
                                         node.status = NodeStatus::Failed;
                                     }
                                     tasks_failed += 1;
-
                                     telemetry.log_event(&ExecutionEvent::TaskFailed {
                                         task_id: task.id.clone(),
                                         reason: format!("Verify failed (exit {}): {}", exit_code, truncate(output, 200)),
@@ -212,28 +240,42 @@ pub async fn execute_plan(
                                 }
                             }
                         } else {
-                            // Sub-agent failed
+                            // Sub-agent failed — use replanner to decide action
                             worktree_mgr.cleanup(&task.id).await.ok();
-
                             let retries = retry_counts.entry(task.id.clone()).or_insert(0);
-                            if *retries < config.max_retries {
-                                *retries += 1;
-                                warn!(task_id = %task.id, retry = *retries, "Task failed, will retry");
-                                if let Some(node) = graph.get_node_mut(&task.id) {
-                                    node.status = NodeStatus::Todo; // reset for retry
-                                }
-                            } else {
-                                if let Some(node) = graph.get_node_mut(&task.id) {
-                                    node.status = NodeStatus::Failed;
-                                }
-                                tasks_failed += 1;
+                            let decision = replanner.analyze_failure(
+                                task, &task_result, *retries, config.max_retries,
+                            );
 
-                                telemetry.log_event(&ExecutionEvent::TaskFailed {
-                                    task_id: task.id.clone(),
-                                    reason: truncate(&task_result.output, 500),
-                                    turns: task_result.turns_used,
-                                    timestamp: Utc::now(),
-                                }).ok();
+                            match decision {
+                                gid_core::harness::types::ReplanDecision::Retry => {
+                                    *retries += 1;
+                                    warn!(task_id = %task.id, retry = *retries, "Replanner: retry");
+                                    if let Some(node) = graph.get_node_mut(&task.id) {
+                                        node.status = NodeStatus::Todo;
+                                    }
+                                }
+                                gid_core::harness::types::ReplanDecision::Escalate(reason) => {
+                                    warn!(task_id = %task.id, reason = %reason, "Replanner: escalate");
+                                    if let Some(node) = graph.get_node_mut(&task.id) {
+                                        node.status = NodeStatus::Failed;
+                                    }
+                                    tasks_failed += 1;
+                                    telemetry.log_event(&ExecutionEvent::TaskFailed {
+                                        task_id: task.id.clone(),
+                                        reason,
+                                        turns: task_result.turns_used,
+                                        timestamp: Utc::now(),
+                                    }).ok();
+                                }
+                                gid_core::harness::types::ReplanDecision::AddTasks(new_tasks) => {
+                                    // Future: add new tasks to graph and re-plan
+                                    info!(task_id = %task.id, new = new_tasks.len(), "Replanner: add tasks (not yet implemented)");
+                                    if let Some(node) = graph.get_node_mut(&task.id) {
+                                        node.status = NodeStatus::Failed;
+                                    }
+                                    tasks_failed += 1;
+                                }
                             }
                         }
                     }
@@ -247,6 +289,7 @@ pub async fn execute_plan(
                     }
                 }
 
+                save_graph(graph, &graph_path).ok(); // GUARD-7
                 layer_results.push(task.id.clone());
             }
         }
@@ -495,6 +538,9 @@ mod tests {
         async fn list_existing(&self) -> Result<Vec<WorktreeInfo>> {
             Ok(vec![])
         }
+        async fn cleanup_stale(&self) -> Result<usize> {
+            Ok(0)
+        }
     }
 
     fn make_task(id: &str, title: &str) -> Node {
@@ -552,6 +598,7 @@ mod tests {
             &config,
             &MockSuccessExecutor,
             &MockWorktreeManager,
+            &std::env::temp_dir().join("gid-test-root").join(".gid"),
         ).await.unwrap();
 
         assert_eq!(result.tasks_completed, 1);
@@ -574,6 +621,7 @@ mod tests {
             &config,
             &MockFailExecutor,
             &MockWorktreeManager,
+            &std::env::temp_dir().join("gid-test-root").join(".gid"),
         ).await.unwrap();
 
         assert_eq!(result.tasks_completed, 0);
@@ -602,6 +650,7 @@ mod tests {
             &config,
             &executor,
             &MockWorktreeManager,
+            &std::env::temp_dir().join("gid-test-root").join(".gid"),
         ).await.unwrap();
 
         // Only task "b" should have been spawned
@@ -629,6 +678,7 @@ mod tests {
             &config,
             &MockSuccessExecutor,
             &MockWorktreeManager,
+            &std::env::temp_dir().join("gid-test-root").join(".gid"),
         ).await.unwrap();
 
         assert_eq!(result.tasks_completed, 2);
@@ -653,6 +703,7 @@ mod tests {
             &config,
             &MockSuccessExecutor,
             &MockWorktreeManager,
+            &std::env::temp_dir().join("gid-test-root").join(".gid"),
         ).await.unwrap();
 
         assert_eq!(result.tasks_completed, 0);

@@ -1828,6 +1828,7 @@ fn cmd_execute(
         &config,
         &executor,
         &worktree_mgr,
+        &gid_dir,
     ));
 
     // Save updated graph state

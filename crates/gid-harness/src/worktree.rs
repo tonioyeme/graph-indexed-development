@@ -32,6 +32,10 @@ pub trait WorktreeManager: Send + Sync {
 
     /// List surviving worktrees (for crash recovery).
     async fn list_existing(&self) -> Result<Vec<WorktreeInfo>>;
+
+    /// Clean up all stale gid worktrees from previous runs.
+    /// Should be called at the start of execution.
+    async fn cleanup_stale(&self) -> Result<usize>;
 }
 
 /// Git-based worktree manager.
@@ -220,6 +224,24 @@ impl WorktreeManager for GitWorktreeManager {
         }
 
         Ok(worktrees)
+    }
+
+    async fn cleanup_stale(&self) -> Result<usize> {
+        let existing = self.list_existing().await?;
+        let count = existing.len();
+
+        for wt in &existing {
+            info!(task_id = %wt.task_id, path = %wt.path.display(), "Cleaning up stale worktree");
+            self.cleanup(&wt.task_id).await.ok();
+        }
+
+        if count > 0 {
+            // Also prune any dangling worktree references
+            self.git(&["worktree", "prune"]).await.ok();
+            info!(count, "Cleaned up stale worktrees");
+        }
+
+        Ok(count)
     }
 }
 

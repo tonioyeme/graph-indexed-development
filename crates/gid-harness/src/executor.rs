@@ -128,6 +128,50 @@ impl CliExecutor {
         prompt
     }
 
+    /// Parse usage statistics from claude CLI stderr output.
+    ///
+    /// Claude CLI with `--verbose` outputs lines like:
+    ///   "Total tokens: 12,345"
+    ///   "Total turns: 5"
+    ///   "Total cost: $0.12"
+    /// We also look for non-verbose summary patterns.
+    fn parse_usage(stderr: &str) -> (u32, u64) {
+        let mut turns: u32 = 0;
+        let mut tokens: u64 = 0;
+
+        for line in stderr.lines() {
+            let lower = line.to_lowercase();
+            // Parse "Total tokens: 12,345" or "tokens: 12345"
+            if lower.contains("token") {
+                if let Some(num) = Self::extract_number(line) {
+                    tokens = num;
+                }
+            }
+            // Parse "Total turns: 5" or "turns: 5"
+            if lower.contains("turn") {
+                if let Some(num) = Self::extract_number(line) {
+                    turns = num as u32;
+                }
+            }
+        }
+
+        (turns, tokens)
+    }
+
+    /// Extract the last number from a string (handles commas).
+    fn extract_number(s: &str) -> Option<u64> {
+        // Find sequences of digits (possibly with commas)
+        let cleaned: String = s.chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == ',')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .filter(|c| *c != ',')
+            .collect();
+        cleaned.parse().ok()
+    }
+
     /// Parse the sub-agent output to detect blockers.
     fn detect_blocker(output: &str) -> Option<String> {
         let lower = output.to_lowercase();
@@ -216,6 +260,7 @@ impl TaskExecutor for CliExecutor {
         }
 
         let blocker = Self::detect_blocker(&combined_output);
+        let (parsed_turns, parsed_tokens) = Self::parse_usage(&stderr);
 
         if !success {
             warn!(
@@ -225,14 +270,11 @@ impl TaskExecutor for CliExecutor {
             );
         }
 
-        // Note: turns_used and tokens_used are approximations.
-        // The CLI doesn't expose these directly; a future API-based executor
-        // could provide exact counts.
         Ok(TaskResult {
             success,
             output: combined_output,
-            turns_used: 0,  // CLI doesn't report turns
-            tokens_used: 0, // CLI doesn't report tokens
+            turns_used: parsed_turns,
+            tokens_used: parsed_tokens,
             blocker,
         })
     }
