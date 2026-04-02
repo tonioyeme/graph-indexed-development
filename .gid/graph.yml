@@ -206,6 +206,121 @@ nodes:
   tags:
   - p1
   - ritual
+- id: ritual-engine
+  title: 'RitualEngine: state machine with run/approve/skip/cancel'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-definition
+  title: 'RitualDefinition: YAML schema with phases, approval, skip_if'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-template
+  title: 'Ritual templates: predefined workflows (feature, bugfix, research)'
+  status: done
+  tags:
+  - p1
+  - ritual
+- id: ritual-approval
+  title: 'Approval system: required/auto/mixed per-phase gates'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-artifact
+  title: 'Artifact checking: glob-based output verification'
+  status: done
+  tags:
+  - p0
+  - ritual
+- id: ritual-cli-basic
+  title: gid ritual init/status/approve/skip/cancel CLI commands
+  status: done
+  tags:
+  - p0
+  - ritual
+  - cli
+- id: harness-scheduler
+  title: 'Task harness scheduler: topological ordering + parallelism'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-executor
+  title: 'Task harness executor: run tasks with agent delegation'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-replanner
+  title: 'Task harness replanner: dynamic re-planning on failure'
+  status: done
+  tags:
+  - p1
+  - harness
+- id: harness-verifier
+  title: 'Task harness verifier: test execution + quality checks'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-context
+  title: 'Task harness context: working memory + file tracking'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-telemetry
+  title: 'Task harness telemetry: execution logging + metrics'
+  status: done
+  tags:
+  - p1
+  - harness
+- id: harness-notifier
+  title: 'Task harness notifier: channel notifications on events'
+  status: done
+  tags:
+  - p1
+  - harness
+- id: harness-log-reader
+  title: 'Task harness log reader: execution-log.jsonl parsing'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-worktree
+  title: 'Task harness worktree: git branch isolation per task'
+  status: done
+  tags:
+  - p1
+  - harness
+- id: harness-topology
+  title: 'Task harness topology: dependency DAG analysis'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-planner
+  title: 'Task harness planner: initial task ordering from graph'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-config
+  title: 'Task harness config: YAML configuration schema'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: harness-execution-state
+  title: 'Task harness execution state: persistence + recovery'
+  status: done
+  tags:
+  - p0
+  - harness
 edges:
 - from: graph-types
   to: workspace-setup
@@ -287,4 +402,58 @@ edges:
   relation: depends_on
 - from: ritual-cli-run
   to: ritual-notifier
+  relation: depends_on
+- from: ritual-definition
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-approval
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-artifact
+  to: ritual-engine
+  relation: depends_on
+- from: ritual-engine
+  to: ritual-cli-basic
+  relation: depends_on
+- from: ritual-engine
+  to: ritual-skill-executor
+  relation: depends_on
+- from: ritual-engine
+  to: ritual-toolscope
+  relation: depends_on
+- from: ritual-template
+  to: ritual-cli-basic
+  relation: depends_on
+- from: harness-topology
+  to: harness-scheduler
+  relation: depends_on
+- from: harness-scheduler
+  to: harness-executor
+  relation: depends_on
+- from: harness-context
+  to: harness-executor
+  relation: depends_on
+- from: harness-executor
+  to: harness-verifier
+  relation: depends_on
+- from: harness-executor
+  to: harness-replanner
+  relation: depends_on
+- from: harness-executor
+  to: harness-telemetry
+  relation: depends_on
+- from: harness-log-reader
+  to: harness-telemetry
+  relation: depends_on
+- from: harness-config
+  to: harness-scheduler
+  relation: depends_on
+- from: harness-planner
+  to: harness-scheduler
+  relation: depends_on
+- from: harness-executor
+  to: ritual-harness-executor
+  relation: depends_on
+- from: harness-execution-state
+  to: harness-executor
   relation: depends_on
