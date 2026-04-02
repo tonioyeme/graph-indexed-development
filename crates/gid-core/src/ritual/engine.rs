@@ -36,7 +36,7 @@ pub struct RitualState {
 
 /// Overall status of the ritual.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum RitualStatus {
     /// Ritual is actively running.
     Running,
@@ -616,5 +616,26 @@ mod tests {
         engine.cancel().unwrap();
         
         assert!(matches!(engine.state.status, RitualStatus::Cancelled));
+    }
+
+    #[test]
+    fn test_ritual_state_json_roundtrip() {
+        let json_str = r#"{
+            "ritual_name": "test-toolscope",
+            "started_at": "2026-04-02T21:50:00Z",
+            "current_phase": 0,
+            "phase_states": [
+                {"phase_id": "research", "status": "running", "started_at": "2026-04-02T21:50:00Z"},
+                {"phase_id": "draft-requirements", "status": "pending"},
+                {"phase_id": "execute-tasks", "status": "pending"}
+            ],
+            "status": {"type": "running"}
+        }"#;
+        let state: RitualState = serde_json::from_str(json_str).expect("Failed to parse RitualState JSON");
+        assert!(matches!(state.status, RitualStatus::Running));
+        assert_eq!(state.current_phase, 0);
+        assert_eq!(state.phase_states.len(), 3);
+        assert!(matches!(state.phase_states[0].status, PhaseStatus::Running));
+        assert!(matches!(state.phase_states[1].status, PhaseStatus::Pending));
     }
 }
