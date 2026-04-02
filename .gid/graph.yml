@@ -321,6 +321,42 @@ nodes:
   tags:
   - p0
   - harness
+- id: complexity
+  title: Code complexity analysis (cyclomatic, cognitive)
+  status: done
+  tags:
+  - p2
+  - code-intel
+- id: parser
+  title: 'Source code parser: Rust/TS/Python entity extraction'
+  status: done
+  tags:
+  - p1
+  - code-intel
+- id: validator
+  title: 'Graph validator: consistency checks + suggestions'
+  status: done
+  tags:
+  - p2
+  - core
+- id: task-graph-knowledge
+  title: 'Task-level knowledge cache: findings + file associations'
+  status: done
+  tags:
+  - p1
+  - harness
+- id: harness-types
+  title: 'Harness shared types: TaskStatus, ExecutionPlan, etc.'
+  status: done
+  tags:
+  - p0
+  - harness
+- id: mcp-package
+  title: MCP server TypeScript package (packages/mcp/)
+  status: done
+  tags:
+  - p2
+  - integration
 edges:
 - from: graph-types
   to: workspace-setup
@@ -456,4 +492,34 @@ edges:
   relation: depends_on
 - from: ritual-harness-executor
   to: harness-executor
+  relation: depends_on
+- from: parser
+  to: graph-types
+  relation: depends_on
+- from: code-graph
+  to: parser
+  relation: depends_on
+- from: complexity
+  to: parser
+  relation: depends_on
+- from: validator
+  to: graph-types
+  relation: depends_on
+- from: advise-cmd
+  to: validator
+  relation: depends_on
+- from: task-graph-knowledge
+  to: task-management
+  relation: depends_on
+- from: harness-executor
+  to: task-graph-knowledge
+  relation: depends_on
+- from: harness-executor
+  to: harness-types
+  relation: depends_on
+- from: harness-scheduler
+  to: harness-types
+  relation: depends_on
+- from: mcp-package
+  to: mcp-server
   relation: depends_on
