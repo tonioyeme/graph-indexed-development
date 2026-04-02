@@ -16,6 +16,10 @@ pub mod task_graph_knowledge;
 pub mod complexity;
 pub mod harness;
 
+// Ritual module (requires "ritual" feature)
+#[cfg(feature = "ritual")]
+pub mod ritual;
+
 // Re-export commonly used types
 pub use graph::*;
 pub use query::QueryEngine;
@@ -65,4 +69,14 @@ pub use task_graph_knowledge::{
 pub use complexity::{
     Complexity, ComplexityReport, assess_complexity_from_graph, assess_complexity,
     is_high_risk_change, assess_risk_level,
+};
+
+// Ritual re-exports (requires "ritual" feature)
+#[cfg(feature = "ritual")]
+pub use ritual::{
+    RitualDefinition, PhaseDefinition, PhaseKind, ApprovalRequirement,
+    SkipCondition, FailureStrategy, ArtifactRef, ArtifactSpec, PhaseHooks,
+    RitualConfig, RitualEngine, RitualState, RitualStatus, PhaseState,
+    PhaseStatus, PhaseExecutor, PhaseResult, PhaseContext, ArtifactManager,
+    ApprovalGate, ApprovalRequest, TemplateRegistry, TemplateSummary,
 };

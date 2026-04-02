@@ -358,6 +358,14 @@ enum Commands {
 
     /// Show execution statistics from telemetry log
     Stats,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Ritual Commands (requires "ritual" feature)
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Ritual pipeline orchestration
+    #[command(subcommand)]
+    Ritual(RitualCommands),
 }
 
 #[derive(Subcommand)]
@@ -480,6 +488,38 @@ enum RefactorCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum RitualCommands {
+    /// Initialize a new ritual from a template
+    Init {
+        /// Template name (default: full-dev-cycle)
+        #[arg(short, long, default_value = "full-dev-cycle")]
+        template: String,
+    },
+
+    /// Run the ritual (start or resume)
+    Run {
+        /// Auto-approve all gates (useful for CI/testing)
+        #[arg(long)]
+        auto_approve: bool,
+    },
+
+    /// Show current ritual status
+    Status,
+
+    /// Approve the current pending phase
+    Approve,
+
+    /// Skip the current phase
+    Skip,
+
+    /// Cancel the ritual
+    Cancel,
+
+    /// List available templates
+    Templates,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -558,6 +598,26 @@ fn main() -> Result<()> {
             cmd_execute(resolve_graph_path(cli.graph)?, max_concurrent, model, approval_mode, dry_run, cli.json)
         }
         Commands::Stats => cmd_stats(resolve_graph_path(cli.graph)?, cli.json),
+
+        // Ritual commands
+        Commands::Ritual(rc) => {
+            let cwd = std::env::current_dir()?;
+            match rc {
+                RitualCommands::Init { template } => cmd_ritual_init(&cwd, &template, cli.json),
+                RitualCommands::Run { auto_approve } => {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(cmd_ritual_run(&cwd, auto_approve, cli.json))
+                }
+                RitualCommands::Status => cmd_ritual_status(&cwd, cli.json),
+                RitualCommands::Approve => {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(cmd_ritual_approve(&cwd, cli.json))
+                }
+                RitualCommands::Skip => cmd_ritual_skip(&cwd, cli.json),
+                RitualCommands::Cancel => cmd_ritual_cancel(&cwd, cli.json),
+                RitualCommands::Templates => cmd_ritual_templates(&cwd, cli.json),
+            }
+        }
     }
 }
 
@@ -2234,5 +2294,367 @@ fn status_icon(status: &NodeStatus) -> &'static str {
         NodeStatus::Cancelled => "⊘",
         NodeStatus::Failed => "✘",
         NodeStatus::NeedsResolution => "⚠",
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Ritual Commands
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_ritual_init(project_root: &std::path::Path, template_name: &str, json: bool) -> Result<()> {
+    use gid_core::ritual::TemplateRegistry;
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    if ritual_path.exists() {
+        bail!("Ritual already exists: {}", ritual_path.display());
+    }
+    
+    // Load template
+    let registry = TemplateRegistry::for_project(project_root);
+    let template = registry.load(template_name)
+        .with_context(|| format!("Template not found: {}", template_name))?;
+    
+    // Write ritual.yml
+    std::fs::create_dir_all(project_root.join(".gid"))?;
+    let yaml = serde_yaml::to_string(&template)?;
+    std::fs::write(&ritual_path, &yaml)?;
+    
+    if json {
+        println!("{}", serde_json::json!({
+            "success": true,
+            "path": ritual_path.display().to_string(),
+            "template": template_name,
+            "phases": template.phases.len()
+        }));
+    } else {
+        println!("✓ Created {} from template '{}'", ritual_path.display(), template_name);
+        println!("  {} phases defined", template.phases.len());
+        println!("\n  Phases:");
+        for (i, phase) in template.phases.iter().enumerate() {
+            println!("    {}. {} ({})", i, phase.id, phase_kind_name(&phase.kind));
+        }
+        println!("\n  Run `gid ritual run` to start the ritual.");
+    }
+    Ok(())
+}
+
+async fn cmd_ritual_run(project_root: &std::path::Path, auto_approve: bool, json: bool) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus};
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    if !ritual_path.exists() {
+        bail!("No ritual found. Run `gid ritual init` first.");
+    }
+    
+    // Load ritual definition
+    let mut template_dirs = vec![
+        project_root.join(".gid/rituals/"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        template_dirs.push(home.join(".gid/rituals/"));
+    }
+    
+    let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
+    
+    // Create or resume engine
+    let mut engine = RitualEngine::new(definition, project_root)?;
+    
+    if !json {
+        println!("▶ Running ritual: {}", engine.definition().name);
+        println!();
+    }
+    
+    // Run the ritual
+    loop {
+        let status = engine.run().await?;
+        
+        match &status {
+            RitualStatus::WaitingApproval { phase_id, message, .. } => {
+                if auto_approve {
+                    if !json {
+                        println!("⏩ Auto-approving phase: {}", phase_id);
+                    }
+                    engine.approve().await?;
+                    continue;
+                }
+                
+                if json {
+                    println!("{}", serde_json::json!({
+                        "status": "waiting_approval",
+                        "phase_id": phase_id,
+                        "message": message
+                    }));
+                } else {
+                    println!("{}", message);
+                }
+                return Ok(());
+            }
+            RitualStatus::Completed => {
+                if json {
+                    println!("{}", serde_json::json!({
+                        "status": "completed"
+                    }));
+                } else {
+                    println!("✓ Ritual completed successfully!");
+                }
+                return Ok(());
+            }
+            RitualStatus::Failed { phase_id, error } => {
+                if json {
+                    println!("{}", serde_json::json!({
+                        "status": "failed",
+                        "phase_id": phase_id,
+                        "error": error
+                    }));
+                } else {
+                    eprintln!("✗ Ritual failed at phase '{}': {}", phase_id, error);
+                }
+                std::process::exit(1);
+            }
+            RitualStatus::Cancelled => {
+                if json {
+                    println!("{}", serde_json::json!({"status": "cancelled"}));
+                } else {
+                    println!("⊘ Ritual was cancelled.");
+                }
+                return Ok(());
+            }
+            _ => break,
+        }
+    }
+    
+    Ok(())
+}
+
+fn cmd_ritual_status(project_root: &std::path::Path, json: bool) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus, PhaseStatus};
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    let state_path = project_root.join(".gid/ritual-state.json");
+    
+    if !ritual_path.exists() {
+        if json {
+            println!("{}", serde_json::json!({"exists": false}));
+        } else {
+            println!("No ritual configured. Run `gid ritual init` to create one.");
+        }
+        return Ok(());
+    }
+    
+    let template_dirs = vec![project_root.join(".gid/rituals/")];
+    let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
+    
+    if !state_path.exists() {
+        if json {
+            println!("{}", serde_json::json!({
+                "exists": true,
+                "running": false,
+                "name": definition.name,
+                "phases": definition.phases.len()
+            }));
+        } else {
+            println!("Ritual: {} ({} phases)", definition.name, definition.phases.len());
+            println!("Status: Not started");
+            println!("\nRun `gid ritual run` to start.");
+        }
+        return Ok(());
+    }
+    
+    let engine = RitualEngine::resume(definition, project_root)?;
+    let state = engine.state();
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&state)?);
+    } else {
+        println!("Ritual: {}", state.ritual_name);
+        println!("Started: {}", state.started_at);
+        
+        match &state.status {
+            RitualStatus::Running => println!("Status: Running"),
+            RitualStatus::WaitingApproval { phase_id, .. } => {
+                println!("Status: Waiting approval for '{}'", phase_id);
+            }
+            RitualStatus::Paused => println!("Status: Paused"),
+            RitualStatus::Completed => println!("Status: Completed ✓"),
+            RitualStatus::Failed { phase_id, error } => {
+                println!("Status: Failed at '{}': {}", phase_id, error);
+            }
+            RitualStatus::Cancelled => println!("Status: Cancelled"),
+        }
+        
+        println!("\nPhases:");
+        for (i, phase_state) in state.phase_states.iter().enumerate() {
+            let icon = match &phase_state.status {
+                PhaseStatus::Pending => "○",
+                PhaseStatus::Running => "◐",
+                PhaseStatus::Completed => "●",
+                PhaseStatus::Skipped { .. } => "⊘",
+                PhaseStatus::WaitingApproval => "⏸",
+                PhaseStatus::Failed => "✗",
+            };
+            let current = if i == state.current_phase { " ← current" } else { "" };
+            println!("  {} {} {}{}", icon, i, phase_state.phase_id, current);
+        }
+    }
+    
+    Ok(())
+}
+
+async fn cmd_ritual_approve(project_root: &std::path::Path, json: bool) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus};
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    let state_path = project_root.join(".gid/ritual-state.json");
+    
+    if !state_path.exists() {
+        bail!("No ritual in progress. Run `gid ritual run` first.");
+    }
+    
+    let template_dirs = vec![project_root.join(".gid/rituals/")];
+    let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
+    let mut engine = RitualEngine::resume(definition, project_root)?;
+    
+    let status = engine.approve().await?;
+    
+    match &status {
+        RitualStatus::WaitingApproval { phase_id, message, .. } => {
+            if json {
+                println!("{}", serde_json::json!({
+                    "approved": true,
+                    "next_approval": phase_id,
+                    "message": message
+                }));
+            } else {
+                println!("✓ Approved. Now waiting for next approval:\n");
+                println!("{}", message);
+            }
+        }
+        RitualStatus::Completed => {
+            if json {
+                println!("{}", serde_json::json!({"approved": true, "completed": true}));
+            } else {
+                println!("✓ Approved. Ritual completed!");
+            }
+        }
+        RitualStatus::Failed { phase_id, error } => {
+            if json {
+                println!("{}", serde_json::json!({
+                    "approved": true,
+                    "failed": true,
+                    "phase_id": phase_id,
+                    "error": error
+                }));
+            } else {
+                eprintln!("✓ Approved, but ritual failed at '{}': {}", phase_id, error);
+            }
+            std::process::exit(1);
+        }
+        _ => {
+            if json {
+                println!("{}", serde_json::json!({"approved": true, "status": format!("{:?}", status)}));
+            } else {
+                println!("✓ Approved.");
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn cmd_ritual_skip(project_root: &std::path::Path, json: bool) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine};
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    let state_path = project_root.join(".gid/ritual-state.json");
+    
+    if !state_path.exists() {
+        bail!("No ritual in progress. Run `gid ritual run` first.");
+    }
+    
+    let template_dirs = vec![project_root.join(".gid/rituals/")];
+    let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
+    let mut engine = RitualEngine::resume(definition, project_root)?;
+    
+    let phase_id = engine.state().phase_states.get(engine.state().current_phase)
+        .map(|p| p.phase_id.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    
+    engine.skip_current()?;
+    
+    if json {
+        println!("{}", serde_json::json!({
+            "skipped": true,
+            "phase_id": phase_id
+        }));
+    } else {
+        println!("⊘ Skipped phase: {}", phase_id);
+        println!("  Run `gid ritual run` to continue.");
+    }
+    
+    Ok(())
+}
+
+fn cmd_ritual_cancel(project_root: &std::path::Path, json: bool) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine};
+    
+    let ritual_path = project_root.join(".gid/ritual.yml");
+    let state_path = project_root.join(".gid/ritual-state.json");
+    
+    if !state_path.exists() {
+        bail!("No ritual in progress.");
+    }
+    
+    let template_dirs = vec![project_root.join(".gid/rituals/")];
+    let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
+    let mut engine = RitualEngine::resume(definition, project_root)?;
+    
+    engine.cancel()?;
+    
+    if json {
+        println!("{}", serde_json::json!({"cancelled": true}));
+    } else {
+        println!("⊘ Ritual cancelled.");
+        println!("  State preserved in .gid/ritual-state.json");
+        println!("  Run `gid ritual run` to resume, or delete state file to start fresh.");
+    }
+    
+    Ok(())
+}
+
+fn cmd_ritual_templates(project_root: &std::path::Path, json: bool) -> Result<()> {
+    use gid_core::ritual::TemplateRegistry;
+    
+    let registry = TemplateRegistry::for_project(project_root);
+    let templates = registry.list()?;
+    
+    if json {
+        println!("{}", serde_json::to_string_pretty(&templates)?);
+    } else {
+        println!("Available Ritual Templates\n");
+        for template in &templates {
+            let source = if template.source.to_string_lossy() == "<builtin>" {
+                "(built-in)".to_string()
+            } else {
+                format!("({})", template.source.display())
+            };
+            println!("  {} {} — {} phases", template.name, source, template.phase_count);
+            if let Some(ref desc) = template.description {
+                println!("    {}", desc);
+            }
+            println!();
+        }
+        println!("Use `gid ritual init --template <name>` to create a ritual.");
+    }
+    
+    Ok(())
+}
+
+fn phase_kind_name(kind: &gid_core::ritual::PhaseKind) -> &'static str {
+    use gid_core::ritual::PhaseKind;
+    match kind {
+        PhaseKind::Skill { .. } => "skill",
+        PhaseKind::GidCommand { .. } => "gid_command",
+        PhaseKind::Harness { .. } => "harness",
+        PhaseKind::Shell { .. } => "shell",
     }
 }

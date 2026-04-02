@@ -19,3 +19,4 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 tokio = { version = "1", features = ["full"] }
+dirs = "6"

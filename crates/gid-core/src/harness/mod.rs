@@ -17,7 +17,12 @@ pub mod context;
 pub mod config;
 
 // Re-export key types (always available)
-pub use types::*;
+pub use types::{
+    ExecutionPlan, ExecutionLayer, TaskInfo, TaskContext, TaskResult,
+    ExecutionResult, HarnessConfig, ApprovalMode, ExecutorType, GuardCheck,
+    ExecutionEvent, ExecutionStats, VerifyResult, WorktreeInfo,
+    ReplanDecision, NewTask,
+};
 pub use topology::{detect_cycles, compute_layers, critical_path, orphan_tasks};
 pub use planner::create_plan;
 pub use context::assemble_task_context;
@@ -44,7 +49,7 @@ pub mod telemetry;
 #[cfg(feature = "harness")]
 pub use scheduler::execute_plan;
 #[cfg(feature = "harness")]
-pub use executor::{TaskExecutor, CliExecutor};
+pub use executor::{TaskExecutor, CliExecutor, ApiExecutor, create_executor};
 #[cfg(feature = "harness")]
 pub use worktree::{WorktreeManager, GitWorktreeManager};
 #[cfg(feature = "harness")]

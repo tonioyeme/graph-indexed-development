@@ -94,6 +94,19 @@ pub struct ExecutionResult {
     pub duration_secs: u64,
 }
 
+/// Executor type for sub-agent spawning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorType {
+    /// Automatically select based on environment (API if auth pool exists, CLI otherwise).
+    #[default]
+    Auto,
+    /// Use CLI executor (`claude` command).
+    Cli,
+    /// Use API executor (requires agentctl auth pool).
+    Api,
+}
+
 /// Harness configuration with cascading precedence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessConfig {
@@ -121,6 +134,12 @@ pub struct HarnessConfig {
     /// Invariant checks mapping GUARD IDs to commands.
     #[serde(default)]
     pub invariant_checks: HashMap<String, GuardCheck>,
+    /// Executor type for sub-agent spawning.
+    #[serde(default)]
+    pub executor: ExecutorType,
+    /// Custom path to agentctl auth pool (for API executor).
+    #[serde(default)]
+    pub auth_pool_path: Option<std::path::PathBuf>,
 }
 
 impl Default for HarnessConfig {
@@ -134,6 +153,8 @@ impl Default for HarnessConfig {
             model: "claude-sonnet-4-5".to_string(),
             max_iterations: 80,
             invariant_checks: HashMap::new(),
+            executor: ExecutorType::Auto,
+            auth_pool_path: None,
         }
     }
 }

@@ -3,13 +3,16 @@
 //! The [`TaskExecutor`] trait abstracts sub-agent spawning, allowing different
 //! implementations (CLI, API, mock). [`CliExecutor`] spawns the `claude` CLI
 //! in a git worktree with a focused prompt (no workspace files).
+//!
+//! [`ApiExecutor`] uses the agentctl-auth crate's Claude API client directly,
+//! providing real token usage statistics and avoiding CLI overhead.
 
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 
 use super::types::{TaskContext, TaskResult, HarnessConfig};
 
@@ -277,6 +280,450 @@ impl TaskExecutor for CliExecutor {
             tokens_used: parsed_tokens,
             blocker,
         })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// API-based Executor (uses agentctl-auth Claude client)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// API-based executor that uses the Claude Messages API directly.
+///
+/// Provides real token usage statistics from API responses, unlike the CLI
+/// executor which parses stderr output. Supports tool use for Read, Write,
+/// Edit, and Bash operations in the task worktree.
+#[derive(Debug, Clone)]
+pub struct ApiExecutor {
+    /// Path to the agentctl auth.toml file.
+    pub pool_path: PathBuf,
+    /// Timeout for bash commands (default: 30 seconds).
+    pub bash_timeout: Duration,
+}
+
+impl Default for ApiExecutor {
+    fn default() -> Self {
+        Self {
+            pool_path: dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".agentctl")
+                .join("auth.toml"),
+            bash_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ApiExecutor {
+    /// Create a new API executor with the default auth pool path (~/.agentctl/auth.toml).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create an API executor with a custom pool path.
+    pub fn with_pool_path(pool_path: impl Into<PathBuf>) -> Self {
+        Self {
+            pool_path: pool_path.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Check if the auth pool exists and is usable.
+    pub fn is_available(&self) -> bool {
+        self.pool_path.exists()
+    }
+
+    /// Build tool definitions for the sub-agent.
+    fn build_tools() -> Vec<agentctl_auth::Tool> {
+        use agentctl_auth::Tool;
+        use serde_json::json;
+
+        vec![
+            Tool::new(
+                "Read",
+                "Read the contents of a file at the specified path. Use this to examine existing code, configuration files, or any text-based files in the project.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to read (relative to the project root)"
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            ),
+            Tool::new(
+                "Write",
+                "Write content to a file at the specified path. Creates the file if it doesn't exist, or overwrites if it does. Creates parent directories as needed.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to write to (relative to the project root)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The content to write to the file"
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            ),
+            Tool::new(
+                "Edit",
+                "Make a precise edit to a file by replacing exact text. The old_text must match exactly (including whitespace). Use this for surgical edits to existing files.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "The path to the file to edit (relative to the project root)"
+                        },
+                        "old_text": {
+                            "type": "string",
+                            "description": "The exact text to find and replace (must match exactly including whitespace)"
+                        },
+                        "new_text": {
+                            "type": "string",
+                            "description": "The new text to replace the old text with"
+                        }
+                    },
+                    "required": ["path", "old_text", "new_text"]
+                }),
+            ),
+            Tool::new(
+                "Bash",
+                "Execute a shell command. Use this for running tests, build commands, git operations, or any other shell command. Commands run in the project root directory.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            ),
+        ]
+    }
+}
+
+/// Tool handler that executes file/bash operations in a worktree.
+struct WorktreeToolHandler {
+    worktree_path: PathBuf,
+    bash_timeout: Duration,
+}
+
+impl WorktreeToolHandler {
+    fn new(worktree_path: PathBuf, bash_timeout: Duration) -> Self {
+        Self { worktree_path, bash_timeout }
+    }
+
+    /// Resolve a path relative to the worktree, ensuring it stays within bounds.
+    fn resolve_path(&self, path: &str) -> Result<PathBuf> {
+        let resolved = self.worktree_path.join(path);
+        let canonical = if resolved.exists() {
+            resolved.canonicalize()?
+        } else {
+            // For non-existent files, canonicalize the parent and append the filename
+            if let Some(parent) = resolved.parent() {
+                if parent.exists() {
+                    let canonical_parent = parent.canonicalize()?;
+                    canonical_parent.join(resolved.file_name().unwrap_or_default())
+                } else {
+                    // Create parent directories for new files
+                    std::fs::create_dir_all(parent)?;
+                    let canonical_parent = parent.canonicalize()?;
+                    canonical_parent.join(resolved.file_name().unwrap_or_default())
+                }
+            } else {
+                resolved
+            }
+        };
+
+        // Security: ensure the resolved path is within the worktree
+        let worktree_canonical = self.worktree_path.canonicalize()?;
+        if !canonical.starts_with(&worktree_canonical) {
+            anyhow::bail!("Path escapes worktree: {}", path);
+        }
+
+        Ok(canonical)
+    }
+
+    async fn handle_read(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        let path = input["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
+        
+        let resolved = self.resolve_path(path)?;
+        debug!(path = %resolved.display(), "Reading file");
+        
+        match std::fs::read_to_string(&resolved) {
+            Ok(content) => Ok(agentctl_auth::ToolOutput::success(content)),
+            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
+        }
+    }
+
+    async fn handle_write(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        let path = input["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'content' field"))?;
+        
+        let resolved = self.resolve_path(path)?;
+        debug!(path = %resolved.display(), bytes = content.len(), "Writing file");
+        
+        // Create parent directories if needed
+        if let Some(parent) = resolved.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        match std::fs::write(&resolved, content) {
+            Ok(()) => Ok(agentctl_auth::ToolOutput::success(format!("Written {} bytes to {}", content.len(), path))),
+            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
+        }
+    }
+
+    async fn handle_edit(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        let path = input["path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
+        let old_text = input["old_text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'old_text' field"))?;
+        let new_text = input["new_text"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'new_text' field"))?;
+        
+        let resolved = self.resolve_path(path)?;
+        debug!(path = %resolved.display(), "Editing file");
+        
+        let content = match std::fs::read_to_string(&resolved) {
+            Ok(c) => c,
+            Err(e) => return Ok(agentctl_auth::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
+        };
+        
+        if !content.contains(old_text) {
+            return Ok(agentctl_auth::ToolOutput::error(format!(
+                "old_text not found in {}. Make sure it matches exactly including whitespace.",
+                path
+            )));
+        }
+        
+        let new_content = content.replacen(old_text, new_text, 1);
+        match std::fs::write(&resolved, new_content) {
+            Ok(()) => Ok(agentctl_auth::ToolOutput::success(format!("Edited {}", path))),
+            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
+        }
+    }
+
+    async fn handle_bash(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        let command = input["command"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' field"))?;
+        
+        debug!(command = %command, "Executing bash");
+        
+        let result = tokio::time::timeout(
+            self.bash_timeout,
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .current_dir(&self.worktree_path)
+                .output(),
+        )
+        .await;
+        
+        match result {
+            Ok(Ok(output)) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let combined = if stderr.is_empty() {
+                    stdout.to_string()
+                } else {
+                    format!("{}\n--- stderr ---\n{}", stdout, stderr)
+                };
+                
+                if output.status.success() {
+                    Ok(agentctl_auth::ToolOutput::success(combined))
+                } else {
+                    Ok(agentctl_auth::ToolOutput::error(format!(
+                        "Command exited with code {}\n{}",
+                        output.status.code().unwrap_or(-1),
+                        combined
+                    )))
+                }
+            }
+            Ok(Err(e)) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to execute command: {}", e))),
+            Err(_) => Ok(agentctl_auth::ToolOutput::error(format!(
+                "Command timed out after {} seconds",
+                self.bash_timeout.as_secs()
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl agentctl_auth::ToolHandler for WorktreeToolHandler {
+    async fn handle(&self, name: &str, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        match name {
+            "Read" => self.handle_read(input).await,
+            "Write" => self.handle_write(input).await,
+            "Edit" => self.handle_edit(input).await,
+            "Bash" => self.handle_bash(input).await,
+            _ => Ok(agentctl_auth::ToolOutput::error(format!("Unknown tool: {}", name))),
+        }
+    }
+}
+
+#[async_trait]
+impl TaskExecutor for ApiExecutor {
+    async fn spawn(
+        &self,
+        context: &TaskContext,
+        worktree_path: &Path,
+        config: &HarnessConfig,
+    ) -> Result<TaskResult> {
+        let prompt = CliExecutor::build_prompt(context);
+        let start = Instant::now();
+
+        info!(
+            task_id = %context.task_info.id,
+            worktree = %worktree_path.display(),
+            model = %config.model,
+            "Spawning sub-agent via API"
+        );
+
+        // Load auth pool
+        let pool = agentctl_auth::AuthPool::load(&self.pool_path)?;
+        
+        // Build Claude client
+        let client = agentctl_auth::claude::Client::builder()
+            .pool(&pool)
+            .build()?;
+
+        // Build tools and handler
+        let tools = Self::build_tools();
+        let handler = WorktreeToolHandler::new(worktree_path.to_path_buf(), self.bash_timeout);
+
+        // System prompt for sub-agent
+        let system = "You are a focused coding agent. Complete the task described below. Use the provided tools to read, write, and edit files, and to run commands. Be efficient and precise. When done, provide a brief summary of what you accomplished.";
+
+        // Run agent loop
+        let result = client
+            .run_agent_loop(
+                &config.model,
+                system,
+                &prompt,
+                &tools,
+                config.max_iterations,
+                &handler,
+            )
+            .await;
+
+        let _duration = start.elapsed();
+
+        match result {
+            Ok(loop_result) => {
+                // Auto-commit any changes the sub-agent made in the worktree
+                let has_changes = tokio::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(worktree_path)
+                    .output()
+                    .await
+                    .map(|o| !o.stdout.is_empty())
+                    .unwrap_or(false);
+
+                if has_changes {
+                    let _ = tokio::process::Command::new("git")
+                        .args(["add", "-A"])
+                        .current_dir(worktree_path)
+                        .output()
+                        .await;
+                    let _ = tokio::process::Command::new("git")
+                        .args(["commit", "-m", &format!("gid: task {} implementation", context.task_info.id)])
+                        .current_dir(worktree_path)
+                        .output()
+                        .await;
+                }
+
+                let blocker = CliExecutor::detect_blocker(&loop_result.final_text);
+
+                info!(
+                    task_id = %context.task_info.id,
+                    turns = loop_result.turns_used,
+                    input_tokens = loop_result.total_input_tokens,
+                    output_tokens = loop_result.total_output_tokens,
+                    tools_called = loop_result.tool_calls.len(),
+                    "Sub-agent completed via API"
+                );
+
+                Ok(TaskResult {
+                    success: true,
+                    output: loop_result.final_text,
+                    turns_used: loop_result.turns_used,
+                    tokens_used: loop_result.total_input_tokens + loop_result.total_output_tokens,
+                    blocker,
+                })
+            }
+            Err(e) => {
+                warn!(
+                    task_id = %context.task_info.id,
+                    error = %e,
+                    "Sub-agent failed via API"
+                );
+
+                Ok(TaskResult {
+                    success: false,
+                    output: format!("API error: {}", e),
+                    turns_used: 0,
+                    tokens_used: 0,
+                    blocker: Some(format!("API error: {}", e)),
+                })
+            }
+        }
+    }
+}
+
+/// Create the appropriate executor based on configuration.
+///
+/// - `Auto`: If agentctl auth.toml exists, uses ApiExecutor; otherwise CliExecutor.
+/// - `Cli`: Always uses CliExecutor.
+/// - `Api`: Always uses ApiExecutor (fails if auth pool doesn't exist).
+pub fn create_executor(config: &HarnessConfig) -> Box<dyn TaskExecutor> {
+    use super::types::ExecutorType;
+
+    match config.executor {
+        ExecutorType::Cli => {
+            info!("Using CLI executor (configured)");
+            Box::new(CliExecutor::new())
+        }
+        ExecutorType::Api => {
+            let api_executor = if let Some(ref path) = config.auth_pool_path {
+                ApiExecutor::with_pool_path(path)
+            } else {
+                ApiExecutor::new()
+            };
+            info!(pool_path = %api_executor.pool_path.display(), "Using API executor (configured)");
+            Box::new(api_executor)
+        }
+        ExecutorType::Auto => {
+            let api_executor = if let Some(ref path) = config.auth_pool_path {
+                ApiExecutor::with_pool_path(path)
+            } else {
+                ApiExecutor::new()
+            };
+            if api_executor.is_available() {
+                info!(pool_path = %api_executor.pool_path.display(), "Using API executor (auto-detected)");
+                Box::new(api_executor)
+            } else {
+                info!("Using CLI executor (no auth pool found)");
+                Box::new(CliExecutor::new())
+            }
+        }
     }
 }
 
