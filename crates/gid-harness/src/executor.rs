@@ -164,17 +164,18 @@ impl TaskExecutor for CliExecutor {
             "Spawning sub-agent via CLI"
         );
 
-        // Build command: claude --print --model <model> --max-turns <n> -p "<prompt>"
+        // Build command: claude -p "<prompt>" --model <model> --max-turns <n>
+        // Note: do NOT use --print — that prevents tool execution (file writes).
+        // -p sends the prompt and enables tool use (read/write/exec).
         let output = tokio::process::Command::new(&self.claude_bin)
-            .arg("--print")
+            .arg("-p")
+            .arg(&prompt)
             .arg("--model")
             .arg(&config.model)
             .arg("--max-turns")
             .arg(config.max_iterations.to_string())
-            .arg("--permission-mode")
-            .arg("bypassPermissions")
-            .arg("-p")
-            .arg(&prompt)
+            .arg("--allowedTools")
+            .arg("Read,Write,Edit,Bash")
             .current_dir(worktree_path)
             .output()
             .await?;
@@ -188,6 +189,31 @@ impl TaskExecutor for CliExecutor {
         } else {
             format!("{}\n--- stderr ---\n{}", stdout, stderr)
         };
+
+        // Auto-commit any changes the sub-agent made in the worktree
+        // This is needed for the merge step to have something to merge
+        let has_changes = tokio::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(worktree_path)
+            .output()
+            .await
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+
+        if has_changes {
+            // Stage all changes
+            let _ = tokio::process::Command::new("git")
+                .args(["add", "-A"])
+                .current_dir(worktree_path)
+                .output()
+                .await;
+            // Commit
+            let _ = tokio::process::Command::new("git")
+                .args(["commit", "-m", &format!("gid: task {} implementation", context.task_info.id)])
+                .current_dir(worktree_path)
+                .output()
+                .await;
+        }
 
         let blocker = Self::detect_blocker(&combined_output);
 
