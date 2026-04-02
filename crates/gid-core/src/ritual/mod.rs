@@ -14,6 +14,7 @@ pub mod executor;
 pub mod artifact;
 pub mod approval;
 pub mod template;
+pub mod scope;
 
 // Re-export key types
 pub use definition::{
@@ -26,3 +27,4 @@ pub use executor::{PhaseExecutor, PhaseResult, PhaseContext};
 pub use artifact::ArtifactManager;
 pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
+pub use scope::{ToolScope, BashPolicy, default_scope_for_phase};
