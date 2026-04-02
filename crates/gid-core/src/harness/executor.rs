@@ -11,7 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use gid_core::harness::types::{TaskContext, TaskResult, HarnessConfig};
+use super::types::{TaskContext, TaskResult, HarnessConfig};
 
 /// Trait for spawning sub-agents to execute tasks.
 ///
@@ -283,7 +283,7 @@ impl TaskExecutor for CliExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gid_core::harness::types::TaskInfo;
+    use crate::harness::types::TaskInfo;
 
     fn sample_context() -> TaskContext {
         TaskContext {

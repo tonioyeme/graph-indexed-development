@@ -18,21 +18,21 @@ use tracing::{info, warn, error};
 
 use std::path::{Path, PathBuf};
 
-use gid_core::graph::{Graph, NodeStatus};
-use gid_core::harness::types::{
+use crate::graph::{Graph, NodeStatus};
+use super::types::{
     ExecutionPlan, ExecutionResult, HarnessConfig,
     ExecutionEvent, VerifyResult,
 };
-use gid_core::code_graph::CodeGraph;
-use gid_core::unified::build_unified_graph;
-use gid_core::advise::analyze as advise_analyze;
-use gid_core::save_graph;
+use crate::code_graph::CodeGraph;
+use crate::unified::build_unified_graph;
+use crate::advise::analyze as advise_analyze;
+use crate::save_graph;
 
-use crate::executor::TaskExecutor;
-use crate::replanner::Replanner;
-use crate::verifier::Verifier;
-use crate::worktree::WorktreeManager;
-use crate::telemetry::TelemetryLogger;
+use super::executor::TaskExecutor;
+use super::replanner::Replanner;
+use super::verifier::Verifier;
+use super::worktree::WorktreeManager;
+use super::telemetry::TelemetryLogger;
 
 /// Execute a plan by driving the full task lifecycle.
 ///
@@ -136,7 +136,7 @@ pub async fn execute_plan(
         // Phase 2: Process in chunks of max_concurrent, spawn in parallel
         for chunk in eligible_tasks.chunks(config.max_concurrent) {
             // 2a: Mark all tasks in chunk as in-progress and create worktrees
-            let mut prepared: Vec<(gid_core::harness::types::TaskInfo, PathBuf, gid_core::harness::types::TaskContext)> = Vec::new();
+            let mut prepared: Vec<(super::types::TaskInfo, PathBuf, super::types::TaskContext)> = Vec::new();
 
             for task in chunk {
                 if let Some(node) = graph.get_node_mut(&task.id) {
@@ -164,11 +164,11 @@ pub async fn execute_plan(
                 };
 
                 // Build full context via assemble_task_context (resolves design docs, goals, guards)
-                let context = match gid_core::harness::assemble_task_context(graph, &task.id, gid_root) {
+                let context = match super::assemble_task_context(graph, &task.id, gid_root) {
                     Ok(ctx) => ctx,
                     Err(e) => {
                         warn!(task_id = %task.id, error = %e, "Context assembly failed, using basic context");
-                        gid_core::harness::types::TaskContext {
+                        super::types::TaskContext {
                             task_info: task.clone(),
                             goals_text: task.goals.clone(),
                             design_excerpt: None,
@@ -255,14 +255,14 @@ pub async fn execute_plan(
                             );
 
                             match decision {
-                                gid_core::harness::types::ReplanDecision::Retry => {
+                                super::types::ReplanDecision::Retry => {
                                     *retries += 1;
                                     warn!(task_id = %task.id, retry = *retries, "Replanner: retry");
                                     if let Some(node) = graph.get_node_mut(&task.id) {
                                         node.status = NodeStatus::Todo;
                                     }
                                 }
-                                gid_core::harness::types::ReplanDecision::Escalate(reason) => {
+                                super::types::ReplanDecision::Escalate(reason) => {
                                     warn!(task_id = %task.id, reason = %reason, "Replanner: escalate");
                                     if let Some(node) = graph.get_node_mut(&task.id) {
                                         node.status = NodeStatus::Failed;
@@ -275,7 +275,7 @@ pub async fn execute_plan(
                                         timestamp: Utc::now(),
                                     }).ok();
                                 }
-                                gid_core::harness::types::ReplanDecision::AddTasks(new_tasks) => {
+                                super::types::ReplanDecision::AddTasks(new_tasks) => {
                                     // Future: add new tasks to graph and re-plan
                                     info!(task_id = %task.id, new = new_tasks.len(), "Replanner: add tasks (not yet implemented)");
                                     if let Some(node) = graph.get_node_mut(&task.id) {
@@ -325,7 +325,7 @@ pub async fn execute_plan(
         }
 
         // Run guard checks
-        let guard_checks: Vec<(&str, &gid_core::harness::types::GuardCheck)> = config.invariant_checks.iter()
+        let guard_checks: Vec<(&str, &super::types::GuardCheck)> = config.invariant_checks.iter()
             .map(|(id, check)| (id.as_str(), check))
             .collect();
 
@@ -468,10 +468,10 @@ mod tests {
     use std::sync::Arc;
     use async_trait::async_trait;
 
-    use gid_core::graph::{Node, Edge};
-    use gid_core::harness::types::*;
-    use crate::executor::TaskExecutor;
-    use crate::worktree::WorktreeManager;
+    use crate::graph::{Node, Edge};
+    use crate::harness::types::*;
+    use crate::harness::executor::TaskExecutor;
+    use crate::harness::worktree::WorktreeManager;
 
     /// Mock executor that always succeeds.
     struct MockSuccessExecutor;

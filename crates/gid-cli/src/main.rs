@@ -1816,13 +1816,13 @@ fn cmd_execute(
 
     // Set up executor and worktree manager
     let project_dir = gid_dir.parent().unwrap_or(std::path::Path::new("."));
-    let worktree_mgr = gid_harness::worktree::GitWorktreeManager::new(project_dir.to_path_buf());
-    let executor = gid_harness::executor::CliExecutor::new();
+    let worktree_mgr = gid_core::harness::GitWorktreeManager::new(project_dir.to_path_buf());
+    let executor = gid_core::harness::CliExecutor::new();
 
     // Run async execution
     let rt = tokio::runtime::Runtime::new()?;
     let mut graph_mut = graph;
-    let result = rt.block_on(gid_harness::scheduler::execute_plan(
+    let result = rt.block_on(gid_core::harness::execute_plan(
         &plan,
         &mut graph_mut,
         &config,

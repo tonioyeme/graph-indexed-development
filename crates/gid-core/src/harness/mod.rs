@@ -1,10 +1,14 @@
-//! Task execution harness — planning, topology analysis, and context assembly.
+//! Task execution harness — planning, topology analysis, context assembly, and execution.
 //!
-//! This module provides the pure, deterministic planning functions for the
-//! GID task execution harness. It does NOT perform I/O or spawn sub-agents.
+//! This module provides both the pure, deterministic planning functions and the
+//! async execution engine for the GID task execution harness.
 //!
-//! The execution engine (scheduler, executor, worktree manager) lives in
-//! the `gid-harness` crate, which depends on this module for types and planning.
+//! ## Feature Flags
+//!
+//! - **Base** (no feature): Just types, topology, planner, context, config (pure functions)
+//! - **`harness`**: Adds async execution engine (scheduler, executor, worktree, verifier, replanner, telemetry)
+//! - **`ritual`**: Implies harness (reserved for future ritual/ceremony features)
+//! - **`full`**: Enables all features
 
 pub mod types;
 pub mod topology;
@@ -12,9 +16,40 @@ pub mod planner;
 pub mod context;
 pub mod config;
 
-// Re-export key types
+// Re-export key types (always available)
 pub use types::*;
 pub use topology::{detect_cycles, compute_layers, critical_path, orphan_tasks};
 pub use planner::create_plan;
 pub use context::assemble_task_context;
 pub use config::load_config;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Async Execution Engine (requires "harness" feature)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "harness")]
+pub mod scheduler;
+#[cfg(feature = "harness")]
+pub mod executor;
+#[cfg(feature = "harness")]
+pub mod worktree;
+#[cfg(feature = "harness")]
+pub mod verifier;
+#[cfg(feature = "harness")]
+pub mod replanner;
+#[cfg(feature = "harness")]
+pub mod telemetry;
+
+// Re-export execution engine types (harness feature)
+#[cfg(feature = "harness")]
+pub use scheduler::execute_plan;
+#[cfg(feature = "harness")]
+pub use executor::{TaskExecutor, CliExecutor};
+#[cfg(feature = "harness")]
+pub use worktree::{WorktreeManager, GitWorktreeManager};
+#[cfg(feature = "harness")]
+pub use verifier::{Verifier, GuardResult};
+#[cfg(feature = "harness")]
+pub use replanner::Replanner;
+#[cfg(feature = "harness")]
+pub use telemetry::TelemetryLogger;

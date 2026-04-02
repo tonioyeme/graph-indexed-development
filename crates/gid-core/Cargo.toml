@@ -1,12 +1,19 @@
 [package]
 name = "gid-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 description = "Graph-Indexed Development core library — graph-based project management and code analysis for AI agents"
 license = "MIT"
 repository = "https://github.com/tonitangpotato/graph-indexed-development"
 keywords = ["graph", "development", "ai", "agent", "code-analysis"]
 categories = ["development-tools", "data-structures"]
+
+[features]
+default = ["graph"]
+graph = []
+harness = ["graph", "dep:tokio", "dep:futures", "dep:async-trait"]
+ritual = ["harness"]
+full = ["ritual"]
 
 [dependencies]
 serde = { workspace = true }
@@ -23,5 +30,11 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 
+# Optional dependencies for harness feature
+tokio = { version = "1", features = ["full"], optional = true }
+futures = { version = "0.3", optional = true }
+async-trait = { version = "0.1", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

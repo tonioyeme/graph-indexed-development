@@ -10,7 +10,7 @@
 
 use tracing::{info, warn};
 
-use gid_core::harness::types::{TaskInfo, TaskResult, ReplanDecision};
+use super::types::{TaskInfo, TaskResult, ReplanDecision};
 
 /// Adaptive re-planner for handling task failures.
 ///

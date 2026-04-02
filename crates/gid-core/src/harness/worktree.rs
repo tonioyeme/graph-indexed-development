@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
 use tracing::{info, debug};
 
-use gid_core::harness::types::WorktreeInfo;
+use super::types::WorktreeInfo;
 
 /// Trait for managing git worktrees.
 ///

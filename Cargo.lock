@@ -330,15 +330,18 @@ dependencies = [
 
 [[package]]
 name = "gid-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
+ "futures",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "tokio",
  "tracing",
  "tree-sitter",
  "tree-sitter-javascript",
@@ -350,31 +353,14 @@ dependencies = [
 
 [[package]]
 name = "gid-dev-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
  "gid-core",
- "gid-harness",
  "serde_json",
  "serde_yaml",
  "tokio",
-]
-
-[[package]]
-name = "gid-harness"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "futures",
- "gid-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]

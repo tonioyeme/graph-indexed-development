@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Result;
 use tracing::{info, warn};
 
-use gid_core::harness::types::{TaskInfo, ExecutionLayer, GuardCheck, VerifyResult};
+use super::types::{TaskInfo, ExecutionLayer, GuardCheck, VerifyResult};
 
 /// Result of a guard check execution.
 #[derive(Debug, Clone)]

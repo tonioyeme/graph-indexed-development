@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::debug;
 
-use gid_core::harness::types::{ExecutionEvent, ExecutionStats};
+use super::types::{ExecutionEvent, ExecutionStats};
 
 /// Append-only JSONL telemetry logger.
 ///
