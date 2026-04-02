@@ -31,6 +31,7 @@ use gid_core::{
         create_plan,
         types::{ExecutionEvent, ExecutionStats},
         load_config,
+        ExecutionState, ExecutionStatus,
     },
 };
 
@@ -359,6 +360,12 @@ enum Commands {
     /// Show execution statistics from telemetry log
     Stats,
 
+    /// Approve pending execution (when status is waiting_approval)
+    Approve,
+
+    /// Stop execution gracefully (marks cancel_requested)
+    Stop,
+
     // ═══════════════════════════════════════════════════════════════════════════════
     // Ritual Commands (requires "ritual" feature)
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -598,6 +605,8 @@ fn main() -> Result<()> {
             cmd_execute(resolve_graph_path(cli.graph)?, max_concurrent, model, approval_mode, dry_run, cli.json)
         }
         Commands::Stats => cmd_stats(resolve_graph_path(cli.graph)?, cli.json),
+        Commands::Approve => cmd_approve(resolve_graph_path(cli.graph)?, cli.json),
+        Commands::Stop => cmd_stop(resolve_graph_path(cli.graph)?, cli.json),
 
         // Ritual commands
         Commands::Ritual(rc) => {
@@ -2023,6 +2032,108 @@ fn cmd_stats(path: PathBuf, json: bool) -> Result<()> {
         }
         println!();
     }
+    Ok(())
+}
+
+fn cmd_approve(path: PathBuf, json: bool) -> Result<()> {
+    let gid_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut state = ExecutionState::load(gid_dir)?;
+
+    match state.status {
+        ExecutionStatus::WaitingApproval => {
+            let approved = state.approve();
+            state.save(gid_dir)?;
+
+            if json {
+                let approvals: Vec<_> = approved.iter().map(|a| {
+                    serde_json::json!({
+                        "layer_index": a.layer_index,
+                        "message": a.message,
+                        "requested_at": a.requested_at.to_rfc3339()
+                    })
+                }).collect();
+                println!("{}", serde_json::json!({
+                    "success": true,
+                    "approved": approvals,
+                    "status": state.status.to_string()
+                }));
+            } else {
+                println!("✓ Approved {} pending request(s)", approved.len());
+                for a in &approved {
+                    println!("  Layer {}: {}", a.layer_index, a.message);
+                }
+                println!("\nStatus is now: {}", state.status);
+                println!("Run `gid execute` to continue.");
+            }
+        }
+        _ => {
+            if json {
+                println!("{}", serde_json::json!({
+                    "success": false,
+                    "error": "No pending approvals",
+                    "status": state.status.to_string()
+                }));
+            } else {
+                println!("No pending approvals.");
+                println!("Current status: {}", state.status);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_stop(path: PathBuf, json: bool) -> Result<()> {
+    let gid_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut state = ExecutionState::load(gid_dir)?;
+
+    match state.status {
+        ExecutionStatus::Running | ExecutionStatus::WaitingApproval => {
+            state.request_cancel();
+            state.save(gid_dir)?;
+
+            if json {
+                println!("{}", serde_json::json!({
+                    "success": true,
+                    "cancel_requested": true,
+                    "active_tasks": state.active_tasks
+                }));
+            } else {
+                println!("✓ Cancellation requested");
+                if !state.active_tasks.is_empty() {
+                    println!("  Active tasks will complete their current work:");
+                    for task in &state.active_tasks {
+                        println!("    - {}", task);
+                    }
+                }
+                println!("\nThe scheduler will stop gracefully at the next layer boundary.");
+                println!("In-progress tasks will be reset to 'todo' (not 'failed').");
+            }
+        }
+        ExecutionStatus::Idle => {
+            if json {
+                println!("{}", serde_json::json!({
+                    "success": false,
+                    "error": "No execution in progress",
+                    "status": state.status.to_string()
+                }));
+            } else {
+                println!("No execution in progress.");
+            }
+        }
+        _ => {
+            if json {
+                println!("{}", serde_json::json!({
+                    "success": false,
+                    "error": format!("Cannot stop: execution is {}", state.status),
+                    "status": state.status.to_string()
+                }));
+            } else {
+                println!("Cannot stop: execution status is '{}'", state.status);
+            }
+        }
+    }
+
     Ok(())
 }
 

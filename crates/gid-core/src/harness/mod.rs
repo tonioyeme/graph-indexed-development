@@ -44,6 +44,12 @@ pub mod verifier;
 pub mod replanner;
 #[cfg(feature = "harness")]
 pub mod telemetry;
+#[cfg(feature = "harness")]
+pub mod execution_state;
+#[cfg(feature = "harness")]
+pub mod log_reader;
+#[cfg(feature = "harness")]
+pub mod notifier;
 
 // Re-export execution engine types (harness feature)
 #[cfg(feature = "harness")]
@@ -55,6 +61,19 @@ pub use worktree::{WorktreeManager, GitWorktreeManager};
 #[cfg(feature = "harness")]
 pub use verifier::{Verifier, GuardResult};
 #[cfg(feature = "harness")]
-pub use replanner::Replanner;
+pub use replanner::{Replanner, ReplanAction, ActionType, LlmNewTask};
 #[cfg(feature = "harness")]
 pub use telemetry::TelemetryLogger;
+#[cfg(feature = "harness")]
+pub use execution_state::{ExecutionState, ExecutionStatus, ApprovalRequest};
+#[cfg(feature = "harness")]
+pub use log_reader::{
+    ExecutionLogReader, ExecutionSummary, TaskSummary, TaskStatus,
+    ApprovalPhase, ApprovalContext, generate_approval_message,
+    EXECUTION_LOG_FILENAME,
+};
+#[cfg(feature = "harness")]
+pub use notifier::{
+    TelegramNotifier, NotifierConfig, InlineKeyboard, InlineButton,
+    ApprovalStatus, escape_html,
+};

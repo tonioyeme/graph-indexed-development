@@ -623,6 +623,73 @@ const TOOLS = [
       },
     },
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Harness Execution (5)
+  // ═══════════════════════════════════════════════════════════════════════════
+  {
+    name: 'gid_plan',
+    description: 'Show execution plan from graph topology. Returns layers, tasks, parallelization info, and estimated turns.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+        format: {
+          type: 'string',
+          enum: ['json', 'text'],
+          description: 'Output format (default: json for MCP)',
+        },
+      },
+    },
+  },
+  {
+    name: 'gid_execute',
+    description: 'Start harness execution — spawns sub-agents to complete tasks in parallel layers. Returns execution result with completed/failed counts, tokens, and duration.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+        maxConcurrent: { type: 'number', description: 'Maximum concurrent sub-agents per layer (default: 3)' },
+        model: { type: 'string', description: 'Model for sub-agents (default: claude-sonnet-4-5)' },
+        approvalMode: {
+          type: 'string',
+          enum: ['auto', 'mixed', 'manual'],
+          description: 'Approval mode: auto (no gates), mixed (phase 1-3 pause), manual (all pause)',
+        },
+        dryRun: { type: 'boolean', description: 'Show plan without executing' },
+      },
+    },
+  },
+  {
+    name: 'gid_stats',
+    description: 'Show execution statistics from telemetry log. Returns completed/failed tasks, total turns, tokens, and duration.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional, used to find .gid directory)' },
+      },
+    },
+  },
+  {
+    name: 'gid_approve',
+    description: 'Approve pending execution when status is waiting_approval. Used in mixed/manual mode to continue past phase gates.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+      },
+    },
+  },
+  {
+    name: 'gid_stop',
+    description: 'Request graceful cancellation of running execution. Active tasks complete their current work, then execution stops.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+      },
+    },
+  },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -884,6 +951,34 @@ function handleTool(name: string, args: ToolArgs) {
       if (args.outputPath) cmd += ` --output ${shellEscape(args.outputPath)}`;
       return toMcpResponse(gidExec(cmd, opts));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Harness Execution
+    // ═══════════════════════════════════════════════════════════════════════
+    case 'gid_plan': {
+      let cmd = 'plan';
+      // Always use JSON format for MCP responses
+      cmd += ' --format json';
+      return toMcpResponse(gidExec(cmd, opts));
+    }
+
+    case 'gid_execute': {
+      let cmd = 'execute';
+      if (args.maxConcurrent) cmd += ` --max-concurrent ${args.maxConcurrent}`;
+      if (args.model) cmd += ` --model ${shellEscape(args.model)}`;
+      if (args.approvalMode) cmd += ` --approval-mode ${args.approvalMode}`;
+      if (args.dryRun) cmd += ' --dry-run';
+      return toMcpResponse(gidExec(cmd, opts));
+    }
+
+    case 'gid_stats':
+      return toMcpResponse(gidExec('stats', opts));
+
+    case 'gid_approve':
+      return toMcpResponse(gidExec('approve', opts));
+
+    case 'gid_stop':
+      return toMcpResponse(gidExec('stop', opts));
 
     default:
       return {

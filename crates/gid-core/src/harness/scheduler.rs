@@ -14,14 +14,14 @@ use std::time::Instant;
 
 use anyhow::Result;
 use chrono::Utc;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use std::path::{Path, PathBuf};
 
-use crate::graph::{Graph, NodeStatus};
+use crate::graph::{Graph, Node, Edge, NodeStatus};
 use super::types::{
     ExecutionPlan, ExecutionResult, HarnessConfig,
-    ExecutionEvent, VerifyResult,
+    ExecutionEvent, VerifyResult, TaskInfo, TaskResult, NewTask,
 };
 use crate::code_graph::CodeGraph;
 use crate::unified::build_unified_graph;
@@ -33,6 +33,7 @@ use super::replanner::Replanner;
 use super::verifier::Verifier;
 use super::worktree::WorktreeManager;
 use super::telemetry::TelemetryLogger;
+use super::execution_state::ExecutionState;
 
 /// Execute a plan by driving the full task lifecycle.
 ///
@@ -59,6 +60,11 @@ pub async fn execute_plan(
 ) -> Result<ExecutionResult> {
     let graph_path = gid_root.join("graph.yml");
     let start = Instant::now();
+
+    // Load or create execution state
+    let mut exec_state = ExecutionState::load(gid_root).unwrap_or_default();
+    exec_state.start_running();
+    exec_state.save(gid_root).ok();
 
     info!(
         total_tasks = plan.total_tasks,
@@ -97,6 +103,35 @@ pub async fn execute_plan(
         );
 
     for layer in &plan.layers {
+        // Check for cancellation at the start of each layer (GOAL-6.18)
+        exec_state = ExecutionState::load(gid_root).unwrap_or(exec_state);
+        if exec_state.is_cancel_requested() {
+            warn!("Cancellation requested, stopping execution gracefully");
+            // Mark any in-progress tasks back to todo (not failed)
+            for node in graph.nodes.iter_mut() {
+                if node.status == NodeStatus::InProgress {
+                    node.status = NodeStatus::Todo;
+                }
+            }
+            save_graph(graph, &graph_path).ok();
+            exec_state.mark_cancelled();
+            exec_state.save(gid_root).ok();
+
+            telemetry.log_event(&ExecutionEvent::Cancel {
+                tasks_done: tasks_completed,
+                tasks_remaining: plan.total_tasks - tasks_completed - tasks_failed,
+                timestamp: Utc::now(),
+            }).ok();
+
+            return Ok(ExecutionResult {
+                tasks_completed,
+                tasks_failed,
+                total_turns,
+                total_tokens,
+                duration_secs: start.elapsed().as_secs(),
+            });
+        }
+
         info!(layer = layer.index, task_count = layer.tasks.len(), "Processing layer");
 
         // Process tasks in parallel within the layer (up to max_concurrent)
@@ -181,6 +216,13 @@ pub async fn execute_plan(
                 prepared.push((task.clone(), wt_path, context));
             }
 
+            // Update execution state with active tasks (GOAL-6.3)
+            let active_task_ids: Vec<String> = prepared.iter()
+                .map(|(task, _, _)| task.id.clone())
+                .collect();
+            exec_state.set_active_tasks(active_task_ids);
+            exec_state.save(gid_root).ok();
+
             // 2b: Spawn all sub-agents in parallel
             let task_start = Instant::now();
             let spawn_futures: Vec<_> = prepared.iter().map(|(_, wt_path, context)| {
@@ -250,9 +292,16 @@ pub async fn execute_plan(
                             // Sub-agent failed — use replanner to decide action
                             worktree_mgr.cleanup(&task.id).await.ok();
                             let retries = retry_counts.entry(task.id.clone()).or_insert(0);
-                            let decision = replanner.analyze_failure(
-                                task, &task_result, *retries, config.max_retries,
-                            );
+
+                            // Try LLM-powered analysis if auth pool is available
+                            let decision = analyze_task_failure(
+                                &mut replanner,
+                                task,
+                                &task_result,
+                                *retries,
+                                config,
+                                graph,
+                            ).await;
 
                             match decision {
                                 super::types::ReplanDecision::Retry => {
@@ -276,12 +325,34 @@ pub async fn execute_plan(
                                     }).ok();
                                 }
                                 super::types::ReplanDecision::AddTasks(new_tasks) => {
-                                    // Future: add new tasks to graph and re-plan
-                                    info!(task_id = %task.id, new = new_tasks.len(), "Replanner: add tasks (not yet implemented)");
-                                    if let Some(node) = graph.get_node_mut(&task.id) {
-                                        node.status = NodeStatus::Failed;
+                                    // Add new tasks to graph and mark original as blocked
+                                    info!(
+                                        task_id = %task.id,
+                                        new_count = new_tasks.len(),
+                                        "Replanner: adding prerequisite tasks"
+                                    );
+
+                                    // Add the new tasks as nodes
+                                    for new_task in &new_tasks {
+                                        add_task_to_graph(graph, new_task, &task.id);
                                     }
-                                    tasks_failed += 1;
+
+                                    // Log the replan event
+                                    telemetry.log_event(&ExecutionEvent::Replan {
+                                        new_tasks: new_tasks.iter().map(|t| t.id.clone()).collect(),
+                                        new_edges: new_tasks.iter()
+                                            .flat_map(|t| t.depends_on.iter().map(|d| (t.id.clone(), d.clone())))
+                                            .collect(),
+                                        timestamp: Utc::now(),
+                                    }).ok();
+
+                                    // Mark original task as blocked (will be retried after new tasks complete)
+                                    if let Some(node) = graph.get_node_mut(&task.id) {
+                                        node.status = NodeStatus::Blocked;
+                                    }
+
+                                    // Save graph with new tasks
+                                    save_graph(graph, &graph_path).ok();
                                 }
                             }
                         }
@@ -358,6 +429,10 @@ pub async fn execute_plan(
     if let Err(e) = post_execution_advise(graph, &telemetry).await {
         warn!(error = %e, "Post-execution advise failed (non-fatal)");
     }
+
+    // Mark execution as completed (GOAL-6.3)
+    exec_state.complete();
+    exec_state.save(gid_root).ok();
 
     // Log completion
     telemetry.log_event(&ExecutionEvent::Complete {
@@ -458,6 +533,131 @@ async fn post_execution_advise(
     }
     
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LLM-Powered Replanning Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Analyze a task failure, using LLM if auth pool is available.
+///
+/// This function:
+/// 1. Checks if auth pool exists (at config path or default ~/.agentctl/auth.toml)
+/// 2. If yes, calls `analyze_failure_with_llm` for nuanced analysis
+/// 3. If no or LLM fails, falls back to heuristic `analyze_failure`
+async fn analyze_task_failure(
+    replanner: &mut Replanner,
+    task: &TaskInfo,
+    result: &TaskResult,
+    retry_count: u32,
+    config: &HarnessConfig,
+    graph: &Graph,
+) -> super::types::ReplanDecision {
+    // Determine auth pool path
+    let pool_path = config.auth_pool_path.clone().unwrap_or_else(|| {
+        dirs::home_dir()
+            .map(|h| h.join(".agentctl").join("auth.toml"))
+            .unwrap_or_else(|| PathBuf::from(".agentctl/auth.toml"))
+    });
+
+    // Check if auth pool exists before trying LLM
+    if pool_path.exists() {
+        debug!(pool_path = %pool_path.display(), "Auth pool found, using LLM analysis");
+
+        let graph_context = build_graph_context(graph);
+
+        match replanner.analyze_failure_with_llm(
+            task,
+            &result.output,
+            &graph_context,
+            &pool_path,
+        ).await {
+            Ok(action) => {
+                return action.into_decision();
+            }
+            Err(e) => {
+                warn!(error = %e, "LLM analysis failed, falling back to heuristics");
+            }
+        }
+    } else {
+        debug!(pool_path = %pool_path.display(), "No auth pool, using heuristic analysis");
+    }
+
+    // Fallback to heuristic-based analysis
+    replanner.analyze_failure(task, result, retry_count, config.max_retries)
+}
+
+/// Build a summary of the current graph state for LLM context.
+fn build_graph_context(graph: &Graph) -> String {
+    let total_tasks = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task"))
+        .count();
+
+    let completed = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task") && n.status == NodeStatus::Done)
+        .count();
+
+    let failed = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task") && n.status == NodeStatus::Failed)
+        .count();
+
+    let in_progress = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task") && n.status == NodeStatus::InProgress)
+        .count();
+
+    let blocked = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task") && n.status == NodeStatus::Blocked)
+        .count();
+
+    let completed_ids: Vec<String> = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("task") && n.status == NodeStatus::Done)
+        .take(10) // Limit to avoid huge prompts
+        .map(|n| n.id.clone())
+        .collect();
+
+    let completed_str = if completed_ids.is_empty() {
+        "none".to_string()
+    } else if completed_ids.len() < completed {
+        format!("{} (and {} more)", completed_ids.join(", "), completed - completed_ids.len())
+    } else {
+        completed_ids.join(", ")
+    };
+
+    format!(
+        "{} tasks total: {} completed ({}), {} in progress, {} failed, {} blocked",
+        total_tasks, completed, completed_str, in_progress, failed, blocked
+    )
+}
+
+/// Add a new task to the graph with proper edges.
+fn add_task_to_graph(graph: &mut Graph, new_task: &NewTask, blocked_by: &str) {
+    // Create the node
+    let mut node = Node::new(&new_task.id, &new_task.title);
+    node.node_type = Some("task".to_string());
+    node.description = Some(new_task.description.clone());
+    node.status = NodeStatus::Todo;
+
+    // Add metadata if any
+    if !new_task.metadata.is_empty() {
+        node.metadata = new_task.metadata.clone();
+    }
+
+    graph.add_node(node);
+
+    // Add dependency edges (new task depends on these)
+    for dep in &new_task.depends_on {
+        graph.add_edge(Edge::depends_on(&new_task.id, dep));
+    }
+
+    // The blocked task should now depend on this new task
+    graph.add_edge(Edge::depends_on(blocked_by, &new_task.id));
+
+    info!(
+        new_task_id = %new_task.id,
+        blocked_task = %blocked_by,
+        deps = ?new_task.depends_on,
+        "Added new prerequisite task to graph"
+    );
 }
 
 #[cfg(test)]
@@ -715,5 +915,109 @@ mod tests {
 
         assert_eq!(result.tasks_completed, 0);
         assert_eq!(result.tasks_failed, 0);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Tests for LLM Replanning Helpers
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_build_graph_context_empty() {
+        let graph = Graph::new();
+        let ctx = build_graph_context(&graph);
+        assert!(ctx.contains("0 tasks total"));
+        assert!(ctx.contains("0 completed"));
+    }
+
+    #[test]
+    fn test_build_graph_context_with_tasks() {
+        let mut graph = Graph::new();
+        
+        let mut done1 = make_task("task-1", "Task 1");
+        done1.status = NodeStatus::Done;
+        graph.add_node(done1);
+        
+        let mut done2 = make_task("task-2", "Task 2");
+        done2.status = NodeStatus::Done;
+        graph.add_node(done2);
+        
+        let mut in_progress = make_task("task-3", "Task 3");
+        in_progress.status = NodeStatus::InProgress;
+        graph.add_node(in_progress);
+        
+        let mut failed = make_task("task-4", "Task 4");
+        failed.status = NodeStatus::Failed;
+        graph.add_node(failed);
+
+        let ctx = build_graph_context(&graph);
+        assert!(ctx.contains("4 tasks total"));
+        assert!(ctx.contains("2 completed"));
+        assert!(ctx.contains("1 in progress"));
+        assert!(ctx.contains("1 failed"));
+        // Check that task IDs are included
+        assert!(ctx.contains("task-1") || ctx.contains("task-2"));
+    }
+
+    #[test]
+    fn test_add_task_to_graph() {
+        let mut graph = Graph::new();
+        
+        // Add existing task that will be blocked
+        graph.add_node(make_task("existing-task", "Existing"));
+        
+        let new_task = NewTask {
+            id: "new-prereq".to_string(),
+            title: "New Prerequisite".to_string(),
+            description: "Must complete before existing task".to_string(),
+            depends_on: vec![],
+            metadata: std::collections::HashMap::new(),
+        };
+
+        add_task_to_graph(&mut graph, &new_task, "existing-task");
+
+        // Check new task was added
+        let added = graph.get_node("new-prereq").unwrap();
+        assert_eq!(added.title, "New Prerequisite");
+        assert_eq!(added.status, NodeStatus::Todo);
+        assert_eq!(added.node_type.as_deref(), Some("task"));
+        assert_eq!(added.description.as_deref(), Some("Must complete before existing task"));
+
+        // Check dependency edge was added
+        let edges: Vec<_> = graph.edges.iter()
+            .filter(|e| e.from == "existing-task" && e.to == "new-prereq")
+            .collect();
+        assert_eq!(edges.len(), 1);
+    }
+
+    #[test]
+    fn test_add_task_with_dependencies() {
+        let mut graph = Graph::new();
+        
+        // Add setup task
+        graph.add_node(make_task("setup", "Setup"));
+        graph.add_node(make_task("main-task", "Main Task"));
+        
+        let new_task = NewTask {
+            id: "intermediate".to_string(),
+            title: "Intermediate Step".to_string(),
+            description: "Depends on setup".to_string(),
+            depends_on: vec!["setup".to_string()],
+            metadata: std::collections::HashMap::new(),
+        };
+
+        add_task_to_graph(&mut graph, &new_task, "main-task");
+
+        // Check edges:
+        // intermediate depends on setup
+        // main-task depends on intermediate
+        let edge1: Vec<_> = graph.edges.iter()
+            .filter(|e| e.from == "intermediate" && e.to == "setup")
+            .collect();
+        assert_eq!(edge1.len(), 1);
+
+        let edge2: Vec<_> = graph.edges.iter()
+            .filter(|e| e.from == "main-task" && e.to == "intermediate")
+            .collect();
+        assert_eq!(edge2.len(), 1);
     }
 }
