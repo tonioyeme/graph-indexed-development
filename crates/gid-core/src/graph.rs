@@ -94,6 +94,11 @@ pub enum NodeStatus {
     Done,
     Blocked,
     Cancelled,
+    /// Task execution failed (verify failed, sub-agent error, etc.)
+    Failed,
+    /// Task needs human/re-planner intervention (merge conflict, structural issue)
+    #[serde(alias = "needs_resolution", alias = "needs-resolution")]
+    NeedsResolution,
 }
 
 impl Default for NodeStatus {
@@ -110,6 +115,8 @@ impl std::fmt::Display for NodeStatus {
             NodeStatus::Done => write!(f, "done"),
             NodeStatus::Blocked => write!(f, "blocked"),
             NodeStatus::Cancelled => write!(f, "cancelled"),
+            NodeStatus::Failed => write!(f, "failed"),
+            NodeStatus::NeedsResolution => write!(f, "needs_resolution"),
         }
     }
 }
@@ -123,6 +130,8 @@ impl std::str::FromStr for NodeStatus {
             "done" => Ok(NodeStatus::Done),
             "blocked" => Ok(NodeStatus::Blocked),
             "cancelled" => Ok(NodeStatus::Cancelled),
+            "failed" => Ok(NodeStatus::Failed),
+            "needs_resolution" | "needs-resolution" => Ok(NodeStatus::NeedsResolution),
             _ => Err(anyhow::anyhow!("Unknown status: {}", s)),
         }
     }
@@ -263,6 +272,8 @@ impl Graph {
                 NodeStatus::Done => s.done += 1,
                 NodeStatus::Blocked => s.blocked += 1,
                 NodeStatus::Cancelled => s.cancelled += 1,
+                NodeStatus::Failed => s.failed += 1,
+                NodeStatus::NeedsResolution => s.needs_resolution += 1,
             }
         }
         s.ready = self.ready_tasks().len();
@@ -376,6 +387,8 @@ pub struct GraphSummary {
     pub done: usize,
     pub blocked: usize,
     pub cancelled: usize,
+    pub failed: usize,
+    pub needs_resolution: usize,
     pub ready: usize,
 }
 
@@ -408,9 +421,9 @@ impl std::fmt::Display for GraphSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} nodes, {} edges | todo={} progress={} done={} blocked={} cancelled={} | ready={}",
+            "{} nodes, {} edges | todo={} progress={} done={} blocked={} failed={} cancelled={} | ready={}",
             self.total_nodes, self.total_edges,
-            self.todo, self.in_progress, self.done, self.blocked, self.cancelled,
+            self.todo, self.in_progress, self.done, self.blocked, self.failed, self.cancelled,
             self.ready,
         )
     }

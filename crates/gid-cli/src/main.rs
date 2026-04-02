@@ -1911,5 +1911,7 @@ fn status_icon(status: &NodeStatus) -> &'static str {
         NodeStatus::Done => "●",
         NodeStatus::Blocked => "✗",
         NodeStatus::Cancelled => "⊘",
+        NodeStatus::Failed => "✘",
+        NodeStatus::NeedsResolution => "⚠",
     }
 }

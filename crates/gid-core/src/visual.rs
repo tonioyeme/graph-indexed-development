@@ -37,6 +37,8 @@ pub fn status_symbol(status: &NodeStatus) -> &'static str {
         NodeStatus::Todo => "○",
         NodeStatus::Blocked => "⛔",
         NodeStatus::Cancelled => "⊘",
+        NodeStatus::Failed => "❌",
+        NodeStatus::NeedsResolution => "⚠️",
     }
 }
 
@@ -48,6 +50,8 @@ pub fn status_symbol_ascii(status: &NodeStatus) -> &'static str {
         NodeStatus::Todo => "[ ]",
         NodeStatus::Blocked => "[!]",
         NodeStatus::Cancelled => "[-]",
+        NodeStatus::Failed => "[F]",
+        NodeStatus::NeedsResolution => "[?]",
     }
 }
 
@@ -200,6 +204,8 @@ pub fn render_dot(graph: &Graph) -> String {
             NodeStatus::Todo => "white",
             NodeStatus::Blocked => "lightcoral",
             NodeStatus::Cancelled => "lightgray",
+            NodeStatus::Failed => "salmon",
+            NodeStatus::NeedsResolution => "lightyellow",
         };
         
         let label = format!("{} {}\\n{}", 
@@ -268,6 +274,8 @@ pub fn render_mermaid(graph: &Graph) -> String {
             NodeStatus::Todo => format!("{}[○ {}]", escape_mermaid_id(&node.id), escape_mermaid(&node.title)),
             NodeStatus::Blocked => format!("{}[⛔ {}]", escape_mermaid_id(&node.id), escape_mermaid(&node.title)),
             NodeStatus::Cancelled => format!("{}[⊘ {}]", escape_mermaid_id(&node.id), escape_mermaid(&node.title)),
+            NodeStatus::Failed => format!("{}[❌ {}]", escape_mermaid_id(&node.id), escape_mermaid(&node.title)),
+            NodeStatus::NeedsResolution => format!("{}[⚠️ {}]", escape_mermaid_id(&node.id), escape_mermaid(&node.title)),
         };
         output.push(format!("    {}", shape));
     }
@@ -309,6 +317,8 @@ pub fn render_mermaid(graph: &Graph) -> String {
             NodeStatus::Todo => "todo",
             NodeStatus::Blocked => "blocked",
             NodeStatus::Cancelled => "cancelled",
+            NodeStatus::Failed => "failed",
+            NodeStatus::NeedsResolution => "needsresolution",
         };
         output.push(format!("    class {} {}", escape_mermaid_id(&node.id), class));
     }

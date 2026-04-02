@@ -14,3 +14,6 @@ packages/*/dist/
 
 # OS
 .DS_Store
+
+# Internal docs (not for public repo)
+docs/
