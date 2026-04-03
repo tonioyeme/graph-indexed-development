@@ -160,25 +160,25 @@ nodes:
   - cli
 - id: ritual-skill-executor
   title: 'SkillExecutor: LLM-backed skill phase execution'
-  status: todo
+  status: done
   tags:
   - p0
   - ritual
 - id: ritual-harness-executor
   title: 'HarnessExecutor: task harness phase execution'
-  status: todo
+  status: done
   tags:
   - p0
   - ritual
 - id: ritual-gid-executor
   title: 'GidCommandExecutor: wire to gid CLI commands'
-  status: todo
+  status: done
   tags:
   - p1
   - ritual
 - id: ritual-shell-executor
   title: 'ShellExecutor: validated shell command execution'
-  status: todo
+  status: done
   tags:
   - p1
   - ritual
