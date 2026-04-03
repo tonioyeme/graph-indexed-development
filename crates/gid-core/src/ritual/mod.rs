@@ -20,6 +20,7 @@ pub mod notifier;
 #[cfg(feature = "harness")]
 pub mod api_llm_client;
 pub mod composer;
+pub mod state_machine;
 
 // Re-export key types
 pub use definition::{
@@ -41,4 +42,14 @@ pub use llm::{LlmClient, ToolDefinition, SkillResult};
 #[cfg(feature = "harness")]
 pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
-pub use composer::{compose_ritual, ProjectState, ProjectLanguage};
+pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
+pub use state_machine::{
+    RitualPhase as V2Phase,
+    RitualState as V2State,
+    RitualEvent as V2Event,
+    RitualAction as V2Action,
+    ProjectState as V2ProjectState,
+    ImplementStrategy,
+    transition,
+    truncate,
+};
