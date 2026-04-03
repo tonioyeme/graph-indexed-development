@@ -357,6 +357,93 @@ nodes:
   tags:
   - p2
   - integration
+- id: ritual-executors-req
+  title: ritual-executors requirements.md
+  status: done
+  tags:
+  - ritual
+  - doc
+  - requirements
+  type: doc
+- id: ritual-executors-design
+  title: ritual-executors design.md
+  status: done
+  tags:
+  - ritual
+  - doc
+  - design
+  type: doc
+- id: ritual-cli-run-req
+  title: ritual-cli-run requirements.md
+  status: done
+  tags:
+  - ritual
+  - doc
+  - requirements
+  type: doc
+- id: ritual-notifier-req
+  title: ritual-notifier requirements.md
+  status: done
+  tags:
+  - ritual
+  - doc
+  - requirements
+  type: doc
+- id: mcp-server-req
+  title: mcp-server requirements.md
+  status: done
+  tags:
+  - integration
+  - doc
+  - requirements
+  type: doc
+- id: gidterm-integration-req
+  title: gidterm-integration requirements.md
+  status: done
+  tags:
+  - integration
+  - doc
+  - requirements
+  type: doc
+- id: core-req
+  title: core requirements.md
+  status: done
+  tags:
+  - core
+  - doc
+  - requirements
+  type: doc
+- id: code-intel-req
+  title: code-intel requirements.md
+  status: done
+  tags:
+  - code-intel
+  - doc
+  - requirements
+  type: doc
+- id: harness-req
+  title: harness requirements.md
+  status: done
+  tags:
+  - harness
+  - doc
+  - requirements
+  type: doc
+- id: ritual-engine-req
+  title: ritual-engine requirements.md
+  status: done
+  tags:
+  - ritual
+  - doc
+  - requirements
+  type: doc
+- id: gid-readme
+  title: .gid/README.md
+  status: done
+  tags:
+  - meta
+  - doc
+  type: doc
 edges:
 - from: graph-types
   to: workspace-setup
@@ -553,3 +640,36 @@ edges:
 - from: harness-worktree
   to: harness-executor
   relation: depends_on
+- from: ritual-executors-req
+  to: ritual-skill-executor
+  relation: documents
+- from: ritual-executors-req
+  to: ritual-harness-executor
+  relation: documents
+- from: ritual-executors-req
+  to: ritual-gid-executor
+  relation: documents
+- from: ritual-executors-req
+  to: ritual-shell-executor
+  relation: documents
+- from: ritual-executors-design
+  to: ritual-skill-executor
+  relation: specifies
+- from: ritual-executors-design
+  to: ritual-harness-executor
+  relation: specifies
+- from: ritual-executors-design
+  to: ritual-gid-executor
+  relation: specifies
+- from: ritual-cli-run-req
+  to: ritual-cli-run
+  relation: documents
+- from: ritual-notifier-req
+  to: ritual-notifier
+  relation: documents
+- from: mcp-server-req
+  to: mcp-server
+  relation: documents
+- from: gidterm-integration-req
+  to: gidterm-integration
+  relation: documents
