@@ -156,3 +156,52 @@ mod tests {
         assert_eq!(result.tokens_used, 1000);
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tool types for harness executor (replaces agentctl-auth dependency)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Output from a tool execution.
+#[derive(Debug, Clone)]
+pub struct ToolOutput {
+    /// The content returned by the tool.
+    pub content: String,
+    /// Whether the tool execution resulted in an error.
+    pub is_error: bool,
+}
+
+impl ToolOutput {
+    /// Create a successful tool output.
+    pub fn success(content: impl Into<String>) -> Self {
+        Self { content: content.into(), is_error: false }
+    }
+
+    /// Create an error tool output.
+    pub fn error(content: impl Into<String>) -> Self {
+        Self { content: content.into(), is_error: true }
+    }
+}
+
+/// A tool that can be provided to the LLM (for building tool lists).
+#[derive(Debug, Clone)]
+pub struct Tool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+impl Tool {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, input_schema: serde_json::Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
+/// Trait for handling tool calls during agent loops.
+#[async_trait]
+pub trait ToolHandler: Send + Sync {
+    async fn handle(&self, name: &str, input: &serde_json::Value) -> Result<ToolOutput>;
+}

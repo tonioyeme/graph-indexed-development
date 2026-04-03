@@ -332,8 +332,8 @@ impl ApiExecutor {
     }
 
     /// Build tool definitions for the sub-agent.
-    fn build_tools() -> Vec<agentctl_auth::Tool> {
-        use agentctl_auth::Tool;
+    fn build_tools() -> Vec<crate::ritual::llm::Tool> {
+        use crate::ritual::llm::Tool;
         use serde_json::json;
 
         vec![
@@ -451,7 +451,7 @@ impl WorktreeToolHandler {
         Ok(canonical)
     }
 
-    async fn handle_read(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+    async fn handle_read(&self, input: &serde_json::Value) -> Result<crate::ritual::llm::ToolOutput> {
         let path = input["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
@@ -460,12 +460,12 @@ impl WorktreeToolHandler {
         debug!(path = %resolved.display(), "Reading file");
         
         match std::fs::read_to_string(&resolved) {
-            Ok(content) => Ok(agentctl_auth::ToolOutput::success(content)),
-            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
+            Ok(content) => Ok(crate::ritual::llm::ToolOutput::success(content)),
+            Err(e) => Ok(crate::ritual::llm::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
         }
     }
 
-    async fn handle_write(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+    async fn handle_write(&self, input: &serde_json::Value) -> Result<crate::ritual::llm::ToolOutput> {
         let path = input["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
@@ -482,12 +482,12 @@ impl WorktreeToolHandler {
         }
         
         match std::fs::write(&resolved, content) {
-            Ok(()) => Ok(agentctl_auth::ToolOutput::success(format!("Written {} bytes to {}", content.len(), path))),
-            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
+            Ok(()) => Ok(crate::ritual::llm::ToolOutput::success(format!("Written {} bytes to {}", content.len(), path))),
+            Err(e) => Ok(crate::ritual::llm::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
         }
     }
 
-    async fn handle_edit(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+    async fn handle_edit(&self, input: &serde_json::Value) -> Result<crate::ritual::llm::ToolOutput> {
         let path = input["path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' field"))?;
@@ -503,11 +503,11 @@ impl WorktreeToolHandler {
         
         let content = match std::fs::read_to_string(&resolved) {
             Ok(c) => c,
-            Err(e) => return Ok(agentctl_auth::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
+            Err(e) => return Ok(crate::ritual::llm::ToolOutput::error(format!("Failed to read {}: {}", path, e))),
         };
         
         if !content.contains(old_text) {
-            return Ok(agentctl_auth::ToolOutput::error(format!(
+            return Ok(crate::ritual::llm::ToolOutput::error(format!(
                 "old_text not found in {}. Make sure it matches exactly including whitespace.",
                 path
             )));
@@ -515,12 +515,12 @@ impl WorktreeToolHandler {
         
         let new_content = content.replacen(old_text, new_text, 1);
         match std::fs::write(&resolved, new_content) {
-            Ok(()) => Ok(agentctl_auth::ToolOutput::success(format!("Edited {}", path))),
-            Err(e) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
+            Ok(()) => Ok(crate::ritual::llm::ToolOutput::success(format!("Edited {}", path))),
+            Err(e) => Ok(crate::ritual::llm::ToolOutput::error(format!("Failed to write {}: {}", path, e))),
         }
     }
 
-    async fn handle_bash(&self, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+    async fn handle_bash(&self, input: &serde_json::Value) -> Result<crate::ritual::llm::ToolOutput> {
         let command = input["command"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("Missing 'command' field"))?;
@@ -548,17 +548,17 @@ impl WorktreeToolHandler {
                 };
                 
                 if output.status.success() {
-                    Ok(agentctl_auth::ToolOutput::success(combined))
+                    Ok(crate::ritual::llm::ToolOutput::success(combined))
                 } else {
-                    Ok(agentctl_auth::ToolOutput::error(format!(
+                    Ok(crate::ritual::llm::ToolOutput::error(format!(
                         "Command exited with code {}\n{}",
                         output.status.code().unwrap_or(-1),
                         combined
                     )))
                 }
             }
-            Ok(Err(e)) => Ok(agentctl_auth::ToolOutput::error(format!("Failed to execute command: {}", e))),
-            Err(_) => Ok(agentctl_auth::ToolOutput::error(format!(
+            Ok(Err(e)) => Ok(crate::ritual::llm::ToolOutput::error(format!("Failed to execute command: {}", e))),
+            Err(_) => Ok(crate::ritual::llm::ToolOutput::error(format!(
                 "Command timed out after {} seconds",
                 self.bash_timeout.as_secs()
             ))),
@@ -567,15 +567,29 @@ impl WorktreeToolHandler {
 }
 
 #[async_trait]
-impl agentctl_auth::ToolHandler for WorktreeToolHandler {
-    async fn handle(&self, name: &str, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+impl crate::ritual::llm::ToolHandler for WorktreeToolHandler {
+    async fn handle(&self, name: &str, input: &serde_json::Value) -> Result<crate::ritual::llm::ToolOutput> {
         match name {
             "Read" => self.handle_read(input).await,
             "Write" => self.handle_write(input).await,
             "Edit" => self.handle_edit(input).await,
             "Bash" => self.handle_bash(input).await,
-            _ => Ok(agentctl_auth::ToolOutput::error(format!("Unknown tool: {}", name))),
+            _ => Ok(crate::ritual::llm::ToolOutput::error(format!("Unknown tool: {}", name))),
         }
+    }
+}
+
+/// Bridge: wraps a gid-core ToolHandler to implement agentctl_auth::ToolHandler.
+struct ApiToolHandlerBridge(WorktreeToolHandler);
+
+#[async_trait]
+impl agentctl_auth::ToolHandler for ApiToolHandlerBridge {
+    async fn handle(&self, name: &str, input: &serde_json::Value) -> Result<agentctl_auth::ToolOutput> {
+        let result = crate::ritual::llm::ToolHandler::handle(&self.0, name, input).await?;
+        Ok(agentctl_auth::ToolOutput {
+            content: result.content,
+            is_error: result.is_error,
+        })
     }
 }
 
@@ -605,9 +619,14 @@ impl TaskExecutor for ApiExecutor {
             .pool(&pool)
             .build()?;
 
-        // Build tools and handler
-        let tools = Self::build_tools();
-        let handler = WorktreeToolHandler::new(worktree_path.to_path_buf(), self.bash_timeout);
+        // Build tools (gid-core types) and convert to agentctl-auth types at boundary
+        let gid_tools = Self::build_tools();
+        let api_tools: Vec<agentctl_auth::Tool> = gid_tools.iter().map(|t| {
+            agentctl_auth::Tool::new(&t.name, &t.description, t.input_schema.clone())
+        }).collect();
+        let handler = ApiToolHandlerBridge(
+            WorktreeToolHandler::new(worktree_path.to_path_buf(), self.bash_timeout)
+        );
 
         // System prompt for sub-agent
         let system = "You are a focused coding agent. Complete the task described below. Use the provided tools to read, write, and edit files, and to run commands. Be efficient and precise. When done, provide a brief summary of what you accomplished.";
@@ -618,7 +637,7 @@ impl TaskExecutor for ApiExecutor {
                 &config.model,
                 system,
                 &prompt,
-                &tools,
+                &api_tools,
                 config.max_iterations,
                 &handler,
             )
