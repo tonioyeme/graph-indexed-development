@@ -192,7 +192,30 @@ impl TemplateRegistry {
             description: Some("Complete development cycle: idea → research → requirements → design → implement → verify".to_string()),
             extends: None,
             phases: vec![
-                // Phase 0: Capture idea
+                // Phase 0: Discover existing implementations (shell, no LLM)
+                PhaseDefinition {
+                    id: "discover-existing".to_string(),
+                    kind: PhaseKind::Shell {
+                        command: concat!(
+                            "echo '=== Codebase Discovery ===' && ",
+                            "find . -type f \\( -name '*.rs' -o -name '*.ts' -o -name '*.py' \\) ",
+                            "-not -path '*/target/*' -not -path '*/node_modules/*' -not -path '*/.git/*' ",
+                            "2>/dev/null | head -500 > /tmp/gid-discovery-files.txt && ",
+                            "echo \"Files indexed: $(wc -l < /tmp/gid-discovery-files.txt)\" && ",
+                            "echo '(Discovery complete — review matches in research phase)'"
+                        ).to_string(),
+                    },
+                    model: None,
+                    approval: ApprovalRequirement::Auto,
+                    skip_if: None,
+                    timeout_minutes: Some(1),
+                    input: vec![],
+                    output: vec![],
+                    hooks: PhaseHooks::default(),
+                    on_failure: FailureStrategy::Skip,  // Discovery failure shouldn't block
+                    harness_config: None,
+                },
+                // Phase 1: Capture idea
                 PhaseDefinition {
                     id: "capture-idea".to_string(),
                     kind: PhaseKind::Skill { name: "idea-intake".to_string() },
@@ -516,7 +539,7 @@ mod tests {
         
         // Check full-dev-cycle
         let full = templates.iter().find(|t| t.name == "full-dev-cycle").unwrap();
-        assert_eq!(full.phases.len(), 9);
+        assert_eq!(full.phases.len(), 10);
         
         // Check quick-impl
         let quick = templates.iter().find(|t| t.name == "quick-impl").unwrap();
@@ -544,7 +567,7 @@ mod tests {
         
         let full = registry.load("full-dev-cycle").unwrap();
         assert_eq!(full.name, "full-dev-cycle");
-        assert_eq!(full.phases.len(), 9);
+        assert_eq!(full.phases.len(), 10);
         
         let quick = registry.load("quick-impl").unwrap();
         assert_eq!(quick.name, "quick-impl");
@@ -610,28 +633,33 @@ phases:
         // Note: builtins are checked first, so this actually returns the builtin
         // To shadow builtins, we'd need to change the search order
         // For now, builtins always win which might be the desired behavior
-        assert_eq!(custom.phases.len(), 9); // Gets builtin
+        assert_eq!(custom.phases.len(), 10); // Gets builtin
     }
     
     #[test]
     fn test_full_dev_cycle_structure() {
         let template = TemplateRegistry::full_dev_cycle_template();
         
-        // Verify phase order (9 phases total)
-        assert_eq!(template.phases[0].id, "capture-idea");
-        assert_eq!(template.phases[1].id, "research");
-        assert_eq!(template.phases[2].id, "draft-requirements");
-        assert_eq!(template.phases[3].id, "draft-design");
-        assert_eq!(template.phases[4].id, "generate-graph");
-        assert_eq!(template.phases[5].id, "plan-tasks");
-        assert_eq!(template.phases[6].id, "execute-tasks");
-        assert_eq!(template.phases[7].id, "extract-code");
-        assert_eq!(template.phases[8].id, "verify-quality");
+        // Verify phase order (10 phases: discovery + 9 original)
+        assert_eq!(template.phases[0].id, "discover-existing");
+        assert_eq!(template.phases[1].id, "capture-idea");
+        assert_eq!(template.phases[2].id, "research");
+        assert_eq!(template.phases[3].id, "draft-requirements");
+        assert_eq!(template.phases[4].id, "draft-design");
+        assert_eq!(template.phases[5].id, "generate-graph");
+        assert_eq!(template.phases[6].id, "plan-tasks");
+        assert_eq!(template.phases[7].id, "execute-tasks");
+        assert_eq!(template.phases[8].id, "extract-code");
+        assert_eq!(template.phases[9].id, "verify-quality");
+        
+        // Discovery phase is auto-approve, no LLM
+        assert!(matches!(template.phases[0].approval, ApprovalRequirement::Auto));
+        assert!(template.phases[0].model.is_none());
         
         // Verify approval requirements
-        assert!(matches!(template.phases[1].approval, ApprovalRequirement::Required)); // research
-        assert!(matches!(template.phases[2].approval, ApprovalRequirement::Required)); // draft-requirements
-        assert!(matches!(template.phases[3].approval, ApprovalRequirement::Required)); // draft-design
-        assert!(matches!(template.phases[6].approval, ApprovalRequirement::Auto));     // execute-tasks
+        assert!(matches!(template.phases[2].approval, ApprovalRequirement::Required)); // research
+        assert!(matches!(template.phases[3].approval, ApprovalRequirement::Required)); // draft-requirements
+        assert!(matches!(template.phases[4].approval, ApprovalRequirement::Required)); // draft-design
+        assert!(matches!(template.phases[7].approval, ApprovalRequirement::Auto));     // execute-tasks
     }
 }
