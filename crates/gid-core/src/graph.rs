@@ -14,11 +14,54 @@ pub struct Graph {
 }
 
 /// Project metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Accepts either a string (`project: myproject`) or a struct (`project: {name: myproject}`).
+#[derive(Debug, Clone, Serialize)]
 pub struct ProjectMeta {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for ProjectMeta {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct ProjectMetaVisitor;
+
+        impl<'de> de::Visitor<'de> for ProjectMetaVisitor {
+            type Value = ProjectMeta;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or a map with 'name' field")
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<ProjectMeta, E>
+            where
+                E: de::Error,
+            {
+                Ok(ProjectMeta { name: v.to_string(), description: None })
+            }
+
+            fn visit_map<M>(self, map: M) -> std::result::Result<ProjectMeta, M::Error>
+            where
+                M: de::MapAccess<'de>,
+            {
+                #[derive(serde::Deserialize)]
+                struct ProjectMetaInner {
+                    name: String,
+                    #[serde(default)]
+                    description: Option<String>,
+                }
+                let inner = ProjectMetaInner::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(ProjectMeta { name: inner.name, description: inner.description })
+            }
+        }
+
+        deserializer.deserialize_any(ProjectMetaVisitor)
+    }
 }
 
 /// A node in the graph (task, code file, component, etc.)
