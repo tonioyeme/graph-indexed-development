@@ -36,7 +36,7 @@ pub use executor::{
 pub use artifact::ArtifactManager;
 pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
-pub use scope::{ToolScope, BashPolicy, ToolNameMapping, default_scope_for_phase, rustclaw_tool_mapping};
+pub use scope::{ToolScope, BashPolicy, ToolNameMapping, ScopeCategory, default_scope_for_phase, rustclaw_tool_mapping};
 pub use llm::{LlmClient, ToolDefinition, SkillResult};
 #[cfg(feature = "harness")]
 pub use api_llm_client::ApiLlmClient;

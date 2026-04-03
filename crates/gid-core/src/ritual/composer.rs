@@ -33,7 +33,7 @@ pub struct ProjectState {
 }
 
 /// Detected project language.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProjectLanguage {
     Rust,
     TypeScript,

@@ -170,6 +170,38 @@ impl ToolScope {
     }
 }
 
+/// Scope categories — abstract phase types that map to ToolScope.
+/// Used by RitualPhase::scope_category() in the state machine (§2).
+/// This decouples scope definitions from phase ID strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeCategory {
+    /// Design phase: Read + Write docs only. No bash, no source code.
+    Design,
+    /// Planning phase: Read only. No writes, no bash.
+    Plan,
+    /// Implementation phase: Full access — Read, Write, Edit, Bash.
+    Implement,
+    /// Verification phase: Read + Bash (test/build commands only). No writes.
+    Verify,
+}
+
+impl ScopeCategory {
+    /// Convert a ScopeCategory to the corresponding ToolScope.
+    pub fn to_scope(self) -> ToolScope {
+        match self {
+            ScopeCategory::Design => ToolScope::documentation(),
+            ScopeCategory::Plan => ToolScope {
+                allowed_tools: vec!["Read".into()],
+                writable_paths: vec![],
+                readable_paths: vec![],
+                bash_policy: BashPolicy::Deny,
+            },
+            ScopeCategory::Implement => ToolScope::full(),
+            ScopeCategory::Verify => ToolScope::verify(),
+        }
+    }
+}
+
 /// Get the default ToolScope for a ritual phase by its ID.
 ///
 /// This maps well-known phase IDs to predefined scopes.
@@ -178,6 +210,8 @@ impl ToolScope {
 /// Tool names are generic (Read, Write, Edit, Bash, WebSearch, WebFetch).
 /// Agent runtimes should use `ToolScope::with_tool_mapping()` to translate
 /// to their actual tool names (e.g., "Read" → "read_file").
+///
+/// For the v2 state machine, prefer `ScopeCategory::to_scope()` instead.
 pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
     match phase_id {
         "capture-idea" => ToolScope {
@@ -187,13 +221,12 @@ pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
             bash_policy: BashPolicy::Deny,
         },
         "research" => ToolScope::research(),
-        "draft-requirements" => ToolScope::documentation(),
-        "draft-design" => ToolScope::documentation(),
-        "generate-graph" => ToolScope::graph_ops(),
-        "plan-tasks" => ToolScope::graph_ops(),
-        "execute-tasks" => ToolScope::full(),
+        "draft-requirements" | "draft-design" | "update-design" => ScopeCategory::Design.to_scope(),
+        "generate-graph" | "update-graph" | "design-to-graph" => ToolScope::graph_ops(),
+        "plan-tasks" => ScopeCategory::Plan.to_scope(),
+        "implement" | "execute-tasks" => ScopeCategory::Implement.to_scope(),
         "extract-code" => ToolScope::graph_ops(),
-        "verify-quality" => ToolScope::verify(),
+        "verify-quality" | "verify" => ScopeCategory::Verify.to_scope(),
         _ => {
             warn!("No ToolScope defined for phase '{}', using full access", phase_id);
             ToolScope::full()
