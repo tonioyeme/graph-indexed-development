@@ -51,6 +51,18 @@ impl LlmClient for CliLlmClient {
         model: &str,
         working_dir: &Path,
     ) -> Result<SkillResult> {
+        // Defensive validation: ensure tool names are safe (no commas, control chars)
+        for tool in &tools {
+            if tool.name.contains(',') || tool.name.chars().any(|c| c.is_control()) {
+                anyhow::bail!("Invalid tool name: '{}' (contains comma or control character)", tool.name);
+            }
+        }
+
+        // Defensive validation: prompt shouldn't start with "--" (could be misinterpreted as flag)
+        if skill_prompt.trim().starts_with("--") {
+            eprintln!("Warning: Skill prompt starts with '--', may cause CLI parsing issues");
+        }
+
         // Build allowed tools list from ToolDefinition names
         let allowed_tools: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
 
