@@ -86,6 +86,7 @@ impl NotifierConfig {
 /// Sends notifications via the Telegram Bot API when important events
 /// occur during harness execution. Supports inline keyboards for
 /// approval workflows.
+#[derive(Clone)]
 pub struct TelegramNotifier {
     /// HTTP client for API requests.
     client: reqwest::Client,

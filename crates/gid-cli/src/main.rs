@@ -2005,7 +2005,6 @@ fn cmd_stats(path: PathBuf, json: bool) -> Result<()> {
         avg_turns_per_task: avg_turns,
         total_tokens,
         duration_secs,
-        estimation_accuracy: 0.0, // Would need plan data to compute
     };
 
     if json {

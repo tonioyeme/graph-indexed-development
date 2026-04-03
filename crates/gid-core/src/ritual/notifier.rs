@@ -124,10 +124,14 @@ impl RitualNotifier {
             total_phases
         );
 
-        match self.telegram.send_html(&html).await {
-            Ok(_) => debug!("Sent ritual start notification"),
-            Err(e) => warn!("Failed to send ritual start notification: {}", e),
-        }
+        // Fire-and-forget: spawn background task to avoid blocking ritual
+        let telegram = self.telegram.clone();
+        tokio::spawn(async move {
+            match telegram.send_html(&html).await {
+                Ok(_) => debug!("Sent ritual start notification"),
+                Err(e) => warn!("Failed to send ritual start notification: {}", e),
+            }
+        });
 
         Ok(())
     }
@@ -156,10 +160,15 @@ impl RitualNotifier {
             if artifact_count == 1 { "" } else { "s" }
         );
 
-        match self.telegram.send_html(&html).await {
-            Ok(_) => debug!("Sent phase complete notification for '{}'", phase.id),
-            Err(e) => warn!("Failed to send phase complete notification: {}", e),
-        }
+        // Fire-and-forget: spawn background task
+        let telegram = self.telegram.clone();
+        let phase_id = phase.id.clone();
+        tokio::spawn(async move {
+            match telegram.send_html(&html).await {
+                Ok(_) => debug!("Sent phase complete notification for '{}'", phase_id),
+                Err(e) => warn!("Failed to send phase complete notification: {}", e),
+            }
+        });
 
         Ok(())
     }
@@ -239,10 +248,15 @@ impl RitualNotifier {
             escape_html(&error_display)
         );
 
-        match self.telegram.send_html(&html).await {
-            Ok(_) => debug!("Sent phase failed notification for '{}'", phase.id),
-            Err(e) => warn!("Failed to send phase failed notification: {}", e),
-        }
+        // Fire-and-forget: spawn background task
+        let telegram = self.telegram.clone();
+        let phase_id = phase.id.clone();
+        tokio::spawn(async move {
+            match telegram.send_html(&html).await {
+                Ok(_) => debug!("Sent phase failed notification for '{}'", phase_id),
+                Err(e) => warn!("Failed to send phase failed notification: {}", e),
+            }
+        });
 
         Ok(())
     }
@@ -267,10 +281,14 @@ impl RitualNotifier {
             duration_str
         );
 
-        match self.telegram.send_html(&html).await {
-            Ok(_) => debug!("Sent ritual complete notification"),
-            Err(e) => warn!("Failed to send ritual complete notification: {}", e),
-        }
+        // Fire-and-forget: spawn background task
+        let telegram = self.telegram.clone();
+        tokio::spawn(async move {
+            match telegram.send_html(&html).await {
+                Ok(_) => debug!("Sent ritual complete notification"),
+                Err(e) => warn!("Failed to send ritual complete notification: {}", e),
+            }
+        });
 
         Ok(())
     }
@@ -303,10 +321,14 @@ impl RitualNotifier {
             escape_html(&error_display)
         );
 
-        match self.telegram.send_html(&html).await {
-            Ok(_) => debug!("Sent ritual failed notification"),
-            Err(e) => warn!("Failed to send ritual failed notification: {}", e),
-        }
+        // Fire-and-forget: spawn background task
+        let telegram = self.telegram.clone();
+        tokio::spawn(async move {
+            match telegram.send_html(&html).await {
+                Ok(_) => debug!("Sent ritual failed notification"),
+                Err(e) => warn!("Failed to send ritual failed notification: {}", e),
+            }
+        });
 
         Ok(())
     }

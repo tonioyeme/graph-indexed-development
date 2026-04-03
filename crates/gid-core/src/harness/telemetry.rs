@@ -72,11 +72,6 @@ impl TelemetryLogger {
         let mut total_turns: u32 = 0;
         let mut total_tokens: u64 = 0;
         let mut total_duration_s: u64 = 0;
-        let mut within_estimate = 0usize;
-        let mut total_estimated = 0usize;
-
-        // Track estimated turns per task for accuracy calc
-        let task_estimates: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -86,19 +81,11 @@ impl TelemetryLogger {
 
             if let Ok(event) = serde_json::from_str::<ExecutionEvent>(line) {
                 match event {
-                    ExecutionEvent::TaskDone { task_id, turns, tokens, duration_s, .. } => {
+                    ExecutionEvent::TaskDone { turns, tokens, duration_s, .. } => {
                         tasks_completed += 1;
                         total_turns += turns;
                         total_tokens += tokens;
                         total_duration_s += duration_s;
-
-                        // Check estimation accuracy
-                        if let Some(&estimated) = task_estimates.get(&task_id) {
-                            total_estimated += 1;
-                            if turns <= estimated {
-                                within_estimate += 1;
-                            }
-                        }
                     }
                     ExecutionEvent::TaskFailed { turns, .. } => {
                         tasks_failed += 1;
@@ -120,12 +107,6 @@ impl TelemetryLogger {
             0.0
         };
 
-        let accuracy = if total_estimated > 0 {
-            within_estimate as f32 / total_estimated as f32
-        } else {
-            0.0
-        };
-
         Ok(ExecutionStats {
             tasks_completed,
             tasks_failed,
@@ -133,7 +114,6 @@ impl TelemetryLogger {
             avg_turns_per_task: avg_turns,
             total_tokens,
             duration_secs: total_duration_s,
-            estimation_accuracy: accuracy,
         })
     }
 

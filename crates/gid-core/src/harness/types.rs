@@ -266,7 +266,6 @@ pub struct ExecutionStats {
     pub avg_turns_per_task: f32,
     pub total_tokens: u64,
     pub duration_secs: u64,
-    pub estimation_accuracy: f32,
 }
 
 /// Verification result.
