@@ -202,7 +202,7 @@ nodes:
   - ritual
 - id: ritual-notifier
   title: 'Ritual notifier: Telegram/channel updates on phase transitions'
-  status: todo
+  status: done
   tags:
   - p1
   - ritual
