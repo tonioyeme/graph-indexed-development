@@ -17,6 +17,8 @@ pub mod template;
 pub mod scope;
 pub mod llm;
 pub mod notifier;
+#[cfg(feature = "harness")]
+pub mod api_llm_client;
 
 // Re-export key types
 pub use definition::{
@@ -35,4 +37,6 @@ pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
 pub use scope::{ToolScope, BashPolicy, ToolNameMapping, default_scope_for_phase, rustclaw_tool_mapping};
 pub use llm::{LlmClient, ToolDefinition, SkillResult};
+#[cfg(feature = "harness")]
+pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
