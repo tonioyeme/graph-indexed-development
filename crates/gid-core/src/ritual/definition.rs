@@ -212,6 +212,9 @@ pub struct RitualConfig {
     /// Path to log file.
     #[serde(default = "default_log_file")]
     pub log_file: String,
+    /// Notification configuration.
+    #[serde(default)]
+    pub notify: Option<super::notifier::RitualNotifyConfig>,
 }
 
 impl Default for RitualConfig {
@@ -221,6 +224,7 @@ impl Default for RitualConfig {
             default_approval: ApprovalRequirement::default(),
             state_file: default_state_file(),
             log_file: default_log_file(),
+            notify: None,
         }
     }
 }

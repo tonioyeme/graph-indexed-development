@@ -20,6 +20,7 @@ use super::executor::{
     SkillExecutor, GidCommandExecutor, HarnessExecutor, ShellExecutor,
 };
 use super::llm::LlmClient;
+use super::notifier::RitualNotifier;
 
 /// Current state of a ritual execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +119,10 @@ pub struct RitualEngine {
     /// LLM client for skill and harness execution.
     /// If None, skill and harness phases will use stub implementations.
     llm_client: Option<Arc<dyn LlmClient>>,
+    /// Optional notifier for Telegram notifications.
+    notifier: Option<RitualNotifier>,
+    /// Whether ritual start notification has been sent (to avoid duplicates on resume).
+    start_notified: bool,
 }
 
 impl RitualEngine {
@@ -135,15 +140,16 @@ impl RitualEngine {
         let gid_root = project_root.join(".gid");
         let state_path = gid_root.join("ritual-state.json");
         
-        let state = if state_path.exists() {
+        let (state, resuming) = if state_path.exists() {
             // Resume from existing state
             let content = std::fs::read_to_string(&state_path)
                 .context("Failed to read ritual state file")?;
-            serde_json::from_str(&content)
-                .context("Failed to parse ritual state")?
+            let state = serde_json::from_str(&content)
+                .context("Failed to parse ritual state")?;
+            (state, true)
         } else {
             // Initialize new state
-            Self::init_state(&definition)
+            (Self::init_state(&definition), false)
         };
         
         Ok(Self {
@@ -153,6 +159,8 @@ impl RitualEngine {
             gid_root,
             artifact_manager: ArtifactManager::new(project_root),
             llm_client,
+            notifier: None,
+            start_notified: resuming, // Don't send start notification on resume
         })
     }
     
@@ -186,7 +194,14 @@ impl RitualEngine {
             gid_root,
             artifact_manager: ArtifactManager::new(project_root),
             llm_client,
+            notifier: None,
+            start_notified: true, // Don't send start notification on resume
         })
+    }
+    
+    /// Set the notifier for Telegram notifications.
+    pub fn set_notifier(&mut self, notifier: RitualNotifier) {
+        self.notifier = Some(notifier);
     }
     
     /// Initialize state for a new ritual.
@@ -219,6 +234,17 @@ impl RitualEngine {
         
         if matches!(self.state.status, RitualStatus::Completed | RitualStatus::Cancelled) {
             return Ok(self.state.status.clone());
+        }
+        
+        // Send ritual start notification (only once)
+        if !self.start_notified {
+            if let Some(ref notifier) = self.notifier {
+                let _ = notifier.notify_ritual_start(
+                    &self.definition.name,
+                    self.definition.phases.len(),
+                ).await;
+            }
+            self.start_notified = true;
         }
         
         self.state.status = RitualStatus::Running;
@@ -272,6 +298,15 @@ impl RitualEngine {
                                 requested_at: Utc::now(),
                             };
                             self.save_state()?;
+                            
+                            // Notify approval required
+                            if let Some(ref notifier) = self.notifier {
+                                let _ = notifier.notify_approval_required(
+                                    phase,
+                                    &phase_result.artifacts,
+                                ).await;
+                            }
+                            
                             return Ok(self.state.status.clone());
                         }
                         
@@ -280,6 +315,16 @@ impl RitualEngine {
                         self.state.phase_states[phase_idx].completed_at = Some(Utc::now());
                         self.state.current_phase += 1;
                         self.save_state()?;
+                        
+                        // Notify phase completion
+                        if let Some(ref notifier) = self.notifier {
+                            let _ = notifier.notify_phase_complete(
+                                phase,
+                                &phase_result,
+                                phase_idx,
+                                self.definition.phases.len(),
+                            ).await;
+                        }
                     } else {
                         // Phase failed - extract needed data before mutable borrow
                         let phase_id = phase.id.clone();
@@ -309,11 +354,24 @@ impl RitualEngine {
         // All phases completed
         self.state.status = RitualStatus::Completed;
         self.save_state()?;
+        
+        // Notify ritual completion
+        if let Some(ref notifier) = self.notifier {
+            let duration_secs = (Utc::now() - self.state.started_at).num_seconds() as u64;
+            let _ = notifier.notify_ritual_complete(
+                &self.definition.name,
+                duration_secs,
+            ).await;
+        }
+        
         Ok(self.state.status.clone())
     }
     
     /// Handle a phase failure according to the failure strategy.
     async fn handle_failure(&mut self, phase_idx: usize, phase_id: &str, on_failure: &FailureStrategy, error: String) -> Result<()> {
+        // Get phase for notifications
+        let phase = &self.definition.phases[phase_idx];
+        
         match on_failure {
             FailureStrategy::Retry { max_attempts } => {
                 let retry_count = self.state.phase_states[phase_idx].retry_count;
@@ -324,13 +382,24 @@ impl RitualEngine {
                     // Will retry on next loop iteration
                 } else {
                     // Max retries exceeded, escalate
+                    let final_error = format!("Max retries ({}) exceeded: {}", max_attempts, error);
                     self.state.phase_states[phase_idx].status = PhaseStatus::Failed;
                     self.state.phase_states[phase_idx].error = Some(error.clone());
                     self.state.status = RitualStatus::Failed {
                         phase_id: phase_id.to_string(),
-                        error: format!("Max retries ({}) exceeded: {}", max_attempts, error),
+                        error: final_error.clone(),
                     };
                     self.save_state()?;
+                    
+                    // Notify phase and ritual failure
+                    if let Some(ref notifier) = self.notifier {
+                        let _ = notifier.notify_phase_failed(phase, &error).await;
+                        let _ = notifier.notify_ritual_failed(
+                            &self.definition.name,
+                            phase_id,
+                            &final_error,
+                        ).await;
+                    }
                 }
             }
             FailureStrategy::Escalate => {
@@ -338,9 +407,19 @@ impl RitualEngine {
                 self.state.phase_states[phase_idx].error = Some(error.clone());
                 self.state.status = RitualStatus::Failed {
                     phase_id: phase_id.to_string(),
-                    error,
+                    error: error.clone(),
                 };
                 self.save_state()?;
+                
+                // Notify phase and ritual failure
+                if let Some(ref notifier) = self.notifier {
+                    let _ = notifier.notify_phase_failed(phase, &error).await;
+                    let _ = notifier.notify_ritual_failed(
+                        &self.definition.name,
+                        phase_id,
+                        &error,
+                    ).await;
+                }
             }
             FailureStrategy::Skip => {
                 self.state.phase_states[phase_idx].status = PhaseStatus::Skipped {
@@ -348,15 +427,27 @@ impl RitualEngine {
                 };
                 self.state.current_phase += 1;
                 self.save_state()?;
+                // No notification for skipped failures — just continue
             }
             FailureStrategy::Abort => {
+                let abort_error = format!("Aborted: {}", error);
                 self.state.phase_states[phase_idx].status = PhaseStatus::Failed;
                 self.state.phase_states[phase_idx].error = Some(error.clone());
                 self.state.status = RitualStatus::Failed {
                     phase_id: phase_id.to_string(),
-                    error: format!("Aborted: {}", error),
+                    error: abort_error.clone(),
                 };
                 self.save_state()?;
+                
+                // Notify phase and ritual failure
+                if let Some(ref notifier) = self.notifier {
+                    let _ = notifier.notify_phase_failed(phase, &error).await;
+                    let _ = notifier.notify_ritual_failed(
+                        &self.definition.name,
+                        phase_id,
+                        &abort_error,
+                    ).await;
+                }
             }
         }
         Ok(())

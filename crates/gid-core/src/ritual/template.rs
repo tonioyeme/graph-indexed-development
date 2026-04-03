@@ -358,6 +358,7 @@ impl TemplateRegistry {
                 default_approval: ApprovalRequirement::Optional,
                 state_file: ".gid/ritual-state.json".to_string(),
                 log_file: ".gid/execution-log.jsonl".to_string(),
+                notify: None,
             },
         }
     }
@@ -425,6 +426,7 @@ impl TemplateRegistry {
                 default_approval: ApprovalRequirement::Auto,
                 state_file: ".gid/ritual-state.json".to_string(),
                 log_file: ".gid/execution-log.jsonl".to_string(),
+                notify: None,
             },
         }
     }
@@ -489,6 +491,7 @@ impl TemplateRegistry {
                 default_approval: ApprovalRequirement::Auto,
                 state_file: ".gid/ritual-state.json".to_string(),
                 log_file: ".gid/execution-log.jsonl".to_string(),
+                notify: None,
             },
         }
     }

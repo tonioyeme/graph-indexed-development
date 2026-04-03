@@ -16,6 +16,7 @@ pub mod approval;
 pub mod template;
 pub mod scope;
 pub mod llm;
+pub mod notifier;
 
 // Re-export key types
 pub use definition::{
@@ -34,3 +35,4 @@ pub use approval::{ApprovalGate, ApprovalRequest};
 pub use template::{TemplateRegistry, TemplateSummary};
 pub use scope::{ToolScope, BashPolicy, ToolNameMapping, default_scope_for_phase, rustclaw_tool_mapping};
 pub use llm::{LlmClient, ToolDefinition, SkillResult};
+pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};

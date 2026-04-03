@@ -2464,7 +2464,7 @@ async fn cmd_ritual_run(
     model_override: Option<String>,
     json: bool,
 ) -> Result<()> {
-    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus, PhaseStatus};
+    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus, PhaseStatus, RitualNotifier};
     use std::time::Instant;
 
     let ritual_path = project_root.join(".gid/ritual.yml");
@@ -2515,6 +2515,11 @@ async fn cmd_ritual_run(
         }
         engine
     };
+
+    // Set up notifier if configured via env vars
+    if let Some(notifier) = RitualNotifier::from_env() {
+        engine.set_notifier(notifier);
+    }
 
     let total_phases = engine.definition().phases.len();
     if !json {
