@@ -43,7 +43,16 @@ impl ApiLlmClient {
 
     /// Try to create from pool, return None if no pool exists.
     pub fn try_from_pool() -> Option<Self> {
-        Self::from_pool().ok()
+        match Self::from_pool() {
+            Ok(client) => {
+                tracing::info!("ApiLlmClient: loaded from auth pool");
+                Some(client)
+            }
+            Err(e) => {
+                tracing::warn!("ApiLlmClient: failed to load auth pool: {}", e);
+                None
+            }
+        }
     }
 
     /// Wrap as Arc<dyn LlmClient>.
