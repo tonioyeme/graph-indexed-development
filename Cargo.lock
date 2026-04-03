@@ -521,7 +521,6 @@ dependencies = [
  "clap",
  "dirs",
  "gid-core",
- "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
