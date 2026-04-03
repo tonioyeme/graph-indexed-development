@@ -122,9 +122,9 @@ nodes:
   - p3
   - integration
 - id: mcp-server
-  title: MCP server mode using gid-core backend
+  title: MCP server via TypeScript wrapper (packages/mcp/)
   status: done
-  description: 'Optional: gid serve starts MCP server backed by gid-core. Replaces TypeScript MCP server.'
+  description: 'TypeScript MCP server using @modelcontextprotocol/sdk, wraps gid CLI binary. Already complete in packages/mcp/.'
   tags:
   - p3
   - integration
