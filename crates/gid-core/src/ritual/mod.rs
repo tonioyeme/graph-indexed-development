@@ -19,6 +19,7 @@ pub mod llm;
 pub mod notifier;
 #[cfg(feature = "harness")]
 pub mod api_llm_client;
+pub mod composer;
 
 // Re-export key types
 pub use definition::{
@@ -40,3 +41,4 @@ pub use llm::{LlmClient, ToolDefinition, SkillResult};
 #[cfg(feature = "harness")]
 pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
+pub use composer::{compose_ritual, ProjectState, ProjectLanguage};

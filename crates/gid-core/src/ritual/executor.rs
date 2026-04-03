@@ -199,6 +199,57 @@ impl SkillExecutor {
                  - Read existing .gid/graph.yml first — merge new nodes, don't delete existing ones\n\
                  Use the Read tool to read DESIGN.md and existing graph, then Write tool to update .gid/graph.yml.".to_string()
             ),
+            "update-design" => Ok(
+                "You are a software architect updating an existing design document.\n\
+                 Read the current DESIGN.md and the user's new task/feature request.\n\
+                 Update DESIGN.md to include the new feature while preserving existing content.\n\
+                 Add a new section for the new feature with:\n\
+                 - What's being added/changed\n\
+                 - Files to modify\n\
+                 - Key design decisions\n\
+                 Do NOT delete existing design content — append the new feature section.\n\
+                 Use the Read tool to read DESIGN.md, then Write tool to update it.".to_string()
+            ),
+            "update-graph" => Ok(
+                "You are updating an existing project graph with new task nodes.\n\
+                 Read the current .gid/graph.yml AND DESIGN.md.\n\
+                 Add new nodes and edges for the new feature/task described in DESIGN.md.\n\n\
+                 CRITICAL RULES:\n\
+                 - Read the existing graph FIRST\n\
+                 - PRESERVE all existing nodes and edges — do NOT delete or modify them\n\
+                 - Only ADD new nodes (task, component, file) and edges for the new work\n\
+                 - New task nodes should have status: todo\n\
+                 - Link new tasks to existing components they modify\n\n\
+                 Node types: component, file, task, feature, layer, doc\n\
+                 Edge relations: depends_on, modifies, contains, tests, implements, related_to\n\n\
+                 Use Read to load existing graph and DESIGN.md, then Write to update .gid/graph.yml.".to_string()
+            ),
+            "implement" => Ok(
+                "You are a coding agent implementing changes on an existing codebase.\n\
+                 Read DESIGN.md and .gid/graph.yml to understand what needs to be done.\n\
+                 Look at task nodes with status: todo — these are your work items.\n\n\
+                 Workflow:\n\
+                 1. Read the relevant existing source files to understand patterns and style\n\
+                 2. Implement each task, maintaining consistency with existing code\n\
+                 3. All changes happen in this single session — coordinate across files\n\
+                 4. After all changes, run the build command to verify compilation\n\n\
+                 Rules:\n\
+                 - Match existing code style (naming, formatting, patterns)\n\
+                 - Use Edit for modifying existing files, Write for new files\n\
+                 - Run `cargo check` (Rust), `npm run build` (TS), or equivalent after changes\n\
+                 - If build fails, fix the errors before finishing\n\
+                 - Keep changes minimal and focused on the task\n\n\
+                 Use Read, Write, Edit, and Bash tools.".to_string()
+            ),
+            "draft-design" => Ok(
+                "You are a software architect. Read the user's request and any existing code context.\n\
+                 Create a concise DESIGN.md in the project root with:\n\
+                 - Problem statement\n\
+                 - Proposed solution (files to create/modify)\n\
+                 - Key design decisions\n\
+                 Keep it brief — this is a quick implementation, not a full RFC.\n\
+                 Use the Write tool to create DESIGN.md.".to_string()
+            ),
             _ => Ok(format!(
                 "You are executing the '{}' skill for ritual '{}'. Complete the task described in the phase definition.",
                 skill_name, context.ritual_name

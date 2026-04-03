@@ -554,7 +554,7 @@ mod tests {
         
         // Check quick-impl
         let quick = templates.iter().find(|t| t.name == "quick-impl").unwrap();
-        assert_eq!(quick.phases.len(), 3);
+        assert_eq!(quick.phases.len(), 4);
         
         // Check bugfix
         let bugfix = templates.iter().find(|t| t.name == "bugfix").unwrap();

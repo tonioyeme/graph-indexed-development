@@ -64,6 +64,26 @@ pub struct PhaseDefinition {
     pub harness_config: Option<HarnessConfigOverride>,
 }
 
+impl Default for PhaseDefinition {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: PhaseKind::Shell {
+                command: "echo 'no-op'".to_string(),
+            },
+            model: None,
+            approval: ApprovalRequirement::default(),
+            skip_if: None,
+            timeout_minutes: None,
+            input: Vec::new(),
+            output: Vec::new(),
+            hooks: PhaseHooks::default(),
+            on_failure: FailureStrategy::default(),
+            harness_config: None,
+        }
+    }
+}
+
 /// What a phase does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
