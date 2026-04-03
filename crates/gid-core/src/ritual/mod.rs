@@ -22,6 +22,7 @@ pub mod api_llm_client;
 pub mod composer;
 pub mod state_machine;
 pub mod v2_executor;
+pub mod gating;
 
 // Re-export key types
 pub use definition::{
@@ -45,6 +46,7 @@ pub use api_llm_client::ApiLlmClient;
 pub use notifier::{RitualNotifier, RitualNotifyConfig, RitualEvent};
 pub use composer::{compose_ritual, ProjectState as ComposerProjectState, ProjectLanguage};
 pub use v2_executor::{V2Executor, V2ExecutorConfig, NotifyFn, run_ritual};
+pub use gating::{GatingConfig, GatingResult, CommandPattern, PatternType, check_gating, load_gating_config, save_gating_config};
 pub use state_machine::{
     RitualPhase as V2Phase,
     RitualState as V2State,
