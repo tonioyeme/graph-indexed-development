@@ -2,6 +2,8 @@
 //!
 //! A unified graph-based project and task management CLI.
 
+mod llm_client;
+
 use std::path::PathBuf;
 use std::io::{self, Read};
 use anyhow::{Context, Result, bail};
@@ -509,6 +511,12 @@ enum RitualCommands {
         /// Auto-approve all gates (useful for CI/testing)
         #[arg(long)]
         auto_approve: bool,
+        /// Initialize from template before running (combines init + run)
+        #[arg(long, short)]
+        template: Option<String>,
+        /// Override the default model for skill phases
+        #[arg(long, short)]
+        model: Option<String>,
     },
 
     /// Show current ritual status
@@ -613,9 +621,9 @@ fn main() -> Result<()> {
             let cwd = std::env::current_dir()?;
             match rc {
                 RitualCommands::Init { template } => cmd_ritual_init(&cwd, &template, cli.json),
-                RitualCommands::Run { auto_approve } => {
+                RitualCommands::Run { auto_approve, template, model } => {
                     let rt = tokio::runtime::Runtime::new()?;
-                    rt.block_on(cmd_ritual_run(&cwd, auto_approve, cli.json))
+                    rt.block_on(cmd_ritual_run(&cwd, auto_approve, template, model, cli.json))
                 }
                 RitualCommands::Status => cmd_ritual_status(&cwd, cli.json),
                 RitualCommands::Approve => {
@@ -2449,56 +2457,181 @@ fn cmd_ritual_init(project_root: &std::path::Path, template_name: &str, json: bo
     Ok(())
 }
 
-async fn cmd_ritual_run(project_root: &std::path::Path, auto_approve: bool, json: bool) -> Result<()> {
-    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus};
-    
+async fn cmd_ritual_run(
+    project_root: &std::path::Path,
+    auto_approve: bool,
+    template: Option<String>,
+    model_override: Option<String>,
+    json: bool,
+) -> Result<()> {
+    use gid_core::ritual::{RitualDefinition, RitualEngine, RitualStatus, PhaseStatus};
+    use std::time::Instant;
+
     let ritual_path = project_root.join(".gid/ritual.yml");
-    if !ritual_path.exists() {
-        bail!("No ritual found. Run `gid ritual init` first.");
+    let state_path = project_root.join(".gid/ritual-state.json");
+
+    // If --template is provided and no ritual exists, init first
+    if let Some(ref tmpl) = template {
+        if !ritual_path.exists() {
+            if !json {
+                println!("Initializing ritual from template: {}", tmpl);
+            }
+            cmd_ritual_init(project_root, tmpl, json)?;
+        }
     }
-    
+
+    if !ritual_path.exists() {
+        bail!("No ritual found. Run `gid ritual init` first or use `--template`.");
+    }
+
     // Load ritual definition
-    let mut template_dirs = vec![
-        project_root.join(".gid/rituals/"),
-    ];
+    let mut template_dirs = vec![project_root.join(".gid/rituals/")];
     if let Some(home) = dirs::home_dir() {
         template_dirs.push(home.join(".gid/rituals/"));
     }
-    
+
     let definition = RitualDefinition::load(&ritual_path, &template_dirs)?;
-    
-    // Create or resume engine
-    let mut engine = RitualEngine::new(definition, project_root)?;
-    
+
+    // Create LLM client for skill/harness phases
+    let llm_client = llm_client::CliLlmClient::new().into_arc();
+
+    // Check if we're resuming
+    let resuming = state_path.exists();
+
+    // Create or resume engine with LLM client
+    let mut engine = if resuming {
+        let engine = RitualEngine::resume_with_llm_client(definition.clone(), project_root, Some(llm_client))?;
+        if !json {
+            println!("▶ Resuming ritual: {} (from phase {})", 
+                engine.definition().name,
+                engine.state().current_phase + 1
+            );
+        }
+        engine
+    } else {
+        let engine = RitualEngine::with_llm_client(definition.clone(), project_root, Some(llm_client))?;
+        if !json {
+            println!("▶ Running ritual: {}", engine.definition().name);
+        }
+        engine
+    };
+
+    let total_phases = engine.definition().phases.len();
     if !json {
-        println!("▶ Running ritual: {}", engine.definition().name);
         println!();
     }
-    
-    // Run the ritual
+
+    // Run the ritual with progress output
     loop {
-        let status = engine.run().await?;
+        let current_phase = engine.state().current_phase;
         
+        // Show progress before running if not completed
+        if current_phase < total_phases && !json {
+            let phase = &engine.definition().phases[current_phase];
+            let model = model_override.as_deref()
+                .or(phase.model.as_deref())
+                .unwrap_or(&engine.definition().config.default_model);
+            let kind_name = phase_kind_name(&phase.kind);
+            println!("  [{}/{}] {} ({}, {})", 
+                current_phase + 1, 
+                total_phases,
+                phase.id,
+                kind_name,
+                model
+            );
+        }
+
+        let phase_start = Instant::now();
+        let status = engine.run().await?;
+        let phase_duration = phase_start.elapsed();
+
         match &status {
             RitualStatus::WaitingApproval { phase_id, message, .. } => {
                 if auto_approve {
                     if !json {
-                        println!("⏩ Auto-approving phase: {}", phase_id);
+                        println!("  ⏩ Auto-approving phase: {}", phase_id);
                     }
                     engine.approve().await?;
                     continue;
                 }
-                
+
+                // Interactive approval prompt
                 if json {
                     println!("{}", serde_json::json!({
                         "status": "waiting_approval",
                         "phase_id": phase_id,
                         "message": message
                     }));
+                    return Ok(());
                 } else {
-                    println!("{}", message);
+                    println!("  ⏸ Approval required for '{}'", phase_id);
+                    
+                    // Show artifacts if available
+                    let phase_idx = engine.definition().phase_index(phase_id);
+                    if let Some(idx) = phase_idx {
+                        let artifacts = &engine.state().phase_states[idx].artifacts_produced;
+                        if !artifacts.is_empty() {
+                            println!("    Review artifacts:");
+                            for artifact in artifacts {
+                                println!("      - {}", artifact);
+                            }
+                        }
+                    }
+                    
+                    // Prompt for approval
+                    loop {
+                        print!("    Approve? [y/n/s(kip)] ");
+                        use std::io::Write;
+                        std::io::stdout().flush()?;
+                        
+                        let mut input = String::new();
+                        std::io::stdin().read_line(&mut input)?;
+                        let choice = input.trim().to_lowercase();
+                        
+                        match choice.as_str() {
+                            "y" | "yes" => {
+                                engine.approve().await?;
+                                break;
+                            }
+                            "n" | "no" => {
+                                println!("  ✗ Rejected. Ritual paused.");
+                                return Ok(());
+                            }
+                            "s" | "skip" => {
+                                engine.skip_current()?;
+                                println!("  ⊘ Skipped phase: {}", phase_id);
+                                break;
+                            }
+                            _ => {
+                                println!("    Invalid choice. Enter y, n, or s.");
+                            }
+                        }
+                    }
+                    continue;
                 }
-                return Ok(());
+            }
+            RitualStatus::Running => {
+                // Phase completed, show success and continue
+                if !json && current_phase < total_phases {
+                    let phase_state = &engine.state().phase_states[current_phase];
+                    let artifact_count = phase_state.artifacts_produced.len();
+                    
+                    match &phase_state.status {
+                        PhaseStatus::Completed => {
+                            println!("  ✓ {} completed ({:.1}s, {} artifact{})",
+                                phase_state.phase_id,
+                                phase_duration.as_secs_f64(),
+                                artifact_count,
+                                if artifact_count == 1 { "" } else { "s" }
+                            );
+                        }
+                        PhaseStatus::Skipped { reason } => {
+                            println!("  ⊘ {} skipped: {}", phase_state.phase_id, reason);
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
             }
             RitualStatus::Completed => {
                 if json {
@@ -2506,6 +2639,7 @@ async fn cmd_ritual_run(project_root: &std::path::Path, auto_approve: bool, json
                         "status": "completed"
                     }));
                 } else {
+                    println!();
                     println!("✓ Ritual completed successfully!");
                 }
                 return Ok(());
@@ -2518,7 +2652,7 @@ async fn cmd_ritual_run(project_root: &std::path::Path, auto_approve: bool, json
                         "error": error
                     }));
                 } else {
-                    eprintln!("✗ Ritual failed at phase '{}': {}", phase_id, error);
+                    eprintln!("  ✗ {} failed: {}", phase_id, error);
                 }
                 std::process::exit(1);
             }
@@ -2530,11 +2664,16 @@ async fn cmd_ritual_run(project_root: &std::path::Path, auto_approve: bool, json
                 }
                 return Ok(());
             }
-            _ => break,
+            RitualStatus::Paused => {
+                if json {
+                    println!("{}", serde_json::json!({"status": "paused"}));
+                } else {
+                    println!("⏸ Ritual paused. Run `gid ritual run` to resume.");
+                }
+                return Ok(());
+            }
         }
     }
-    
-    Ok(())
 }
 
 fn cmd_ritual_status(project_root: &std::path::Path, json: bool) -> Result<()> {

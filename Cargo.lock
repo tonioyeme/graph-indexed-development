@@ -517,6 +517,7 @@ name = "gid-dev-cli"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "dirs",
  "gid-core",
