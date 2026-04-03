@@ -394,7 +394,7 @@ impl TemplateRegistry {
                 // Phase 0: Draft design (LLM generates DESIGN.md)
                 PhaseDefinition {
                     id: "draft-design".to_string(),
-                    kind: PhaseKind::Skill { name: "quick-design".to_string() },
+                    kind: PhaseKind::Skill { name: "draft-design".to_string() },
                     model: Some("sonnet".to_string()),
                     approval: ApprovalRequirement::Auto,
                     skip_if: Some(SkipCondition::FileExists { file_exists: "DESIGN.md".to_string() }),

@@ -143,15 +143,8 @@ impl SkillExecutor {
 
         // Fall back to built-in skill prompts, then generic
         match skill_name {
-            "quick-design" => Ok(
-                "You are a software architect. Read the user's request and any existing code context.\n\
-                 Create a concise DESIGN.md in the project root with:\n\
-                 - Problem statement\n\
-                 - Proposed solution (files to create/modify)\n\
-                 - Key design decisions\n\
-                 Keep it brief — this is a quick implementation, not a full RFC.\n\
-                 Use the Write tool to create DESIGN.md.".to_string()
-            ),
+            // "quick-design" is a legacy alias for "draft-design"
+            "quick-design" => self.load_skill_prompt("draft-design", context),
             "design-to-graph" => Ok(
                 "You are a project graph generator. Read DESIGN.md from the project root.\n\
                  Generate a GID graph in YAML format and write it to .gid/graph.yml.\n\n\
