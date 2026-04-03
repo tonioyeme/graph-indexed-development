@@ -153,27 +153,51 @@ impl SkillExecutor {
                  Use the Write tool to create DESIGN.md.".to_string()
             ),
             "design-to-graph" => Ok(
-                "You are a task graph generator. Read DESIGN.md from the project root.\n\
-                 Generate a GID task graph in YAML format and write it to .gid/graph.yml.\n\n\
-                 The graph format is:\n\
+                "You are a project graph generator. Read DESIGN.md from the project root.\n\
+                 Generate a GID graph in YAML format and write it to .gid/graph.yml.\n\n\
+                 The graph has multiple node types:\n\
                  ```yaml\n\
                  nodes:\n\
-                   - id: task-id\n\
-                     label: \"Human-readable title\"\n\
+                   # Component/module nodes (the architecture)\n\
+                   - id: mod-dashboard\n\
+                     title: \"Dashboard Module\"\n\
+                     type: component\n\
+                     status: done\n\
+                     tags: [module]\n\
+                     description: \"HTTP dashboard server\"\n\
+                   # File nodes (what gets changed)\n\
+                   - id: file-dashboard-rs\n\
+                     title: \"src/dashboard.rs\"\n\
+                     type: file\n\
+                     status: done\n\
+                     tags: [source]\n\
+                   # Task nodes (what to do)\n\
+                   - id: task-add-health-endpoint\n\
+                     title: \"Add /api/health endpoint\"\n\
+                     type: task\n\
                      status: todo\n\
                      tags: [implementation]\n\
-                     description: \"What to do\"\n\
+                     description: \"Add health check endpoint returning uptime and stats\"\n\
                  edges:\n\
+                   - from: task-add-health-endpoint\n\
+                     to: mod-dashboard\n\
+                     relation: modifies\n\
+                   - from: mod-dashboard\n\
+                     to: file-dashboard-rs\n\
+                     relation: contains\n\
                    - from: task-a\n\
                      to: task-b\n\
                      relation: depends_on\n\
                  ```\n\n\
+                 Node types: component, file, task, feature, layer, doc\n\
+                 Edge relations: depends_on, modifies, contains, tests, implements, related_to\n\n\
                  Rules:\n\
-                 - Each task should be a single, concrete unit of work\n\
-                 - Use depends_on edges to express ordering\n\
-                 - Status should be 'todo' for all new tasks\n\
-                 - Read existing .gid/graph.yml first if it exists, and merge\n\
-                 Use the Read tool to read DESIGN.md, then Write tool to create .gid/graph.yml.".to_string()
+                 - Create component nodes for modules being touched\n\
+                 - Create file nodes for files being created/modified\n\
+                 - Create task nodes for concrete work items (status: todo)\n\
+                 - Link tasks to components they modify, components to files they contain\n\
+                 - Read existing .gid/graph.yml first — merge new nodes, don't delete existing ones\n\
+                 Use the Read tool to read DESIGN.md and existing graph, then Write tool to update .gid/graph.yml.".to_string()
             ),
             _ => Ok(format!(
                 "You are executing the '{}' skill for ritual '{}'. Complete the task described in the phase definition.",
