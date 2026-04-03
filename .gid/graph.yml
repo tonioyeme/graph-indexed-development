@@ -444,6 +444,89 @@ nodes:
   - meta
   - doc
   type: doc
+# ═══ Ritual V2 — Pure Function State Machine ═══
+- id: ritual-v2-design
+  title: 'DESIGN-ritual-v2.md: pure function state machine design document'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: DESIGN-ritual-v2.md
+- id: ritual-v2-state-machine
+  title: 'V2 State Machine: transition(state, event) → (new_state, actions)'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: crates/gid-core/src/ritual/state_machine.rs
+  notes: '29 tests. Pure function, zero IO. Invariant: every transition → terminal OR exactly 1 EP action.'
+- id: ritual-v2-executor
+  title: 'V2 Executor: action executor + engine loop (run_ritual)'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: crates/gid-core/src/ritual/v2_executor.rs
+  notes: '8 tests. DetectProject, RunSkill, RunShell, RunPlanning, RunHarness.'
+- id: ritual-v2-gating
+  title: 'Tool Gating: block writes to source paths without active ritual'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: crates/gid-core/src/ritual/gating.rs
+  notes: '21 tests. GatingConfig from .gid/config.yml. Glob+regex matching.'
+- id: ritual-v2-api-llm-client
+  title: 'ApiLlmClient: shared LLM client in gid-core for standalone execution'
+  status: done
+  tags:
+  - p1
+  - ritual-v2
+  file: crates/gid-core/src/ritual/api_llm_client.rs
+- id: ritual-v2-llm-trait
+  title: 'LlmClient trait + ToolHandler types for ritual skill phases'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: crates/gid-core/src/ritual/llm.rs
+  notes: 'Decoupled from agentctl-auth. Types owned by gid-core.'
+- id: ritual-v2-composer
+  title: 'Dynamic ritual composer: auto-detect project state → compose phases'
+  status: done
+  tags:
+  - p1
+  - ritual-v2
+  file: crates/gid-core/src/ritual/composer.rs
+- id: rustclaw-ritual-runner
+  title: 'RustClaw RitualRunner: bridges V2 state machine with RustClaw infra'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: /Users/potato/rustclaw/src/ritual_runner.rs
+  notes: 'Terminal notifications, concurrent protection, 5min shell timeout.'
+- id: rustclaw-ritual-adapter
+  title: 'RustClaw RitualLlmAdapter: bridges LlmClient → gid-core trait'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+  file: /Users/potato/rustclaw/src/ritual_adapter.rs
+  notes: 'Mini agent loop. Path traversal protection. UTF-8 safe truncation.'
+- id: rustclaw-start-ritual-tool
+  title: 'start_ritual tool: single entry point replacing 6 V1 tools'
+  status: done
+  tags:
+  - p0
+  - ritual-v2
+- id: ritual-v2-triage
+  title: 'Triage phase: haiku LLM call before Design to skip/clarify'
+  status: todo
+  tags:
+  - p0
+  - ritual-v2
+  notes: 'Saves ~70% tokens on small tasks. New states: Triaging, WaitingClarification.'
 edges:
 - from: graph-types
   to: workspace-setup
@@ -673,3 +756,43 @@ edges:
 - from: gidterm-integration-req
   to: gidterm-integration
   relation: documents
+# ═══ Ritual V2 edges ═══
+- from: ritual-v2-design
+  to: ritual-v2-state-machine
+  relation: specifies
+- from: ritual-v2-design
+  to: ritual-v2-executor
+  relation: specifies
+- from: ritual-v2-design
+  to: ritual-v2-gating
+  relation: specifies
+- from: ritual-v2-state-machine
+  to: ritual-v2-executor
+  relation: depends_on
+- from: ritual-v2-executor
+  to: ritual-v2-llm-trait
+  relation: depends_on
+- from: ritual-v2-api-llm-client
+  to: ritual-v2-llm-trait
+  relation: implements
+- from: rustclaw-ritual-adapter
+  to: ritual-v2-llm-trait
+  relation: implements
+- from: rustclaw-ritual-runner
+  to: ritual-v2-state-machine
+  relation: depends_on
+- from: rustclaw-ritual-runner
+  to: rustclaw-ritual-adapter
+  relation: depends_on
+- from: rustclaw-start-ritual-tool
+  to: rustclaw-ritual-runner
+  relation: depends_on
+- from: ritual-v2-triage
+  to: ritual-v2-state-machine
+  relation: extends
+- from: ritual-v2-gating
+  to: rustclaw-ritual-runner
+  relation: used_by
+- from: ritual-v2-composer
+  to: ritual-v2-executor
+  relation: used_by
