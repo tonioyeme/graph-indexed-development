@@ -252,7 +252,8 @@ pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
         },
         "research" => ToolScope::research(),
         "draft-requirements" | "draft-design" | "update-design" => ScopeCategory::Design.to_scope(),
-        "review-requirements" | "review-design" | "review-tasks" | "apply-review" => ToolScope::review(),
+        // Review phases get full access — behavior controlled by prompt, not tool gating
+        "review-requirements" | "review-design" | "review-tasks" | "apply-review" => ToolScope::full(),
         "generate-graph" | "update-graph" | "design-to-graph" => ToolScope::graph_ops(),
         "plan-tasks" => ScopeCategory::Plan.to_scope(),
         "implement" | "execute-tasks" => ScopeCategory::Implement.to_scope(),
