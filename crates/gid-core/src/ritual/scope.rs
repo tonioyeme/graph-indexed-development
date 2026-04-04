@@ -140,6 +140,20 @@ impl ToolScope {
         }
     }
 
+    /// Review — read files + write reviews only. No spawn, no bash.
+    pub fn review() -> Self {
+        Self {
+            allowed_tools: vec!["Read".into(), "Write".into(), "Edit".into()],
+            writable_paths: vec![
+                ".gid/reviews/**".into(),
+                ".gid/features/**".into(),
+                "docs/**".into(),
+            ],
+            readable_paths: vec![],
+            bash_policy: BashPolicy::Deny,
+        }
+    }
+
     /// Graph operations — can modify .gid/ only.
     pub fn graph_ops() -> Self {
         Self {
@@ -238,6 +252,7 @@ pub fn default_scope_for_phase(phase_id: &str) -> ToolScope {
         },
         "research" => ToolScope::research(),
         "draft-requirements" | "draft-design" | "update-design" => ScopeCategory::Design.to_scope(),
+        "review-requirements" | "review-design" | "review-tasks" | "apply-review" => ToolScope::review(),
         "generate-graph" | "update-graph" | "design-to-graph" => ToolScope::graph_ops(),
         "plan-tasks" => ScopeCategory::Plan.to_scope(),
         "implement" | "execute-tasks" => ScopeCategory::Implement.to_scope(),
