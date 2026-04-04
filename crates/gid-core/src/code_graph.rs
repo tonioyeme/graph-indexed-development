@@ -646,10 +646,20 @@ impl CodeGraph {
                 }
             } else if edge.to.starts_with("module_ref:") {
                 let module = &edge.to["module_ref:".len()..];
-                if let Some(file_id) = module_map.get(module) {
+                // Try direct lookup first
+                let resolved_file_id = module_map.get(module).cloned()
+                    // If direct lookup fails, try resolving as TypeScript relative import
+                    .or_else(|| {
+                        // edge.from is like "file:src/pages/Dashboard.tsx"
+                        // Extract the path after "file:"
+                        let importing_file = edge.from.strip_prefix("file:").unwrap_or(&edge.from);
+                        resolve_ts_import(importing_file, module, &module_map)
+                    });
+                
+                if let Some(file_id) = resolved_file_id {
                     resolved_edges.push(CodeEdge {
                         from: edge.from,
-                        to: file_id.clone(),
+                        to: file_id,
                         relation: edge.relation,
                         weight: edge.weight,
                         call_count: edge.call_count,
@@ -5027,6 +5037,98 @@ fn is_typescript_builtin_method(obj: &str, method: &str) -> bool {
     }
 }
 
+/// Resolve a TypeScript/JavaScript import path to a module_map key.
+/// Handles relative paths like `./foo`, `../bar`, `../../components/Stats.js`
+/// and converts them to dot-separated format matching module_map keys.
+fn resolve_ts_import(
+    importing_file: &str,
+    import_module: &str,
+    module_map: &HashMap<String, String>,
+) -> Option<String> {
+    // Handle path aliases like @/foo - just try the literal path
+    if import_module.starts_with('@') {
+        // Try @/foo -> src.foo
+        let without_at = import_module.trim_start_matches("@/");
+        let normalized = normalize_ts_module_path(without_at);
+        if let Some(file_id) = module_map.get(&normalized) {
+            return Some(file_id.clone());
+        }
+        // Try with src prefix
+        let with_src = format!("src.{}", normalized);
+        if let Some(file_id) = module_map.get(&with_src) {
+            return Some(file_id.clone());
+        }
+        return None;
+    }
+
+    // Only handle relative imports
+    if !import_module.starts_with('.') {
+        return None;
+    }
+
+    // Get the directory of the importing file
+    let importing_dir = if let Some(pos) = importing_file.rfind('/') {
+        &importing_file[..pos]
+    } else {
+        ""
+    };
+
+    // Resolve the relative path
+    let resolved = resolve_relative_path(importing_dir, import_module);
+    
+    // Normalize: strip extensions and convert / to .
+    let normalized = normalize_ts_module_path(&resolved);
+    
+    // Try direct lookup
+    if let Some(file_id) = module_map.get(&normalized) {
+        return Some(file_id.clone());
+    }
+    
+    // Try with common TS extensions (import says .js but file might be .tsx)
+    // The module_map was built without extensions, so we just try the base name
+    // But sometimes partial paths exist, try those too
+    let parts: Vec<&str> = normalized.split('.').collect();
+    for start in 1..parts.len() {
+        let partial = parts[start..].join(".");
+        if let Some(file_id) = module_map.get(&partial) {
+            return Some(file_id.clone());
+        }
+    }
+    
+    None
+}
+
+/// Resolve a relative path against a base directory
+fn resolve_relative_path(base_dir: &str, relative: &str) -> String {
+    let mut parts: Vec<&str> = if base_dir.is_empty() {
+        Vec::new()
+    } else {
+        base_dir.split('/').collect()
+    };
+    
+    for segment in relative.split('/') {
+        match segment {
+            "." | "" => continue,
+            ".." => { parts.pop(); }
+            s => parts.push(s),
+        }
+    }
+    
+    parts.join("/")
+}
+
+/// Normalize a TypeScript module path to dot-separated format
+fn normalize_ts_module_path(path: &str) -> String {
+    path.replace('/', ".")
+        .trim_end_matches(".js")
+        .trim_end_matches(".jsx")
+        .trim_end_matches(".ts")
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".mjs")
+        .trim_end_matches(".mts")
+        .to_string()
+}
+
 // ═══ Call Extraction - Rust ═══
 
 /// Build scope map for Rust — maps line ranges to function IDs
@@ -5974,6 +6076,51 @@ fn extract_calls_typescript(
                     }
                 }
             }
+            // JSX component references like <Stats /> or <Dashboard>...</Dashboard>
+            "jsx_element" | "jsx_self_closing_element" => {
+                let call_line = node.start_position().row + 1;
+
+                let scope = scope_map
+                    .iter()
+                    .filter(|(start, end, _, _)| call_line >= *start && call_line <= *end)
+                    .max_by_key(|(start, _, _, _)| *start);
+
+                if let Some((_start, _end, caller_id, _)) = scope {
+                    // For jsx_element, the opening tag is the first child (jsx_opening_element)
+                    // For jsx_self_closing_element, the name is directly accessible
+                    let tag_name = if node.kind() == "jsx_self_closing_element" {
+                        node.child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("")
+                    } else {
+                        // jsx_element has opening_element as first child
+                        node.child(0)
+                            .and_then(|open| open.child_by_field_name("name"))
+                            .and_then(|n| n.utf8_text(source).ok())
+                            .unwrap_or("")
+                    };
+
+                    // Only process PascalCase component names (user-defined components)
+                    // Lowercase tags like <div>, <span> are HTML elements
+                    if !tag_name.is_empty() 
+                        && tag_name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+                        && !is_typescript_builtin(tag_name)
+                    {
+                        resolve_typescript_call_edge(
+                            caller_id,
+                            tag_name,
+                            func_name_map,
+                            file_func_ids,
+                            file_imported_names,
+                            rel_path,
+                            package_dir,
+                            node_pkg_map,
+                            false,
+                            edges,
+                        );
+                    }
+                }
+            }
             _ => {}
         }
 
@@ -6581,5 +6728,65 @@ class Helper {
             call_edges.iter().any(|e| e.from.contains("formatUser") && e.to.contains("processData")),
             "formatUser should call processData"
         );
+    }
+
+    #[test]
+    fn test_resolve_relative_path() {
+        // Test basic relative path resolution
+        assert_eq!(resolve_relative_path("src/pages", "./Dashboard"), "src/pages/Dashboard");
+        assert_eq!(resolve_relative_path("src/pages", "../utils/helper"), "src/utils/helper");
+        assert_eq!(resolve_relative_path("src/pages/admin", "../../components/Stats"), "src/components/Stats");
+        assert_eq!(resolve_relative_path("src/pages", "../../components/Stats"), "components/Stats");
+        assert_eq!(resolve_relative_path("", "./foo"), "foo");
+        assert_eq!(resolve_relative_path("src", "../lib/util"), "lib/util");
+    }
+
+    #[test]
+    fn test_normalize_ts_module_path() {
+        // Test extension stripping and slash to dot conversion
+        assert_eq!(normalize_ts_module_path("src/components/Stats.js"), "src.components.Stats");
+        assert_eq!(normalize_ts_module_path("src/components/Stats.tsx"), "src.components.Stats");
+        assert_eq!(normalize_ts_module_path("src/components/Stats.ts"), "src.components.Stats");
+        assert_eq!(normalize_ts_module_path("src/components/Stats.jsx"), "src.components.Stats");
+        assert_eq!(normalize_ts_module_path("src/components/Stats"), "src.components.Stats");
+    }
+
+    #[test]
+    fn test_resolve_ts_import() {
+        let mut module_map = HashMap::new();
+        module_map.insert("src.components.Stats".to_string(), "file:src/components/Stats.tsx".to_string());
+        module_map.insert("src.utils.helper".to_string(), "file:src/utils/helper.ts".to_string());
+        module_map.insert("components.Stats".to_string(), "file:src/components/Stats.tsx".to_string());
+
+        // Test relative import resolution
+        let result = resolve_ts_import("src/pages/Dashboard.tsx", "../../components/Stats.js", &module_map);
+        assert_eq!(result, Some("file:src/components/Stats.tsx".to_string()), 
+            "Should resolve ../../components/Stats.js from src/pages/Dashboard.tsx");
+
+        let result = resolve_ts_import("src/pages/Dashboard.tsx", "../utils/helper", &module_map);
+        assert_eq!(result, Some("file:src/utils/helper.ts".to_string()),
+            "Should resolve ../utils/helper from src/pages/Dashboard.tsx");
+
+        // Test ./relative
+        let mut module_map2 = HashMap::new();
+        module_map2.insert("src.pages.local".to_string(), "file:src/pages/local.ts".to_string());
+        let result = resolve_ts_import("src/pages/Dashboard.tsx", "./local", &module_map2);
+        assert_eq!(result, Some("file:src/pages/local.ts".to_string()),
+            "Should resolve ./local from src/pages/Dashboard.tsx");
+
+        // Test non-relative import returns None
+        let result = resolve_ts_import("src/pages/Dashboard.tsx", "lodash", &module_map);
+        assert_eq!(result, None, "Non-relative imports should return None");
+    }
+
+    #[test]
+    fn test_resolve_ts_import_path_alias() {
+        let mut module_map = HashMap::new();
+        module_map.insert("src.components.Stats".to_string(), "file:src/components/Stats.tsx".to_string());
+
+        // Test @/ path alias
+        let result = resolve_ts_import("src/pages/Dashboard.tsx", "@/components/Stats", &module_map);
+        assert_eq!(result, Some("file:src/components/Stats.tsx".to_string()),
+            "Should resolve @/components/Stats path alias");
     }
 }
