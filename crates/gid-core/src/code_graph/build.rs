@@ -8,6 +8,66 @@ use std::path::Path;
 
 use super::types::*;
 use super::lang::{find_call_position, find_project_root};
+use crate::lsp_client::LspLocation;
+use crate::lsp_daemon;
+
+/// Unified LSP provider: either a direct LspClient or a DaemonLspClient.
+/// Both support the same operations but with different lifecycles.
+enum LspProvider {
+    Direct(crate::lsp_client::LspClient),
+    Daemon(lsp_daemon::DaemonLspClient),
+}
+
+impl LspProvider {
+    fn open_file(&mut self, rel_path: &str, content: &str, language_id: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Direct(c) => c.open_file(rel_path, content, language_id),
+            Self::Daemon(c) => c.open_file(rel_path, content),
+        }
+    }
+
+    fn get_definition(&mut self, rel_path: &str, line: u32, character: u32) -> anyhow::Result<Option<LspLocation>> {
+        match self {
+            Self::Direct(c) => c.get_definition(rel_path, line, character),
+            Self::Daemon(c) => c.get_definition(rel_path, line, character),
+        }
+    }
+
+    fn get_references(&mut self, rel_path: &str, line: u32, character: u32, include_declaration: bool) -> anyhow::Result<Vec<LspLocation>> {
+        match self {
+            Self::Direct(c) => c.get_references(rel_path, line, character, include_declaration),
+            Self::Daemon(c) => c.get_references(rel_path, line, character, include_declaration),
+        }
+    }
+
+    fn get_implementations(&mut self, rel_path: &str, line: u32, character: u32) -> anyhow::Result<Vec<LspLocation>> {
+        match self {
+            Self::Direct(c) => c.get_implementations(rel_path, line, character),
+            Self::Daemon(c) => c.get_implementations(rel_path, line, character),
+        }
+    }
+
+    fn wait_until_ready(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Direct(c) => c.wait_until_ready(std::time::Duration::from_secs(600)),
+            Self::Daemon(_) => Ok(()), // Daemon handles readiness internally
+        }
+    }
+
+    fn shutdown(self) -> anyhow::Result<()> {
+        match self {
+            Self::Direct(c) => c.shutdown(),
+            Self::Daemon(_) => Ok(()), // Don't shut down daemon - it persists
+        }
+    }
+
+    fn progress_token_summary(&self) -> String {
+        match self {
+            Self::Direct(c) => c.progress_token_summary(),
+            Self::Daemon(_) => "daemon-managed".to_string(),
+        }
+    }
+}
 
 impl CodeGraph {
     /// Build a unified graph combining code nodes with task structure.
@@ -211,13 +271,37 @@ impl CodeGraph {
                 continue;
             }
 
-            // Start LSP server
-            let mut client = match LspClient::start(config, &project_root) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!("[LSP] Failed to start {} server: {}", lang_id, e);
-                    stats.failed += lang_edge_indices.len();
-                    continue;
+            // Try to connect to a persistent LSP daemon first (instant if already running).
+            // Fall back to spawning a fresh LSP process (slow cold start for large projects).
+            let mut client: LspProvider = if lsp_daemon::is_daemon_running(&project_root) {
+                match lsp_daemon::DaemonLspClient::connect(&project_root, lang_id) {
+                    Ok(c) => {
+                        eprintln!("[LSP] Connected to daemon for {} (instant)", lang_id);
+                        LspProvider::Daemon(c)
+                    }
+                    Err(e) => {
+                        eprintln!("[LSP] Daemon connect failed ({}), falling back to direct", e);
+                        match LspClient::start(config, &project_root) {
+                            Ok(c) => LspProvider::Direct(c),
+                            Err(e2) => {
+                                tracing::warn!("[LSP] Failed to start {} server: {}", lang_id, e2);
+                                stats.failed += lang_edge_indices.len();
+                                continue;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // No daemon running — start LSP directly and also start daemon for next time
+                eprintln!("[LSP] No daemon running, starting {} directly...", lang_id);
+                let _ = lsp_daemon::ensure_daemon(&project_root);
+                match LspClient::start(config, &project_root) {
+                    Ok(c) => LspProvider::Direct(c),
+                    Err(e) => {
+                        tracing::warn!("[LSP] Failed to start {} server: {}", lang_id, e);
+                        stats.failed += lang_edge_indices.len();
+                        continue;
+                    }
                 }
             };
 
@@ -246,8 +330,39 @@ impl CodeGraph {
                 }
             }
 
-            // Give LSP a moment to index
-            std::thread::sleep(std::time::Duration::from_millis(2000));
+            // Wait for LSP to finish indexing the project.
+            // Direct clients need time; daemon clients are already ready.
+            eprintln!("[DEBUG] Calling wait_until_ready...");
+            let wait_start = std::time::Instant::now();
+            if let Err(e) = client.wait_until_ready() {
+                eprintln!("[DEBUG] wait_until_ready error: {}", e);
+            }
+            eprintln!("[DEBUG] wait_until_ready done in {:.1}s, progress_tokens: {}",
+                wait_start.elapsed().as_secs_f64(), client.progress_token_summary());
+            
+            // DEBUG: Test a known good position - the main function in agent.rs
+            // Let's try a well-known call to see if RA works at all
+            {
+                eprintln!("[DEBUG] Testing manual definition lookups...");
+                // agent.rs line 122 (0-indexed), col 35 = "new" in WasmSandbox::new(...)
+                match client.get_definition("src/agent.rs", 122, 35) {
+                    Ok(Some(loc)) => eprintln!("[DEBUG] agent.rs:122:35(new) → {}:{}", loc.file_path, loc.line),
+                    Ok(None) => eprintln!("[DEBUG] agent.rs:122:35(new) → None"),
+                    Err(e) => eprintln!("[DEBUG] agent.rs:122:35(new) → Error: {}", e),
+                }
+                // Also try WasmSandbox at col 22
+                match client.get_definition("src/agent.rs", 122, 22) {
+                    Ok(Some(loc)) => eprintln!("[DEBUG] agent.rs:122:22(WasmSandbox) → {}:{}", loc.file_path, loc.line),
+                    Ok(None) => eprintln!("[DEBUG] agent.rs:122:22(WasmSandbox) → None"),
+                    Err(e) => eprintln!("[DEBUG] agent.rs:122:22(WasmSandbox) → Error: {}", e),
+                }
+                // agent.rs line 129 col 26 = SafetyLayer::new
+                match client.get_definition("src/agent.rs", 129, 26) {
+                    Ok(Some(loc)) => eprintln!("[DEBUG] agent.rs:129:26(SafetyLayer::new) → {}:{}", loc.file_path, loc.line),
+                    Ok(None) => eprintln!("[DEBUG] agent.rs:129:26(SafetyLayer::new) → None"),
+                    Err(e) => eprintln!("[DEBUG] agent.rs:129:26(SafetyLayer::new) → Error: {}", e),
+                }
+            }
 
             // Build source content map for finding call sites
             let mut source_map: HashMap<String, String> = HashMap::new();
@@ -327,6 +442,9 @@ impl CodeGraph {
                         match found_pos {
                             Some((line, col)) => (caller.file_path.clone(), line, col),
                             None => {
+                                if stats.failed < 10 {
+                                    eprintln!("[DEBUG] CALL_SITE_NOT_FOUND: edge {} → {}, callee='{}', caller={}:{}-{}", edge.from, edge.to, callee_name, caller.file_path, caller_start, caller_end);
+                                }
                                 stats.failed += 1;
                                 continue;
                             }
@@ -338,6 +456,9 @@ impl CodeGraph {
                 match client.get_definition(&lsp_file_path, call_line, call_col) {
                     Ok(Some(location)) => {
                         let graph_file_path = from_lsp_path(&location.file_path);
+                        if stats.refined < 5 {
+                            eprintln!("[DEBUG] REFINED: {} → {} (lsp_path={}, loc={}:{})", edge.from, edge.to, lsp_file_path, location.file_path, location.line);
+                        }
                         if let Some(file_index) = def_index.get(&graph_file_path) {
                             if let Some(target_id) =
                                 find_closest_node(file_index, location.line, 5)
@@ -354,10 +475,16 @@ impl CodeGraph {
                         }
                     }
                     Ok(None) => {
+                        if stats.removed < 20 {
+                            eprintln!("[DEBUG] REMOVED(None): {} → {} at {}:{}:{}", edge.from, edge.to, lsp_file_path, call_line, call_col);
+                        }
                         edges_to_remove.push(idx);
                         stats.removed += 1;
                     }
                     Err(e) => {
+                        if stats.failed < 20 {
+                            eprintln!("[DEBUG] FAILED: {} → {} at {}:{}:{}: {}", edge.from, edge.to, lsp_file_path, call_line, call_col, e);
+                        }
                         tracing::debug!("[LSP] definition failed for {}:{},{}: {}", file_path, call_line, call_col, e);
                         stats.failed += 1;
                     }
@@ -550,7 +677,7 @@ impl CodeGraph {
                 self.edges.extend(new_impl_edges);
             }
 
-            // Shutdown LSP
+            // Shutdown: direct clients are killed, daemon clients persist for reuse
             if let Err(e) = client.shutdown() {
                 tracing::debug!("LSP shutdown error: {}", e);
             }

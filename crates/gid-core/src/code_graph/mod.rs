@@ -17,3 +17,4 @@ mod build;
 mod tests;
 
 pub use types::*;
+pub use types::{ExtractMetadata, FileState, FileDelta, ExtractReport};

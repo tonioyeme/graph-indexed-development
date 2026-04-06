@@ -1,0 +1,1 @@
+verify_command: "cargo check --features full -p gid-core 2>&1 && cargo test --features full -p gid-core 2>&1"

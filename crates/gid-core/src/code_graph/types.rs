@@ -4,6 +4,120 @@ use std::collections::HashMap;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 
+// ═══ Incremental Extract Types ═══
+
+/// Metadata stored alongside the code graph for change detection.
+/// Persisted as `.gid/extract-meta.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractMetadata {
+    /// Schema version — bump on struct changes. Mismatch → full rebuild.
+    pub version: u32,
+    /// When this metadata was last updated (ISO 8601).
+    pub updated_at: String,
+    /// Per-file tracking: relative path → FileState
+    pub files: HashMap<String, FileState>,
+}
+
+impl Default for ExtractMetadata {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            updated_at: String::new(),
+            files: HashMap::new(),
+        }
+    }
+}
+
+/// Per-file state for change detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileState {
+    /// File modification time (Unix seconds).
+    pub mtime: u64,
+    /// xxHash64 of file content.
+    pub content_hash: u64,
+    /// Node IDs that were extracted from this file.
+    pub node_ids: Vec<String>,
+    /// Number of edges originating from this file (reporting only).
+    pub edge_count: usize,
+}
+
+/// Result of comparing current filesystem vs stored metadata.
+#[derive(Debug, Clone, Default)]
+pub struct FileDelta {
+    /// New files not in metadata.
+    pub added: Vec<String>,
+    /// Files with changed content hash.
+    pub modified: Vec<String>,
+    /// Files in metadata but not on disk.
+    pub deleted: Vec<String>,
+    /// Files with unchanged content.
+    pub unchanged: Vec<String>,
+}
+
+impl FileDelta {
+    /// Returns true if there are no changes.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
+    }
+
+    /// Total number of changed files.
+    pub fn changed_count(&self) -> usize {
+        self.added.len() + self.modified.len() + self.deleted.len()
+    }
+}
+
+/// Report of an extraction run.
+#[derive(Debug, Clone)]
+pub struct ExtractReport {
+    /// Number of newly added files.
+    pub added: usize,
+    /// Number of modified files.
+    pub modified: usize,
+    /// Number of deleted files.
+    pub deleted: usize,
+    /// Number of unchanged files.
+    pub unchanged: usize,
+    /// Whether this was a full rebuild (--force or no prior metadata).
+    pub full_rebuild: bool,
+    /// Duration of the extraction in milliseconds.
+    pub duration_ms: u64,
+}
+
+impl std::fmt::Display for ExtractReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.full_rebuild {
+            write!(
+                f,
+                "Full rebuild: {} files extracted ({}ms)",
+                self.added + self.modified + self.unchanged,
+                self.duration_ms
+            )
+        } else if self.added == 0 && self.modified == 0 && self.deleted == 0 {
+            write!(f, "Graph is up to date ({} files, {}ms)", self.unchanged, self.duration_ms)
+        } else {
+            let total_changed = self.added + self.modified + self.deleted;
+            let mut parts = Vec::new();
+            if self.modified > 0 {
+                parts.push(format!("{} modified", self.modified));
+            }
+            if self.added > 0 {
+                parts.push(format!("{} added", self.added));
+            }
+            if self.deleted > 0 {
+                parts.push(format!("{} deleted", self.deleted));
+            }
+            write!(
+                f,
+                "Updated {} files ({}), {} unchanged ({}ms)",
+                total_changed,
+                parts.join(", "),
+                self.unchanged,
+                self.duration_ms
+            )
+        }
+    }
+}
+
 // ═══ Graph Types ═══
 
 /// A code dependency graph extracted from source files.

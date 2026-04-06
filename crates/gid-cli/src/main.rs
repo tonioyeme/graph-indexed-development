@@ -170,6 +170,9 @@ enum Commands {
         /// Use LSP servers for precise call edge resolution
         #[arg(long)]
         lsp: bool,
+        /// Force full rebuild (ignore cached metadata)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Analyze a file's code dependencies
@@ -569,7 +572,7 @@ fn main() -> Result<()> {
             QueryCommands::Topo => cmd_query_topo(resolve_graph_path(cli.graph)?, cli.json),
         },
         Commands::EditGraph { operations } => cmd_edit_graph(resolve_graph_path(cli.graph)?, &operations, cli.json),
-        Commands::Extract { dir, format, output, lsp } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp),
+        Commands::Extract { dir, format, output, lsp, force } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -1185,7 +1188,7 @@ fn cmd_edit_graph(path: PathBuf, operations_json: &str, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool) -> Result<()> {
+fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool) -> Result<()> {
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -1195,11 +1198,25 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     if !dir.exists() {
         bail!("Directory not found: {}", dir.display());
     }
-    
+
+    // Determine graph and metadata paths
+    let gid_dir = dir.join(".gid");
+    let graph_path = gid_dir.join("code-graph.json");
+    let meta_path = gid_dir.join("extract-meta.json");
+
     if !json_flag {
-        eprintln!("Extracting code graph from {}...", dir.display());
+        if force {
+            eprintln!("Extracting code graph from {} (full rebuild)...", dir.display());
+        } else {
+            eprintln!("Extracting code graph from {} (incremental)...", dir.display());
+        }
     }
-    let mut code_graph = CodeGraph::extract_from_dir(&dir);
+
+    let (mut code_graph, report) = CodeGraph::extract_incremental(&dir, &graph_path, &meta_path, force)?;
+
+    if !json_flag {
+        eprintln!("{}", report);
+    }
 
     // LSP refinement pass
     if lsp {

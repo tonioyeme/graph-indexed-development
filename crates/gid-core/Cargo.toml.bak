@@ -29,7 +29,6 @@ tree-sitter-python = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-javascript = { workspace = true }
-xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # Optional dependencies for harness feature
 tokio = { version = "1", features = ["full"], optional = true }

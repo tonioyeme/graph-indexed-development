@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod task_graph_knowledge;
 pub mod complexity;
 pub mod lsp_client;
+pub mod lsp_daemon;
 pub mod harness;
 
 // Ritual module (requires "ritual" feature)
@@ -29,6 +30,7 @@ pub use code_graph::{
     CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation, Language,
     ImpactReport, CausalChain, ChainNode,
     UnifiedGraphResult, UnifiedNode, UnifiedEdge,
+    ExtractMetadata, FileState, FileDelta, ExtractReport,
 };
 pub use unified::{build_unified_graph, merge_relevant_code, link_tasks_to_code, UnifiedStats};
 pub use working_mem::{

@@ -5,19 +5,38 @@
 //! to resolve call sites, find callers, and discover trait implementations.
 //! This replaces name-matching heuristics with compiler-level precision (~99% accuracy).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
+/// Tracks the status of a progress token from the LSP server.
+#[derive(Debug, Clone)]
+struct ProgressTokenStatus {
+    ended: bool,
+    percentage: Option<u32>,
+}
+
+impl ProgressTokenStatus {
+    fn new() -> Self {
+        Self { ended: false, percentage: None }
+    }
+    
+    fn ended() -> Self {
+        Self { ended: true, percentage: Some(100) }
+    }
+}
+
 /// LSP client over stdio transport (JSON-RPC 2.0).
 pub struct LspClient {
     process: Child,
-    reader: BufReader<std::process::ChildStdout>,
+    /// Channel receiver for messages from the reader thread
+    msg_rx: mpsc::Receiver<Result<Value, String>>,
     writer: std::process::ChildStdin,
     next_id: u64,
     root_uri: String,
@@ -29,7 +48,9 @@ pub struct LspClient {
     /// Timeout per request
     timeout: Duration,
     /// Files that have been opened via didOpen
-    opened_files: std::collections::HashSet<String>,
+    opened_files: HashSet<String>,
+    /// Active work-done-progress tokens (token → true if "end" received)
+    progress_tokens: HashMap<String, ProgressTokenStatus>,
 }
 
 /// A resolved definition location from LSP.
@@ -190,15 +211,37 @@ impl LspClient {
             .with_context(|| format!("spawn LSP: {} {:?}", config.command, config.args))?;
 
         let writer = process.stdin.take().context("take stdin")?;
-        let reader = BufReader::new(process.stdout.take().context("take stdout")?);
+        let stdout = process.stdout.take().context("take stdout")?;
+        
+        // Spawn reader thread: reads LSP messages and sends them through a channel
+        let (msg_tx, msg_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                match read_lsp_message(&mut reader) {
+                    Ok(msg) => {
+                        if msg_tx.send(Ok(msg)).is_err() {
+                            break; // Receiver dropped
+                        }
+                    }
+                    Err(e) => {
+                        let _ = msg_tx.send(Err(e.to_string()));
+                        break;
+                    }
+                }
+            }
+        });
         
         // Spawn stderr reader thread to capture server errors  
         let stderr = process.stderr.take().context("take stderr")?;
         let _stderr_handle = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().flatten() {
-                // Only log actual errors, not info messages
-                if line.contains("error") || line.contains("Error") || line.contains("FATAL") {
+                if line.contains("error") || line.contains("Error") || line.contains("FATAL")
+                    || line.contains("WARN") || line.contains("panic")
+                {
+                    tracing::warn!("[LSP stderr] {}", line);
+                } else {
                     tracing::debug!("[LSP stderr] {}", line);
                 }
             }
@@ -206,7 +249,7 @@ impl LspClient {
 
         let mut client = Self {
             process,
-            reader,
+            msg_rx,
             writer,
             next_id: 1,
             root_uri: root_uri.clone(),
@@ -214,14 +257,20 @@ impl LspClient {
             _notifications: Vec::new(),
             _capabilities: Value::Null,
             timeout: Duration::from_secs(30),
-            opened_files: std::collections::HashSet::new(),
+            opened_files: HashSet::new(),
+            progress_tokens: HashMap::new(),
         };
 
-        // Initialize handshake
+        // Initialize handshake — use a longer timeout because rust-analyzer
+        // can take minutes to process `initialize` for large workspaces
+        // (e.g. 587 crates). The normal 30s request timeout is not enough.
         let init_params = json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                "window": {
+                    "workDoneProgress": true
+                },
                 "textDocument": {
                     "definition": {
                         "dynamicRegistration": false,
@@ -246,9 +295,12 @@ impl LspClient {
             }]
         });
 
+        let saved_timeout = client.timeout;
+        client.timeout = Duration::from_secs(600); // 10 min for initialize (large projects need full type analysis)
         let resp = client
             .send_request("initialize", init_params)
             .context("LSP initialize")?;
+        client.timeout = saved_timeout;
 
         if let Some(caps) = resp.get("capabilities") {
             client._capabilities = caps.clone();
@@ -304,6 +356,251 @@ impl LspClient {
         Ok(())
     }
 
+    /// Wait for the language server to finish indexing the project.
+    ///
+    /// Uses the LSP `$/progress` notification protocol:
+    /// 1. Server sends `window/workDoneProgress/create` to register a progress token
+    /// 2. Server sends `$/progress` with `kind: "begin"` when work starts
+    /// 3. Server sends `$/progress` with `kind: "report"` for updates
+    /// 4. Server sends `$/progress` with `kind: "end"` when work completes
+    ///
+    /// We wait until all active progress tokens have reached "end".
+    /// Fallback: if no progress notifications arrive within `initial_wait`, we assume
+    /// the server either doesn't support progress or finished instantly.
+    /// Get a summary of progress tokens for debugging
+    pub fn progress_token_summary(&self) -> String {
+        if self.progress_tokens.is_empty() {
+            return "no tokens".to_string();
+        }
+        let active: Vec<_> = self.progress_tokens.iter()
+            .filter(|(_, status)| !status.ended && status.percentage != Some(100))
+            .map(|(token, status)| format!("{}({}%)", token, status.percentage.unwrap_or(0)))
+            .collect();
+        let done: Vec<_> = self.progress_tokens.iter()
+            .filter(|(_, status)| status.ended || status.percentage == Some(100))
+            .map(|(token, _)| token.clone())
+            .collect();
+        format!("{} done, {} active (active: {:?})", done.len(), active.len(), active)
+    }
+
+    pub fn wait_until_ready(&mut self, max_wait: Duration) -> Result<()> {
+        let deadline = Instant::now() + max_wait;
+        // After all tokens have received END, wait this long for new tokens to appear.
+        // rust-analyzer fires multiple phases (Roots Scanned → cachePriming → flycheck)
+        // with gaps between them, so we need a generous quiescence window.
+        let quiescence_duration = Duration::from_secs(15);
+        let initial_wait = Duration::from_secs(10);
+        let initial_deadline = Instant::now() + initial_wait;
+        let mut saw_any_progress = false;
+        let mut all_ended_since: Option<Instant> = None;
+
+        eprintln!("[LSP] Waiting for server indexing (max {}s, quiescence {}s)...", 
+            max_wait.as_secs(), quiescence_duration.as_secs());
+
+        loop {
+            let now = Instant::now();
+            if now > deadline {
+                let active: Vec<_> = self.progress_tokens.iter()
+                    .filter(|(_, status)| !status.ended)
+                    .map(|(token, status)| format!("{}({}%)", token, status.percentage.unwrap_or(0)))
+                    .collect();
+                if !active.is_empty() {
+                    eprintln!(
+                        "[LSP] Indexing timeout after {}s, {} tokens still active: {:?}",
+                        max_wait.as_secs(), active.len(), active
+                    );
+                }
+                break;
+            }
+
+            // If we haven't seen any progress and past initial wait, assume ready
+            if !saw_any_progress && now > initial_deadline {
+                eprintln!("[LSP] No progress notifications received in {}s, assuming ready", initial_wait.as_secs());
+                break;
+            }
+
+            // Check if ALL tokens have received END notification.
+            // Important: percentage==100 is NOT enough — rust-analyzer may fire new
+            // phases (cachePriming, flycheck) after Roots Scanned reaches 100%.
+            // Only END notifications are authoritative.
+            if saw_any_progress && !self.progress_tokens.is_empty() {
+                let all_ended = self.progress_tokens.values().all(|status| status.ended);
+                // Debug: show blocking tokens periodically
+                if !all_ended {
+                    let elapsed = max_wait.as_secs().saturating_sub(deadline.saturating_duration_since(now).as_secs());
+                    if elapsed % 15 == 0 && elapsed > 0 {
+                        for (name, status) in &self.progress_tokens {
+                            if !status.ended {
+                                eprintln!("[LSP] Waiting for: '{}' pct={:?}", name, status.percentage);
+                            }
+                        }
+                    }
+                }
+                if all_ended {
+                    match all_ended_since {
+                        None => {
+                            all_ended_since = Some(now);
+                            eprintln!("[LSP] All {} tokens ended, waiting {}s for new phases...", 
+                                self.progress_tokens.len(), quiescence_duration.as_secs());
+                        }
+                        Some(since) if now.duration_since(since) >= quiescence_duration => {
+                            eprintln!("[LSP] Quiescence achieved ({}s silence), server is ready ({} tokens seen)", 
+                                quiescence_duration.as_secs(), self.progress_tokens.len());
+                            break;
+                        }
+                        _ => {} // Still in quiescence wait
+                    }
+                } else {
+                    all_ended_since = None;
+                }
+            }
+
+            // Try to read a message with a short timeout
+            match self.read_message_timeout(Duration::from_millis(200)) {
+                Ok(Some(msg)) => {
+                    self.handle_server_message(&msg)?;
+                    if msg.get("method").and_then(|m| m.as_str()) == Some("$/progress") {
+                        saw_any_progress = true;
+                    }
+                }
+                Ok(None) => {
+                    // Timeout, no message available — continue polling
+                }
+                Err(e) => {
+                    eprintln!("[LSP] Error reading message during wait: {}", e);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle a server-initiated message (notification or request).
+    /// Processes `window/workDoneProgress/create` requests and `$/progress` notifications.
+    fn handle_server_message(&mut self, msg: &Value) -> Result<()> {
+        let method = match msg.get("method").and_then(|m| m.as_str()) {
+            Some(m) => m,
+            None => return Ok(()), // Not a notification/request
+        };
+
+        match method {
+            // Server requests to create a progress token — we must respond
+            "window/workDoneProgress/create" => {
+                if let Some(id) = msg.get("id") {
+                    // Extract token
+                    let token = msg.get("params")
+                        .and_then(|p| p.get("token"))
+                        .and_then(|t| {
+                            if let Some(s) = t.as_str() {
+                                Some(s.to_string())
+                            } else {
+                                t.as_u64().map(|n| n.to_string())
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    if !token.is_empty() {
+                        tracing::debug!("[LSP] Progress token created: {}", token);
+                        self.progress_tokens.insert(token.clone(), ProgressTokenStatus::new());
+                    }
+
+                    // Respond with success (null result)
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": null
+                    });
+                    self.write_message(&resp)?;
+                }
+            }
+
+            // Progress notification — track begin/report/end
+            "$/progress" => {
+                if let Some(params) = msg.get("params") {
+                    let token = params.get("token")
+                        .and_then(|t| {
+                            if let Some(s) = t.as_str() {
+                                Some(s.to_string())
+                            } else {
+                                t.as_u64().map(|n| n.to_string())
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    let kind = params.get("value")
+                        .and_then(|v| v.get("kind"))
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("");
+
+                    let title = params.get("value")
+                        .and_then(|v| v.get("title"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+
+                    let message = params.get("value")
+                        .and_then(|v| v.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("");
+
+                    match kind {
+                        "begin" => {
+                            eprintln!("[DEBUG-PROGRESS] BEGIN token='{}' title='{}'", token, title);
+                            self.progress_tokens.insert(token, ProgressTokenStatus::new());
+                        }
+                        "report" => {
+                            let pct = params.get("value")
+                                .and_then(|v| v.get("percentage"))
+                                .and_then(|p| p.as_u64())
+                                .map(|p| p as u32);
+                            if let Some(pct_val) = pct {
+                                eprintln!("[DEBUG-PROGRESS] REPORT token='{}' {}% {}", token, pct_val, message);
+                            } else {
+                                eprintln!("[DEBUG-PROGRESS] REPORT token='{}' {}", token, message);
+                            }
+                            // Update percentage tracking
+                            if let Some(status) = self.progress_tokens.get_mut(&token) {
+                                if let Some(p) = pct {
+                                    status.percentage = Some(p);
+                                }
+                            } else {
+                                // Token not previously seen — create entry with percentage
+                                let mut status = ProgressTokenStatus::new();
+                                status.percentage = pct;
+                                self.progress_tokens.insert(token, status);
+                            }
+                        }
+                        "end" => {
+                            eprintln!("[DEBUG-PROGRESS] END token='{}' msg='{}'", token, message);
+                            self.progress_tokens.insert(token, ProgressTokenStatus::ended());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // Other server requests we might need to handle
+            "client/registerCapability" => {
+                // Respond with success to capability registration requests
+                if let Some(id) = msg.get("id") {
+                    let resp = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": null
+                    });
+                    self.write_message(&resp)?;
+                }
+            }
+
+            _ => {
+                // Buffer other notifications
+                self._notifications.push(msg.clone());
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get definition location for a symbol at the given position.
     /// Returns None if no definition found or definition is outside project.
     pub fn get_definition(
@@ -321,12 +618,26 @@ impl LspClient {
 
         let resp = self.send_request("textDocument/definition", params)?;
 
+        // Debug counter for tracking removal reasons
+        static DEBUG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let count = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Response can be Location | Location[] | LocationLink[] | null
         let locations = if resp.is_null() {
+            if count < 10 {
+                eprintln!("[DEBUG-DEF] NULL response for {}:{}:{}", rel_path, line, character);
+            }
             return Ok(None);
         } else if resp.is_array() {
-            resp.as_array().unwrap().clone()
+            let arr = resp.as_array().unwrap().clone();
+            if count < 10 {
+                eprintln!("[DEBUG-DEF] Array response (len={}) for {}:{}:{}", arr.len(), rel_path, line, character);
+            }
+            arr
         } else {
+            if count < 10 {
+                eprintln!("[DEBUG-DEF] Single response for {}:{}:{}", rel_path, line, character);
+            }
             vec![resp]
         };
 
@@ -378,6 +689,11 @@ impl LspClient {
         let root_prefix = format!("{}/", self.root_uri);
         if !target_uri.starts_with(&root_prefix) {
             // Definition is outside project (stdlib, node_modules, etc.)
+            static OUTSIDE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let oc = OUTSIDE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if oc < 10 {
+                eprintln!("[DEBUG-DEF] OUTSIDE project: target_uri={}, root_prefix={}", target_uri, root_prefix);
+            }
             return Ok(None);
         }
 
@@ -557,14 +873,31 @@ impl LspClient {
         let deadline = Instant::now() + self.timeout;
 
         loop {
-            if Instant::now() > deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 bail!("LSP response timeout for request id={}", expected_id);
             }
 
-            let msg = self.read_message()?;
+            let msg = match self.msg_rx.recv_timeout(remaining) {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => bail!("LSP reader error: {}", e),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bail!("LSP response timeout for request id={}", expected_id);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("LSP server closed connection");
+                }
+            };
 
             // Check if this is our response
             if let Some(id) = msg.get("id") {
+                // It has an id — could be our response or a server request
+                if msg.get("method").is_some() {
+                    // Server request (has both id and method) — handle it
+                    self.handle_server_message(&msg)?;
+                    continue;
+                }
+
                 let msg_id = id.as_u64().unwrap_or(0);
                 if msg_id == expected_id {
                     // Check for error
@@ -581,49 +914,63 @@ impl LspClient {
                 }
             }
 
-            // It's a notification or server request — buffer and continue
+            // It's a notification — handle progress, buffer others
             if msg.get("method").is_some() {
-                self._notifications.push(msg);
+                self.handle_server_message(&msg)?;
             }
         }
     }
 
-    fn read_message(&mut self) -> Result<Value> {
-        // Read headers until empty line
-        let mut content_length: usize = 0;
-        let mut header_line = String::new();
-
-        loop {
-            header_line.clear();
-            let bytes_read = self.reader.read_line(&mut header_line)?;
-            if bytes_read == 0 {
+    /// Try to read a message with a timeout. Returns None if timeout expires.
+    fn read_message_timeout(&mut self, timeout: Duration) -> Result<Option<Value>> {
+        match self.msg_rx.recv_timeout(timeout) {
+            Ok(Ok(msg)) => Ok(Some(msg)),
+            Ok(Err(e)) => bail!("LSP reader error: {}", e),
+            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 bail!("LSP server closed connection");
             }
-
-            let trimmed = header_line.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-
-            if let Some(len_str) = trimmed.strip_prefix("Content-Length: ") {
-                content_length = len_str
-                    .parse()
-                    .context("parse Content-Length")?;
-            }
-            // Ignore other headers (Content-Type, etc.)
         }
-
-        if content_length == 0 {
-            bail!("Missing Content-Length header");
-        }
-
-        // Read exactly content_length bytes
-        let mut body = vec![0u8; content_length];
-        self.reader.read_exact(&mut body)?;
-
-        let msg: Value = serde_json::from_slice(&body).context("parse LSP JSON body")?;
-        Ok(msg)
     }
+}
+
+/// Read one LSP JSON-RPC message from a buffered reader.
+/// This is a standalone function used by the reader thread.
+fn read_lsp_message(reader: &mut BufReader<std::process::ChildStdout>) -> Result<Value> {
+    // Read headers until empty line
+    let mut content_length: usize = 0;
+    let mut header_line = String::new();
+
+    loop {
+        header_line.clear();
+        let bytes_read = reader.read_line(&mut header_line)?;
+        if bytes_read == 0 {
+            bail!("LSP server closed connection");
+        }
+
+        let trimmed = header_line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+
+        if let Some(len_str) = trimmed.strip_prefix("Content-Length: ") {
+            content_length = len_str
+                .parse()
+                .context("parse Content-Length")?;
+        }
+        // Ignore other headers (Content-Type, etc.)
+    }
+
+    if content_length == 0 {
+        bail!("Missing Content-Length header");
+    }
+
+    // Read exactly content_length bytes
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
+
+    let msg: Value = serde_json::from_slice(&body).context("parse LSP JSON body")?;
+    Ok(msg)
 }
 
 impl Drop for LspClient {
