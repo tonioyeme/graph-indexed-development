@@ -70,7 +70,7 @@ Call edge 解析是纯 name-only matching，没有 receiver type 信息，导致
 
 ---
 
-## ISS-004 [improvement] [P1] [open]
+## ISS-004 [improvement] [P1] [closed] ✅
 **发现日期**: 2026-04-05
 **发现者**: RustClaw
 **组件**: gid-core, lsp_client.rs
