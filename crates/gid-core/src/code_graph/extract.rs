@@ -778,6 +778,32 @@ fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> V
     edges
 }
 
+// ═══ Public test accessors for ISS-009 helpers ═══
+
+/// Public wrapper for testing module node generation.
+#[cfg(test)]
+pub fn generate_module_nodes_pub(file_entries: &[(String, String, Language)]) -> (Vec<CodeNode>, Vec<CodeEdge>) {
+    generate_module_nodes(file_entries)
+}
+
+/// Public wrapper for testing file→module edge generation.
+#[cfg(test)]
+pub fn generate_file_to_module_edges_pub(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    generate_file_to_module_edges(file_entries)
+}
+
+/// Public wrapper for testing Rust TestsFor edge generation.
+#[cfg(test)]
+pub fn generate_rust_tests_for_edges_pub(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    generate_rust_tests_for_edges(file_entries)
+}
+
+/// Public wrapper for testing TypeScript TestsFor edge generation.
+#[cfg(test)]
+pub fn generate_ts_tests_for_edges_pub(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    generate_ts_tests_for_edges(file_entries)
+}
+
 impl CodeGraph {
     /// Extract with per-repo cache. Cache key = repo_name + base_commit.
     /// If a cached graph exists on disk, returns it instantly.

@@ -7,12 +7,22 @@ use super::types::*;
 
 impl CodeGraph {
     pub fn impact_analysis(&self, changed_node_ids: &[&str]) -> ImpactReport<'_> {
+        self.impact_analysis_filtered(changed_node_ids, None)
+    }
+
+    /// Impact analysis with optional edge relation filter.
+    /// If `relations` is None, traverses all edge types.
+    pub fn impact_analysis_filtered(
+        &self,
+        changed_node_ids: &[&str],
+        relations: Option<&[EdgeRelation]>,
+    ) -> ImpactReport<'_> {
         let mut affected_nodes = Vec::new();
         let mut affected_tests = Vec::new();
         let mut seen = HashSet::new();
 
         for node_id in changed_node_ids {
-            let impacted = self.get_impact(node_id);
+            let impacted = self.get_impact_filtered(node_id, relations);
             for node in impacted {
                 if seen.insert(node.id.clone()) {
                     if node.file_path.contains("/tests/") || node.file_path.contains("/test_") {

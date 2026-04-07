@@ -13,19 +13,33 @@ impl<'a> QueryEngine<'a> {
 
     /// Impact analysis: what nodes are affected if `node_id` changes?
     /// Follows reverse dependency edges (who depends on this node?).
+    /// Traverses all edge relations by default.
     pub fn impact(&self, node_id: &str) -> Vec<&'a Node> {
+        self.impact_filtered(node_id, None)
+    }
+
+    /// Impact analysis with optional relation filter.
+    /// If `relations` is None, traverses all edge types.
+    pub fn impact_filtered(&self, node_id: &str, relations: Option<&[&str]>) -> Vec<&'a Node> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         queue.push_back(node_id.to_string());
         visited.insert(node_id.to_string());
 
         while let Some(current) = queue.pop_front() {
-            // Find nodes that depend_on current (edges where to == current)
+            // Find nodes that point to current (edges where to == current)
             for edge in &self.graph.edges {
-                if edge.to == current && edge.relation == "depends_on" {
-                    if visited.insert(edge.from.clone()) {
-                        queue.push_back(edge.from.clone());
+                if edge.to != current {
+                    continue;
+                }
+                // Apply relation filter if set
+                if let Some(rels) = relations {
+                    if !rels.contains(&edge.relation.as_str()) {
+                        continue;
                     }
+                }
+                if visited.insert(edge.from.clone()) {
+                    queue.push_back(edge.from.clone());
                 }
             }
         }
@@ -37,11 +51,27 @@ impl<'a> QueryEngine<'a> {
     }
 
     /// Dependencies: what does `node_id` depend on? (transitive)
+    /// Traverses all edge relations by default.
     pub fn deps(&self, node_id: &str, transitive: bool) -> Vec<&'a Node> {
+        self.deps_filtered(node_id, transitive, None)
+    }
+
+    /// Dependencies with optional relation filter.
+    /// If `relations` is None, traverses all edge types.
+    pub fn deps_filtered(&self, node_id: &str, transitive: bool, relations: Option<&[&str]>) -> Vec<&'a Node> {
         if !transitive {
             // Direct deps only
             let dep_ids: HashSet<&str> = self.graph.edges.iter()
-                .filter(|e| e.from == node_id && e.relation == "depends_on")
+                .filter(|e| {
+                    if e.from != node_id {
+                        return false;
+                    }
+                    if let Some(rels) = relations {
+                        rels.contains(&e.relation.as_str())
+                    } else {
+                        true
+                    }
+                })
                 .map(|e| e.to.as_str())
                 .collect();
             return self.graph.nodes.iter()
@@ -56,10 +86,16 @@ impl<'a> QueryEngine<'a> {
 
         while let Some(current) = queue.pop_front() {
             for edge in &self.graph.edges {
-                if edge.from == current && edge.relation == "depends_on" {
-                    if visited.insert(edge.to.clone()) {
-                        queue.push_back(edge.to.clone());
+                if edge.from != current {
+                    continue;
+                }
+                if let Some(rels) = relations {
+                    if !rels.contains(&edge.relation.as_str()) {
+                        continue;
                     }
+                }
+                if visited.insert(edge.to.clone()) {
+                    queue.push_back(edge.to.clone());
                 }
             }
         }
@@ -161,5 +197,131 @@ impl<'a> QueryEngine<'a> {
         }
 
         Ok(sorted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{Graph, Node, Edge};
+
+    fn make_edge(from: &str, to: &str, relation: &str) -> Edge {
+        Edge {
+            from: from.into(),
+            to: to.into(),
+            relation: relation.into(),
+            weight: None,
+            confidence: None,
+            metadata: None,
+        }
+    }
+
+    fn make_test_graph() -> Graph {
+        // A → depends_on → B → depends_on → C
+        // A → implements → D
+        // E → belongs_to → D
+        let nodes = vec![
+            Node::new("A", "A"),
+            Node::new("B", "B"),
+            Node::new("C", "C"),
+            Node::new("D", "D"),
+            Node::new("E", "E"),
+        ];
+        let edges = vec![
+            make_edge("A", "B", "depends_on"),
+            make_edge("B", "C", "depends_on"),
+            make_edge("A", "D", "implements"),
+            make_edge("E", "D", "belongs_to"),
+        ];
+        Graph { nodes, edges, ..Default::default() }
+    }
+
+    #[test]
+    fn test_impact_multi_relation() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // Default impact traverses all relations
+        // Changing C: B depends_on C → A depends_on B → impacted: A, B
+        let impacted = qe.impact("C");
+        let ids: Vec<&str> = impacted.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"B"));
+        assert!(ids.contains(&"A"));
+    }
+
+    #[test]
+    fn test_impact_filtered_depends_on_only() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // Filter to depends_on: changing D, A implements D but with depends_on filter, not traversed
+        let impacted = qe.impact_filtered("D", Some(&["depends_on"]));
+        let ids: Vec<&str> = impacted.iter().map(|n| n.id.as_str()).collect();
+        // No node has depends_on edge to D
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn test_impact_filtered_all_relations() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // Changing D: A implements D, E belongs_to D → both impacted
+        let impacted = qe.impact_filtered("D", None);
+        let ids: Vec<&str> = impacted.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"A"), "A implements D");
+        assert!(ids.contains(&"E"), "E belongs_to D");
+    }
+
+    #[test]
+    fn test_deps_multi_relation() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // A's deps (all relations): B (depends_on), D (implements), and transitively C (via B)
+        let deps = qe.deps("A", true);
+        let ids: Vec<&str> = deps.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"B"));
+        assert!(ids.contains(&"C"));
+        assert!(ids.contains(&"D"));
+    }
+
+    #[test]
+    fn test_deps_filtered_depends_on_only() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // A's deps with depends_on filter: B, C — but NOT D (implements edge)
+        let deps = qe.deps_filtered("A", true, Some(&["depends_on"]));
+        let ids: Vec<&str> = deps.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"B"));
+        assert!(ids.contains(&"C"));
+        assert!(!ids.contains(&"D"), "D should be excluded — implements, not depends_on");
+    }
+
+    #[test]
+    fn test_deps_non_transitive_filtered() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // A direct deps only, all relations: B (depends_on) and D (implements)
+        let deps = qe.deps_filtered("A", false, None);
+        let ids: Vec<&str> = deps.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"B"));
+        assert!(ids.contains(&"D"));
+        assert!(!ids.contains(&"C"), "C is transitive, should be excluded");
+    }
+
+    #[test]
+    fn test_backward_compat_impact_uses_all_relations() {
+        let graph = make_test_graph();
+        let qe = QueryEngine::new(&graph);
+
+        // impact() without filter should traverse all relations (backward compat)
+        let impacted = qe.impact("D");
+        let ids: Vec<&str> = impacted.iter().map(|n| n.id.as_str()).collect();
+        // A implements D, E belongs_to D
+        assert!(ids.contains(&"A"));
+        assert!(ids.contains(&"E"));
     }
 }

@@ -562,4 +562,208 @@ class Helper {
             );
         }
     }
+
+    // ═══ ISS-009 Cross-Layer Tests ═══
+
+    #[test]
+    fn test_module_generation_flat() {
+        // Flat directory → one module node per dir
+        let files = vec![
+            ("src/main.rs".to_string(), "fn main() {}".to_string(), Language::Rust),
+            ("src/lib.rs".to_string(), "pub mod auth;".to_string(), Language::Rust),
+        ];
+        let (nodes, edges) = super::super::extract::generate_module_nodes_pub(&files);
+
+        assert_eq!(nodes.len(), 1, "Should have one module: src");
+        assert_eq!(nodes[0].id, "module:src");
+        assert_eq!(nodes[0].kind, NodeKind::Module);
+        assert_eq!(nodes[0].name, "src");
+        assert!(edges.is_empty(), "No parent module → no belongs_to edge");
+    }
+
+    #[test]
+    fn test_module_generation_nested() {
+        // Nested dirs → hierarchical belongs_to edges
+        let files = vec![
+            ("src/auth/mod.rs".to_string(), "".to_string(), Language::Rust),
+            ("src/auth/middleware.rs".to_string(), "".to_string(), Language::Rust),
+            ("src/main.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let (nodes, edges) = super::super::extract::generate_module_nodes_pub(&files);
+
+        assert!(nodes.len() >= 2, "Should have module:src and module:src/auth");
+        assert!(nodes.iter().any(|n| n.id == "module:src"));
+        assert!(nodes.iter().any(|n| n.id == "module:src/auth"));
+
+        // src/auth → belongs_to → src
+        assert!(edges.iter().any(|e|
+            e.from == "module:src/auth" && e.to == "module:src" && e.relation == EdgeRelation::BelongsTo
+        ), "src/auth should belong_to src");
+    }
+
+    #[test]
+    fn test_module_generation_empty_dir() {
+        // No source files → no module nodes
+        let files: Vec<(String, String, Language)> = vec![];
+        let (nodes, edges) = super::super::extract::generate_module_nodes_pub(&files);
+        assert!(nodes.is_empty());
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn test_file_belongs_to_module() {
+        // Each non-root file has belongs_to edge to its directory's module
+        let files = vec![
+            ("src/auth/middleware.rs".to_string(), "".to_string(), Language::Rust),
+            ("src/main.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let edges = super::super::extract::generate_file_to_module_edges_pub(&files);
+
+        assert!(edges.iter().any(|e|
+            e.from == "file:src/auth/middleware.rs"
+            && e.to == "module:src/auth"
+            && e.relation == EdgeRelation::BelongsTo
+        ));
+        assert!(edges.iter().any(|e|
+            e.from == "file:src/main.rs"
+            && e.to == "module:src"
+            && e.relation == EdgeRelation::BelongsTo
+        ));
+    }
+
+    #[test]
+    fn test_root_file_no_belongs_to() {
+        // File at project root → no belongs_to edge
+        let files = vec![
+            ("main.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let edges = super::super::extract::generate_file_to_module_edges_pub(&files);
+        assert!(edges.is_empty(), "Root file should not have belongs_to edge");
+    }
+
+    #[test]
+    fn test_nodekind_module_serde_roundtrip() {
+        let node = CodeNode::new_module("src/auth");
+        let yaml = serde_yaml::to_string(&node).unwrap();
+        let deserialized: CodeNode = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.kind, NodeKind::Module);
+        assert_eq!(deserialized.id, "module:src/auth");
+        assert_eq!(deserialized.name, "auth");
+    }
+
+    #[test]
+    fn test_edge_relation_belongs_to_roundtrip() {
+        let edge = CodeEdge::new("file:src/main.rs", "module:src", EdgeRelation::BelongsTo);
+        let yaml = serde_yaml::to_string(&edge).unwrap();
+        let deserialized: CodeEdge = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(deserialized.relation, EdgeRelation::BelongsTo);
+        assert_eq!(deserialized.from, "file:src/main.rs");
+        assert_eq!(deserialized.to, "module:src");
+    }
+
+    #[test]
+    fn test_rust_tests_for_matching() {
+        // tests/auth.rs → file:src/auth.rs
+        let files = vec![
+            ("src/auth.rs".to_string(), "".to_string(), Language::Rust),
+            ("tests/auth.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let edges = super::super::extract::generate_rust_tests_for_edges_pub(&files);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "file:tests/auth.rs");
+        assert_eq!(edges[0].to, "file:src/auth.rs");
+        assert_eq!(edges[0].relation, EdgeRelation::TestsFor);
+        assert!((edges[0].confidence - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_rust_tests_for_test_prefix() {
+        // tests/test_auth.rs → file:src/auth.rs
+        let files = vec![
+            ("src/auth.rs".to_string(), "".to_string(), Language::Rust),
+            ("tests/test_auth.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let edges = super::super::extract::generate_rust_tests_for_edges_pub(&files);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, "file:src/auth.rs");
+    }
+
+    #[test]
+    fn test_rust_tests_for_mod() {
+        // tests/auth.rs → file:src/auth/mod.rs
+        let files = vec![
+            ("src/auth/mod.rs".to_string(), "".to_string(), Language::Rust),
+            ("tests/auth.rs".to_string(), "".to_string(), Language::Rust),
+        ];
+        let edges = super::super::extract::generate_rust_tests_for_edges_pub(&files);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, "file:src/auth/mod.rs");
+    }
+
+    #[test]
+    fn test_ts_test_file_matching() {
+        // auth.test.ts → file:auth.ts
+        let files = vec![
+            ("auth.ts".to_string(), "".to_string(), Language::TypeScript),
+            ("auth.test.ts".to_string(), "".to_string(), Language::TypeScript),
+        ];
+        let edges = super::super::extract::generate_ts_tests_for_edges_pub(&files);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "file:auth.test.ts");
+        assert_eq!(edges[0].to, "file:auth.ts");
+        assert_eq!(edges[0].relation, EdgeRelation::TestsFor);
+    }
+
+    #[test]
+    fn test_ts_spec_file_matching() {
+        // auth.spec.ts → file:auth.ts
+        let files = vec![
+            ("auth.ts".to_string(), "".to_string(), Language::TypeScript),
+            ("auth.spec.ts".to_string(), "".to_string(), Language::TypeScript),
+        ];
+        let edges = super::super::extract::generate_ts_tests_for_edges_pub(&files);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, "file:auth.ts");
+    }
+
+    #[test]
+    fn test_code_graph_impact_relation_filter() {
+        // Build a small graph with multiple relation types
+        let mut graph = CodeGraph::default();
+        graph.nodes.push(CodeNode::new_file("src/a.rs"));
+        graph.nodes.push(CodeNode::new_file("src/b.rs"));
+        graph.nodes.push(CodeNode::new_file("tests/a.rs"));
+        graph.edges.push(CodeEdge::new("file:src/b.rs", "file:src/a.rs", EdgeRelation::Imports));
+        graph.edges.push(CodeEdge::new_heuristic("file:tests/a.rs", "file:src/a.rs", EdgeRelation::TestsFor, 0.8));
+        graph.build_indexes();
+
+        // Unfiltered: both b.rs and tests/a.rs are impacted
+        let all = graph.get_impact("file:src/a.rs");
+        assert_eq!(all.len(), 2);
+
+        // Filter to Imports only: only b.rs
+        let imports_only = graph.get_impact_filtered(
+            "file:src/a.rs",
+            Some(&[EdgeRelation::Imports]),
+        );
+        assert_eq!(imports_only.len(), 1);
+        assert_eq!(imports_only[0].id, "file:src/b.rs");
+
+        // Filter to TestsFor only: only tests/a.rs
+        let tests_only = graph.get_impact_filtered(
+            "file:src/a.rs",
+            Some(&[EdgeRelation::TestsFor]),
+        );
+        assert_eq!(tests_only.len(), 1);
+        assert_eq!(tests_only[0].id, "file:tests/a.rs");
+    }
+
+    #[test]
+    fn test_new_heuristic_constructor() {
+        let edge = CodeEdge::new_heuristic("a", "b", EdgeRelation::TestsFor, 0.8);
+        assert_eq!(edge.confidence, 0.8);
+        assert_eq!(edge.relation, EdgeRelation::TestsFor);
+        assert!(edge.call_site_line.is_none());
+        assert!(edge.call_site_column.is_none());
+    }
 }

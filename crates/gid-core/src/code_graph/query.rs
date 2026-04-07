@@ -83,20 +83,11 @@ impl CodeGraph {
     pub fn get_impact_filtered(&self, node_id: &str, relations: Option<&[EdgeRelation]>) -> Vec<&CodeNode> {
         let mut impacted = Vec::new();
         let mut visited = HashSet::new();
-        self.collect_dependents_filtered(node_id, relations, &mut impacted, &mut visited);
+        self.collect_dependents(node_id, relations, &mut impacted, &mut visited);
         impacted
     }
 
     fn collect_dependents<'a>(
-        &'a self,
-        node_id: &str,
-        result: &mut Vec<&'a CodeNode>,
-        visited: &mut HashSet<String>,
-    ) {
-        self.collect_dependents_filtered(node_id, None, result, visited);
-    }
-
-    fn collect_dependents_filtered<'a>(
         &'a self,
         node_id: &str,
         relations: Option<&[EdgeRelation]>,
@@ -116,7 +107,7 @@ impl CodeGraph {
             }
             if let Some(node) = self.node_by_id(&edge.from) {
                 result.push(node);
-                self.collect_dependents_filtered(&edge.from, relations, result, visited);
+                self.collect_dependents(&edge.from, relations, result, visited);
             }
         }
     }
