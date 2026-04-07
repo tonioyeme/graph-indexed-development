@@ -766,4 +766,52 @@ class Helper {
         assert!(edge.call_site_line.is_none());
         assert!(edge.call_site_column.is_none());
     }
+
+    #[test]
+    fn test_ts_nested_tests_dir() {
+        // FINDING-6: __tests__/Button.test.tsx → src/components/Button.tsx
+        let entries = vec![
+            ("src/components/Button.tsx".to_string(), "export {}".to_string(), Language::TypeScript),
+            ("src/components/__tests__/Button.test.tsx".to_string(), "test('btn', () => {})".to_string(), Language::TypeScript),
+        ];
+        let edges = super::super::extract::generate_ts_tests_for_edges_pub(&entries);
+        assert_eq!(edges.len(), 1, "Should match nested __tests__ to source: {:?}", edges);
+        assert_eq!(edges[0].from, "file:src/components/__tests__/Button.test.tsx");
+        assert_eq!(edges[0].to, "file:src/components/Button.tsx");
+        assert_eq!(edges[0].relation, EdgeRelation::TestsFor);
+        assert_eq!(edges[0].confidence, 0.8);
+    }
+
+    #[test]
+    fn test_python_tests_for_naming() {
+        let entries = vec![
+            ("auth.py".to_string(), "class Auth: pass".to_string(), Language::Python),
+            ("tests/test_auth.py".to_string(), "def test_auth(): pass".to_string(), Language::Python),
+        ];
+        let edges = super::super::extract::generate_python_tests_for_edges_pub(&entries);
+        assert_eq!(edges.len(), 1, "Should match test_auth.py → auth.py: {:?}", edges);
+        assert_eq!(edges[0].from, "file:tests/test_auth.py");
+        assert_eq!(edges[0].to, "file:auth.py");
+        assert_eq!(edges[0].relation, EdgeRelation::TestsFor);
+    }
+
+    #[test]
+    fn test_python_tests_for_no_self_match() {
+        // Test files should not match themselves
+        let entries = vec![
+            ("test_auth.py".to_string(), "def test_auth(): pass".to_string(), Language::Python),
+        ];
+        let edges = super::super::extract::generate_python_tests_for_edges_pub(&entries);
+        assert_eq!(edges.len(), 0, "Should not self-match test file");
+    }
+
+    #[test]
+    fn test_edge_relation_from_str() {
+        use std::str::FromStr;
+        assert_eq!(EdgeRelation::from_str("imports").unwrap(), EdgeRelation::Imports);
+        assert_eq!(EdgeRelation::from_str("belongs_to").unwrap(), EdgeRelation::BelongsTo);
+        assert_eq!(EdgeRelation::from_str("tests_for").unwrap(), EdgeRelation::TestsFor);
+        assert_eq!(EdgeRelation::from_str("CALLS").unwrap(), EdgeRelation::Calls);
+        assert!(EdgeRelation::from_str("nonexistent").is_err());
+    }
 }

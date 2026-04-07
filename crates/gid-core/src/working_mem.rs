@@ -3,7 +3,7 @@
 //! Provides GID-based context about edited files and their impact.
 //! Used by agents to understand the blast radius of their changes.
 
-use crate::code_graph::{CodeGraph, CodeNode, NodeKind};
+use crate::code_graph::{CodeGraph, CodeNode, EdgeRelation, NodeKind};
 use std::collections::HashSet;
 
 // ═══ Data Structures ═══
@@ -323,6 +323,64 @@ pub fn analyze_impact(files_changed: &[String], graph: &CodeGraph) -> ImpactAnal
         gid_ctx.total_blast_radius,
     );
     
+    ImpactAnalysis {
+        affected_source,
+        affected_tests,
+        risk_level,
+        summary,
+    }
+}
+
+/// Analyze impact of changing files, with optional edge relation filter.
+pub fn analyze_impact_filtered(
+    files_changed: &[String],
+    graph: &CodeGraph,
+    relations: Option<&[EdgeRelation]>,
+) -> ImpactAnalysis {
+    let gid_ctx = query_gid_context(files_changed, graph);
+
+    let mut affected_source = Vec::new();
+    let mut affected_tests = Vec::new();
+    let mut seen = HashSet::new();
+
+    let changed_node_ids: Vec<String> = graph.nodes.iter()
+        .filter(|n| files_changed.contains(&n.file_path))
+        .map(|n| n.id.clone())
+        .collect();
+
+    for node_id in &changed_node_ids {
+        for impacted in graph.get_impact_filtered(node_id, relations) {
+            if seen.insert(impacted.id.clone()) {
+                let callers = graph.get_callers(&impacted.id).len();
+                let callees = graph.get_callees(&impacted.id).len();
+                let info = NodeInfo::from_code_node(impacted, callers, callees);
+
+                if impacted.is_test {
+                    affected_tests.push(info);
+                } else {
+                    affected_source.push(info);
+                }
+            }
+        }
+    }
+
+    let risk_level = match gid_ctx.max_callers {
+        0..=5 => RiskLevel::Low,
+        6..=20 => RiskLevel::Medium,
+        21..=50 => RiskLevel::High,
+        _ => RiskLevel::Critical,
+    };
+
+    let summary = format!(
+        "Changing {} file(s) affects {} source nodes and {} test nodes. Risk: {} (max {} callers, blast radius {}).",
+        files_changed.len(),
+        affected_source.len(),
+        affected_tests.len(),
+        risk_level,
+        gid_ctx.max_callers,
+        gid_ctx.total_blast_radius,
+    );
+
     ImpactAnalysis {
         affected_source,
         affected_tests,

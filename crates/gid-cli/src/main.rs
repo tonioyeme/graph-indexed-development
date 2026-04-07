@@ -16,7 +16,7 @@ use gid_core::{
     query::QueryEngine,
     validator::Validator,
     CodeGraph, CodeNode, NodeKind,
-    analyze_impact, format_impact_for_llm,
+    analyze_impact, analyze_impact_filtered, format_impact_for_llm,
     assess_complexity_from_graph, assess_risk_level,
     build_unified_graph,
     // New modules
@@ -261,6 +261,9 @@ enum Commands {
         /// Directory to extract from
         #[arg(short, long, default_value = ".")]
         dir: PathBuf,
+        /// Filter by edge relation(s), comma-separated (e.g., calls,imports,tests_for)
+        #[arg(long)]
+        relation: Option<String>,
     },
 
     /// Extract code snippets for relevant nodes
@@ -390,6 +393,9 @@ enum QueryCommands {
     Impact {
         /// Node ID to analyze
         node: String,
+        /// Filter by edge relation(s), comma-separated (e.g., depends_on,implements)
+        #[arg(short, long)]
+        relation: Option<String>,
     },
 
     /// Show dependencies of a node
@@ -399,6 +405,9 @@ enum QueryCommands {
         /// Include transitive dependencies
         #[arg(short, long)]
         transitive: bool,
+        /// Filter by edge relation(s), comma-separated (e.g., depends_on,implements)
+        #[arg(long)]
+        relation: Option<String>,
     },
 
     /// Find path between two nodes
@@ -563,9 +572,9 @@ fn main() -> Result<()> {
             cmd_remove_edge(resolve_graph_path(cli.graph)?, &from, &to, relation.as_deref(), cli.json)
         }
         Commands::Query(qc) => match qc {
-            QueryCommands::Impact { node } => cmd_query_impact(resolve_graph_path(cli.graph)?, &node, cli.json),
-            QueryCommands::Deps { node, transitive } => {
-                cmd_query_deps(resolve_graph_path(cli.graph)?, &node, transitive, cli.json)
+            QueryCommands::Impact { node, relation } => cmd_query_impact(resolve_graph_path(cli.graph)?, &node, relation.as_deref(), cli.json),
+            QueryCommands::Deps { node, transitive, relation } => {
+                cmd_query_deps(resolve_graph_path(cli.graph)?, &node, transitive, relation.as_deref(), cli.json)
             }
             QueryCommands::Path { from, to } => cmd_query_path(resolve_graph_path(cli.graph)?, &from, &to, cli.json),
             QueryCommands::CommonCause { a, b } => cmd_query_common(resolve_graph_path(cli.graph)?, &a, &b, cli.json),
@@ -579,7 +588,7 @@ fn main() -> Result<()> {
         Commands::CodeSymptoms { problem, tests, dir } => cmd_code_symptoms(&dir, &problem, &tests, cli.json),
         Commands::CodeTrace { symptoms, depth, max_chains, dir } => cmd_code_trace(&dir, &symptoms, depth, max_chains, cli.json),
         Commands::CodeComplexity { nodes, dir } => cmd_code_complexity(&dir, &nodes, cli.json),
-        Commands::CodeImpact { files, dir } => cmd_code_impact(&dir, &files, cli.json),
+        Commands::CodeImpact { files, dir, relation } => cmd_code_impact(&dir, &files, relation.as_deref(), cli.json),
         Commands::CodeSnippets { keywords, max_lines, dir } => cmd_code_snippets(&dir, &keywords, max_lines, cli.json),
         Commands::Schema { dir } => cmd_schema(&dir, cli.json),
         Commands::FileSummary { file, dir } => cmd_file_summary(&dir, &file, cli.json),
@@ -964,7 +973,7 @@ fn cmd_remove_edge(path: PathBuf, from: &str, to: &str, relation: Option<&str>, 
     Ok(())
 }
 
-fn cmd_query_impact(path: PathBuf, node: &str, json: bool) -> Result<()> {
+fn cmd_query_impact(path: PathBuf, node: &str, relation: Option<&str>, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
 
     if graph.get_node(node).is_none() {
@@ -972,16 +981,21 @@ fn cmd_query_impact(path: PathBuf, node: &str, json: bool) -> Result<()> {
     }
 
     let engine = QueryEngine::new(&graph);
-    let impacted = engine.impact(node);
+    let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+    let impacted = match &rels {
+        Some(r) => engine.impact_filtered(node, Some(r)),
+        None => engine.impact(node),
+    };
 
     if json {
         let nodes: Vec<_> = impacted.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title})).collect();
-        println!("{}", serde_json::json!({"node": node, "impacted": nodes}));
+        println!("{}", serde_json::json!({"node": node, "relation_filter": relation, "impacted": nodes}));
     } else {
         if impacted.is_empty() {
             println!("No nodes would be affected by changes to '{}'", node);
         } else {
-            println!("Changes to '{}' would affect {} node(s):", node, impacted.len());
+            let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
+            println!("Changes to '{}' would affect {} node(s){}:", node, impacted.len(), filter_note);
             for n in impacted {
                 println!("  {} — {}", n.id, n.title);
             }
@@ -990,7 +1004,7 @@ fn cmd_query_impact(path: PathBuf, node: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, json: bool) -> Result<()> {
+fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<&str>, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
 
     if graph.get_node(node).is_none() {
@@ -998,19 +1012,24 @@ fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, json: bool) -> Re
     }
 
     let engine = QueryEngine::new(&graph);
-    let deps = engine.deps(node, transitive);
+    let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+    let deps = match &rels {
+        Some(r) => engine.deps_filtered(node, transitive, Some(r)),
+        None => engine.deps(node, transitive),
+    };
 
     if json {
         let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({
             "id": n.id, "title": n.title, "status": n.status.to_string()
         })).collect();
-        println!("{}", serde_json::json!({"node": node, "transitive": transitive, "dependencies": nodes}));
+        println!("{}", serde_json::json!({"node": node, "transitive": transitive, "relation_filter": relation, "dependencies": nodes}));
     } else {
         let label = if transitive { "Transitive" } else { "Direct" };
+        let filter_note = relation.map(|r| format!(" (relations: {})", r)).unwrap_or_default();
         if deps.is_empty() {
-            println!("'{}' has no {} dependencies", node, label.to_lowercase());
+            println!("'{}' has no {} dependencies{}", node, label.to_lowercase(), filter_note);
         } else {
-            println!("{} dependencies of '{}' ({}):", label, node, deps.len());
+            println!("{} dependencies of '{}' ({}){}:", label, node, deps.len(), filter_note);
             for n in deps {
                 println!("  {} {} — {}", status_icon(&n.status), n.id, n.title);
             }
@@ -2379,17 +2398,29 @@ fn cmd_code_complexity(dir: &PathBuf, nodes_str: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-fn cmd_code_impact(dir: &PathBuf, files_str: &str, json: bool) -> Result<()> {
+fn cmd_code_impact(dir: &PathBuf, files_str: &str, relation: Option<&str>, json: bool) -> Result<()> {
+    use gid_core::code_graph::EdgeRelation;
+
     let dir = resolve_dir(dir)?;
     let graph = CodeGraph::extract_from_dir(&dir);
     let files: Vec<String> = files_str.split(',').map(|s| s.trim().to_string()).collect();
 
-    let analysis = analyze_impact(&files, &graph);
+    let analysis = if let Some(rel_str) = relation {
+        let rels: Result<Vec<EdgeRelation>, _> = rel_str
+            .split(',')
+            .map(|s| s.trim().parse::<EdgeRelation>())
+            .collect();
+        let rels = rels.map_err(|e| anyhow::anyhow!("{}", e))?;
+        analyze_impact_filtered(&files, &graph, Some(&rels))
+    } else {
+        analyze_impact(&files, &graph)
+    };
     let formatted = format_impact_for_llm(&analysis);
 
     if json {
         println!("{}", serde_json::json!({
             "files_changed": files,
+            "relation_filter": relation,
             "risk_level": format!("{:?}", analysis.risk_level),
             "affected_source": analysis.affected_source.len(),
             "affected_tests": analysis.affected_tests.len(),

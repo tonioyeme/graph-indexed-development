@@ -429,6 +429,24 @@ impl std::fmt::Display for EdgeRelation {
     }
 }
 
+impl std::str::FromStr for EdgeRelation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "imports" => Ok(EdgeRelation::Imports),
+            "inherits" => Ok(EdgeRelation::Inherits),
+            "defined_in" | "definedin" => Ok(EdgeRelation::DefinedIn),
+            "calls" => Ok(EdgeRelation::Calls),
+            "tests_for" | "testsfor" => Ok(EdgeRelation::TestsFor),
+            "overrides" => Ok(EdgeRelation::Overrides),
+            "implements" => Ok(EdgeRelation::Implements),
+            "belongs_to" | "belongsto" => Ok(EdgeRelation::BelongsTo),
+            _ => Err(format!("Unknown edge relation: '{}'", s)),
+        }
+    }
+}
+
 // ═══ Impact Analysis Types ═══
 
 /// Result of impact analysis — what's affected by a change

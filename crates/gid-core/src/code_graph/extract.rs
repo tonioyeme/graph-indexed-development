@@ -778,6 +778,71 @@ fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> V
     edges
 }
 
+/// Generate TestsFor edges for Python test files using naming conventions.
+/// Matches: test_auth.py → auth.py, tests/test_auth.py → auth.py
+fn generate_python_tests_for_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    let mut edges = Vec::new();
+
+    // Collect source files (non-test)
+    let mut source_stems: HashMap<String, String> = HashMap::new();
+    for (path, _, lang) in file_entries {
+        if *lang != Language::Python {
+            continue;
+        }
+        if path.starts_with("tests/") || path.contains("/tests/") {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if name.starts_with("test_") || name.starts_with("conftest") {
+            continue;
+        }
+        // stem: "src/auth.py" → "auth", "auth/middleware.py" → "auth/middleware"
+        let stem = path.trim_end_matches(".py");
+        // Remove leading src/ if present
+        let stem = stem.strip_prefix("src/").unwrap_or(stem);
+        source_stems.insert(stem.to_string(), format!("file:{}", path));
+        // Also register just the filename stem for simple matching
+        if let Some(basename) = stem.rsplit('/').next() {
+            source_stems.entry(basename.to_string()).or_insert_with(|| format!("file:{}", path));
+        }
+    }
+
+    // Find test files and match to source
+    for (path, _, lang) in file_entries {
+        if *lang != Language::Python {
+            continue;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        if !name.starts_with("test_") && !path.starts_with("tests/") && !path.contains("/tests/") {
+            continue;
+        }
+
+        let test_file_id = format!("file:{}", path);
+
+        // Extract test stem: "tests/test_auth.py" → "auth", "test_auth.py" → "auth"
+        let raw = path
+            .strip_prefix("tests/")
+            .or_else(|| path.rsplit_once("/tests/").map(|(_, rest)| rest))
+            .unwrap_or(path);
+        let basename = raw.rsplit('/').next().unwrap_or(raw);
+        let test_stem = basename
+            .trim_end_matches(".py")
+            .strip_prefix("test_")
+            .unwrap_or(basename.trim_end_matches(".py"));
+
+        if let Some(source_id) = source_stems.get(test_stem) {
+            edges.push(CodeEdge::new_heuristic(
+                &test_file_id,
+                source_id,
+                EdgeRelation::TestsFor,
+                0.8, // naming convention match
+            ));
+        }
+    }
+
+    edges
+}
+
 // ═══ Public test accessors for ISS-009 helpers ═══
 
 /// Public wrapper for testing module node generation.
@@ -802,6 +867,12 @@ pub fn generate_rust_tests_for_edges_pub(file_entries: &[(String, String, Langua
 #[cfg(test)]
 pub fn generate_ts_tests_for_edges_pub(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
     generate_ts_tests_for_edges(file_entries)
+}
+
+/// Public wrapper for testing Python TestsFor edge generation.
+#[cfg(test)]
+pub fn generate_python_tests_for_edges_pub(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
+    generate_python_tests_for_edges(file_entries)
 }
 
 impl CodeGraph {
@@ -872,6 +943,7 @@ impl CodeGraph {
         // Generate TestsFor edges from naming conventions (ISS-009)
         let rust_test_edges = generate_rust_tests_for_edges(&file_entries);
         let ts_test_edges = generate_ts_tests_for_edges(&file_entries);
+        let python_test_edges = generate_python_tests_for_edges(&file_entries);
 
         // Second pass: parse each file
         let mut parser = Parser::new();
@@ -900,6 +972,7 @@ impl CodeGraph {
         edges.extend(file_module_edges);
         edges.extend(rust_test_edges);
         edges.extend(ts_test_edges);
+        edges.extend(python_test_edges);
         state.edges = edges;
 
         // Resolve placeholder references
@@ -1293,6 +1366,7 @@ impl CodeGraph {
         // Generate TestsFor edges from naming conventions (ISS-009)
         let rust_test_edges = generate_rust_tests_for_edges(&file_entries);
         let ts_test_edges = generate_ts_tests_for_edges(&file_entries);
+        let python_test_edges = generate_python_tests_for_edges(&file_entries);
 
         // Second pass: parse each file
         let mut parser = Parser::new();
@@ -1327,6 +1401,7 @@ impl CodeGraph {
         edges.extend(file_module_edges);
         edges.extend(rust_test_edges);
         edges.extend(ts_test_edges);
+        edges.extend(python_test_edges);
         state.edges = edges;
 
         // Resolve, dedup, finalize

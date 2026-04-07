@@ -37,7 +37,7 @@ pub use unified::{build_unified_graph, merge_relevant_code, link_tasks_to_code, 
 pub use working_mem::{
     GidContext, NodeInfo, ErrorType, RiskLevel, ImpactAnalysis,
     query_gid_context, find_low_risk_alternatives, classify_error,
-    extract_key_traceback, analyze_impact, format_impact_for_llm,
+    extract_key_traceback, analyze_impact, analyze_impact_filtered, format_impact_for_llm,
     // Agent working memory types
     Action, TestOutcome, AttemptRecord, NodeRisk, WorkingMemory,
 };
