@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gid_core::{
     Graph, Node, Edge, NodeStatus,
     load_graph, save_graph,
-    parser::find_graph_file,
+    parser::find_graph_file_walk_up,
     query::QueryEngine,
     validator::Validator,
     CodeGraph, CodeNode, NodeKind,
@@ -646,7 +646,7 @@ fn main() -> Result<()> {
             QueryCommands::Topo => cmd_query_topo(resolve_graph_path(cli.graph)?, cli.json),
         },
         Commands::EditGraph { operations } => cmd_edit_graph(resolve_graph_path(cli.graph)?, &operations, cli.json),
-        Commands::Extract { dir, format, output, lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force, no_semantify),
+        Commands::Extract { dir, format, output, lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force, no_semantify, cli.graph.as_ref()),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -726,8 +726,10 @@ fn resolve_graph_path(provided: Option<PathBuf>) -> Result<PathBuf> {
     }
 
     let cwd = std::env::current_dir()?;
-    find_graph_file(&cwd).context(
-        "No graph file found. Use --graph <path> or run 'gid init' to create one."
+    // Walk up from cwd to find .gid/graph.yml (like git finding .git/)
+    find_graph_file_walk_up(&cwd).context(
+        "No graph file found. Use --graph <path> or run 'gid init' to create one.\n\
+         (Searched current directory and all parent directories for .gid/graph.yml)"
     )
 }
 
@@ -1305,7 +1307,7 @@ fn cmd_edit_graph(path: PathBuf, operations_json: &str, json: bool) -> Result<()
     Ok(())
 }
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool) -> Result<()> {
+fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool, graph_override: Option<&PathBuf>) -> Result<()> {
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -1316,8 +1318,29 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
         bail!("Directory not found: {}", dir.display());
     }
 
-    // Determine metadata path
-    let gid_dir = dir.join(".gid");
+    // Resolve .gid/ directory: --graph flag > walk up from extract dir > walk up from cwd > cwd/.gid/
+    let gid_dir = if let Some(graph_path) = graph_override {
+        // Explicit --graph: use its parent as .gid/
+        graph_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".gid"))
+    } else {
+        // Walk up from extract dir to find existing .gid/
+        find_graph_file_walk_up(&dir)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            // Then try walking up from cwd
+            .or_else(|| {
+                std::env::current_dir().ok()
+                    .and_then(|cwd| find_graph_file_walk_up(&cwd))
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            })
+            // Fall back to cwd/.gid/
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(".gid")
+            })
+    };
     let meta_path = gid_dir.join("extract-meta.json");
 
     if !json_flag {

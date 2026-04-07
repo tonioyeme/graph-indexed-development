@@ -27,7 +27,7 @@ pub mod ritual;
 // Re-export commonly used types
 pub use graph::*;
 pub use query::QueryEngine;
-pub use parser::{load_graph, save_graph};
+pub use parser::{load_graph, save_graph, find_graph_file, find_graph_file_walk_up, find_project_root};
 pub use code_graph::{
     CodeGraph, CodeNode, CodeEdge, NodeKind, EdgeRelation, Language,
     ImpactReport, CausalChain, ChainNode,

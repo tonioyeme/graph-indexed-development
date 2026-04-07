@@ -897,14 +897,56 @@ pub(crate) fn build_scope_map_rust(
     while let Some((current, impl_ctx, module_prefix, in_function)) = stack.pop() {
         match current.kind() {
             "impl_item" => {
-                // Extract impl target type
-                let impl_type = extract_impl_type(current, source);
-                let impl_id = impl_type.as_ref().map(|t| format!("class:{}:{}", rel_path, t));
-                
-                let child_count = current.child_count();
-                for i in (0..child_count).rev() {
-                    if let Some(child) = current.child(i) {
-                        stack.push((child, impl_id.clone(), module_prefix.clone(), false));
+                if in_function {
+                    // impl blocks inside function bodies (e.g., custom Deserialize impls)
+                    // define types that don't get their own nodes in the graph.
+                    // Don't set impl_ctx — attribute their methods to the parent function scope.
+                    let child_count = current.child_count();
+                    for i in (0..child_count).rev() {
+                        if let Some(child) = current.child(i) {
+                            stack.push((child, impl_ctx.clone(), module_prefix.clone(), true));
+                        }
+                    }
+                } else {
+                    // Top-level impl block: extract target type for method ID generation
+                    let impl_type = extract_impl_type(current, source);
+                    let impl_id = impl_type.as_ref().map(|t| format!("class:{}:{}", rel_path, t));
+                    
+                    let child_count = current.child_count();
+                    for i in (0..child_count).rev() {
+                        if let Some(child) = current.child(i) {
+                            stack.push((child, impl_id.clone(), module_prefix.clone(), false));
+                        }
+                    }
+                }
+            }
+            "trait_item" => {
+                // Trait definitions contain methods (default impls and signatures).
+                // Extract the trait name and use it as impl_ctx so child functions get
+                // method:file:TraitName.method_name IDs matching the node extractor.
+                if in_function {
+                    // Trait defined inside a function body — same as nested impl, skip.
+                    let child_count = current.child_count();
+                    for i in (0..child_count).rev() {
+                        if let Some(child) = current.child(i) {
+                            stack.push((child, impl_ctx.clone(), module_prefix.clone(), true));
+                        }
+                    }
+                } else {
+                    let trait_name = current.child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .unwrap_or("");
+                    let trait_id = if !trait_name.is_empty() {
+                        Some(format!("class:{}:{}", rel_path, trait_name))
+                    } else {
+                        None
+                    };
+
+                    let child_count = current.child_count();
+                    for i in (0..child_count).rev() {
+                        if let Some(child) = current.child(i) {
+                            stack.push((child, trait_id.clone(), module_prefix.clone(), false));
+                        }
                     }
                 }
             }

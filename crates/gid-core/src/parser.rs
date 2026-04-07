@@ -34,3 +34,30 @@ pub fn find_graph_file(project_dir: &Path) -> Option<std::path::PathBuf> {
     ];
     candidates.into_iter().find(|p| p.exists())
 }
+
+/// Find the graph file by walking up from a starting directory.
+/// Like `git` searching for `.git/`, this walks up the directory tree
+/// until it finds a `.gid/graph.yml` (or reaches the filesystem root).
+pub fn find_graph_file_walk_up(start_dir: &Path) -> Option<std::path::PathBuf> {
+    let mut current = start_dir.to_path_buf();
+    loop {
+        if let Some(found) = find_graph_file(&current) {
+            return Some(found);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Find the `.gid/` directory by walking up from a starting directory.
+/// Returns the parent directory that contains `.gid/`, not the `.gid/` path itself.
+pub fn find_project_root(start_dir: &Path) -> Option<std::path::PathBuf> {
+    find_graph_file_walk_up(start_dir)
+        .and_then(|graph_path| {
+            // graph_path is like /foo/bar/.gid/graph.yml → parent.parent = /foo/bar
+            graph_path.parent()
+                .and_then(|gid_dir| gid_dir.parent())
+                .map(|p| p.to_path_buf())
+        })
+}
