@@ -1,6 +1,6 @@
 {
   "id": "r-559511",
-  "phase": "Graphing",
+  "phase": "Done",
   "task": "Implement Ritual v2 ← Harness Context Integration\n\nDesign doc: .gid/features/ritual-context-integration/design.md\n\nThree files to change:\n1. crates/gid-core/src/harness/types.rs — Add TaskContext::render_prompt() method\n2. crates/gid-core/src/ritual/v2_executor.rs — Add enrich_implement_context(), build_graph_context(), resolve_gid_root(), safe_truncate(), review_config_for_triage_size(). Thread state to run_skill(). Fix UTF-8 unsafe truncation in run_planning.\n3. crates/gid-core/src/harness/mod.rs — Ensure assemble_task_context is pub\n\n7 tests: render_prompt, render_prompt_partial, enrich_with_graph, enrich_no_graph, enrich_no_task_nodes, enrich_with_error_context, review_config_sizes\n\nKey rule: state machine stays pure (no changes). All enrichment in executor. All failures non-fatal (fallback to raw context).\nProject location: /Users/potato/clawd/projects/gid-rs",
   "target_root": "/Users/potato/clawd/projects/gid-rs",
   "project": {
@@ -21,9 +21,11 @@
   "review_target": null,
   "triage_size": "medium",
   "phase_tokens": {
-    "planning": 484,
     "triage": 714,
-    "design": 13637
+    "planning": 484,
+    "design": 13637,
+    "implement": 6192,
+    "graph": 5595
   },
   "review_round": 0,
   "transitions": [
@@ -56,8 +58,26 @@
       "to": "Graphing",
       "event": "Planning → Graphing",
       "timestamp": "2026-04-07T05:11:11.301389Z"
+    },
+    {
+      "from": "Graphing",
+      "to": "Implementing",
+      "event": "Graphing → Implementing",
+      "timestamp": "2026-04-07T05:13:07.420419Z"
+    },
+    {
+      "from": "Implementing",
+      "to": "Verifying",
+      "event": "Implementing → Verifying",
+      "timestamp": "2026-04-07T05:14:54.718666Z"
+    },
+    {
+      "from": "Verifying",
+      "to": "Done",
+      "event": "Verifying → Done",
+      "timestamp": "2026-04-07T05:15:08.649926Z"
     }
   ],
   "started_at": "2026-04-07T05:06:18.001434Z",
-  "updated_at": "2026-04-07T05:11:11.301390Z"
+  "updated_at": "2026-04-07T05:15:08.649926Z"
 }

@@ -138,6 +138,7 @@ impl LlmClient for ApiLlmClient {
         tools: Vec<ToolDefinition>,
         model: &str,
         working_dir: &Path,
+        max_iterations: usize,
     ) -> Result<SkillResult> {
         // Convert ToolDefinition → agentctl-auth Tool
         let api_tools: Vec<Tool> = tools.iter().map(|t| {
@@ -168,7 +169,7 @@ impl LlmClient for ApiLlmClient {
             "You are a development assistant executing a ritual phase. Complete the task and produce the required artifacts.",
             skill_prompt,
             &api_tools,
-            20, // max turns
+            max_iterations as u32, // max turns
             &handler,
         ).await.map_err(|e| {
             tracing::error!("ApiLlmClient: agent loop failed: {:?}", e);

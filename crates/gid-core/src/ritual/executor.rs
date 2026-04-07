@@ -374,6 +374,7 @@ impl SkillExecutor {
             tools,
             &context.model,
             &self.project_root,
+            80,
         ).await?;
 
         // Collect output artifacts
@@ -892,6 +893,7 @@ impl crate::harness::TaskExecutor for LlmTaskExecutor {
             tools,
             &config.model,
             worktree_path,
+            80,
         ).await;
 
         match result {

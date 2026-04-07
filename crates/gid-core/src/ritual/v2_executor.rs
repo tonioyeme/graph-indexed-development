@@ -298,10 +298,23 @@ impl V2Executor {
         };
 
         // Select model and adjust iterations for review phases based on triage size
-        let (model, _max_iterations) = if name == "review" {
+        let (model, max_iterations) = if name == "review" {
             self.review_config_for_triage_size(state)
         } else {
             (self.config.skill_model.clone(), 100)
+        };
+
+        // Inject review depth hint into prompt for review phases
+        let full_prompt = if name == "review" {
+            let depth = match state.triage_size.as_deref().unwrap_or("medium") {
+                "small" => "quick",
+                "medium" => "standard",
+                "large" => "full",
+                _ => "standard",
+            };
+            format!("[REVIEW_DEPTH: {}]\n\n{}", depth, full_prompt)
+        } else {
+            full_prompt
         };
 
         // Get tool scope for this phase
@@ -314,6 +327,7 @@ impl V2Executor {
                 tools,
                 &model,
                 &self.config.project_root,
+                max_iterations,
             )
             .await
         {
@@ -431,6 +445,7 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
                 vec![], // No tools needed for planning
                 &self.config.planning_model,
                 &self.config.project_root,
+                20,
             )
             .await
         {

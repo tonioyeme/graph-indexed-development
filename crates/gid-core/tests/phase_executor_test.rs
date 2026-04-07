@@ -36,6 +36,7 @@ impl LlmClient for MockLlmClient {
         _tools: Vec<ToolDefinition>,
         _model: &str,
         _working_dir: &Path,
+        _max_iterations: usize,
     ) -> Result<SkillResult> {
         Ok(SkillResult::success(&self.output)
             .with_tool_calls(3)

@@ -304,3 +304,53 @@ GID graph 应该是多层结构，层内有细分层级，层间有 edges 连接
 - **已定义的类型（Module, TestsFor）从未被使用** — 说明设计时想到了，实现时没做完
 
 **优先级**: P0 — 比 LSP (ISS-002) 更基础。LSP 提高代码层精度，但如果代码层和任务层连不起来，精度高了也没用
+
+---
+
+## ISS-010 [improvement] [P1] [open]
+**Triage Size 驱动 Review 深度分级**
+
+**发现日期**: 2026-04-07
+**发现者**: potato + RustClaw
+**组件**: gid-core, ritual/state_machine.rs + ritual/v2_executor.rs + review skills (RustClaw skills/)
+
+### 问题描述
+
+Ritual v2 的 triage 结果（small/medium/large）应该影响 review 的**深度**，而不仅仅是 model 选择和是否跳过。
+
+### 现状
+
+已实现（部分）：
+1. ✅ **Skip 逻辑** — small + incremental update → 跳过 review
+2. ✅ **Model/iterations 选择** — `review_config_for_triage_size()`: small→sonnet/30, medium→opus/50, large→opus/100
+3. ❌ **`_max_iterations` 未实际传递** — 变量带下划线，`run_skill()` 没有 max_iterations 参数
+
+未实现：
+4. ❌ **Review skill 本身不分级** — 无论 size，都跑同一个 review-design (27 checks) 或 review-requirements skill
+5. ❌ **无轻量 review 模式** — small task 不需要跑 "State machine invariants" 或 "Cross-cutting concerns" 等重型 check
+
+### 方案
+
+三级 review 深度，由 triage size 选择：
+
+| Triage Size | Review Depth | Checks | Model |
+|---|---|---|---|
+| small | **Quick** — structural + naming 只 | Phase 1 + Phase 4 (8 checks) | Sonnet |
+| medium | **Standard** — logic + architecture | Phase 1-5 (20 checks) | Opus |
+| large | **Full** — 全部 27 checks + path traces | Phase 1-7 (27 checks) | Opus |
+
+实现方式：
+1. **Review skill 参数化** — `RunSkill` 的 context 注入 review depth 指令（如 `[REVIEW_DEPTH: quick]`），skill 据此选择执行哪些 phase
+2. **或拆分 skill** — `review-design-quick`, `review-design-standard`, `review-design-full` 三个 skill 文件
+3. **max_iterations 真正传递** — `run_skill()` 加 max_iterations 参数或在 config 里限制
+
+方式 1 更灵活（一个 skill 文件，参数控制），方式 2 更显式（各自独立）。推荐方式 1。
+
+### 同时修复
+- `_max_iterations` 变量实际传递到 `run_skill()` 调用
+- requirements review 也做同样的分级（当前只对 design review 有条件跳过）
+
+### 关联
+- Ritual v2 triage 逻辑（state_machine.rs Triaging phase）
+- review-design skill (RustClaw skills/review-design/SKILL.md)
+- review-requirements skill (RustClaw skills/review-requirements/SKILL.md)

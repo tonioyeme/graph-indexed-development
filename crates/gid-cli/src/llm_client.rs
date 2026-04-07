@@ -50,6 +50,7 @@ impl LlmClient for CliLlmClient {
         tools: Vec<ToolDefinition>,
         model: &str,
         working_dir: &Path,
+        _max_iterations: usize,
     ) -> Result<SkillResult> {
         // Defensive validation: ensure tool names are safe (no commas, control chars)
         for tool in &tools {

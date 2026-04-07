@@ -92,6 +92,7 @@ impl SkillResult {
 ///         tools: Vec<ToolDefinition>,
 ///         model: &str,
 ///         working_dir: &Path,
+///         max_iterations: usize,
 ///     ) -> Result<SkillResult> {
 ///         // Run agentic loop with tools until completion
 ///         // ...
@@ -108,6 +109,7 @@ pub trait LlmClient: Send + Sync {
     /// * `tools` - Tool definitions available to the LLM (pre-filtered by ToolScope)
     /// * `model` - Model identifier (e.g., "sonnet", "opus")
     /// * `working_dir` - Directory to run the skill in
+    /// * `max_iterations` - Maximum number of agent loop iterations
     ///
     /// # Returns
     ///
@@ -118,6 +120,7 @@ pub trait LlmClient: Send + Sync {
         tools: Vec<ToolDefinition>,
         model: &str,
         working_dir: &Path,
+        max_iterations: usize,
     ) -> Result<SkillResult>;
 
     /// Simple single-turn chat (no tools). Used for triage and other lightweight LLM calls.
@@ -125,7 +128,7 @@ pub trait LlmClient: Send + Sync {
     /// Default implementation uses `run_skill` with no tools.
     /// Implementations can override for efficiency (e.g., skip agent loop overhead).
     async fn chat(&self, prompt: &str, model: &str) -> Result<String> {
-        let result = self.run_skill(prompt, vec![], model, Path::new(".")).await?;
+        let result = self.run_skill(prompt, vec![], model, Path::new("."), 20).await?;
         Ok(result.output)
     }
 }
