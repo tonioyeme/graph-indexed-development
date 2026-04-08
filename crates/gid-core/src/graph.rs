@@ -318,6 +318,15 @@ impl Edge {
     }
 }
 
+/// Task specification for `add_feature()`.
+#[derive(Debug, Clone)]
+pub struct TaskSpec {
+    pub title: String,
+    pub status: Option<NodeStatus>,  // default: Todo
+    pub tags: Vec<String>,           // default: []
+    pub deps: Vec<String>,           // titles of tasks this depends on
+}
+
 // ─── Graph operations ────────────────────────────────────────
 
 impl Graph {
@@ -376,6 +385,306 @@ impl Graph {
         });
     }
 
+    /// Add an edge with deduplication check.
+    ///
+    /// Returns `true` if the edge was added (new), `false` if it already existed.
+    /// An edge is considered duplicate if the (from, to, relation) triple matches.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gid_core::{Graph, Edge};
+    ///
+    /// let mut g = Graph::new();
+    /// let edge = Edge::new("a", "b", "depends_on");
+    /// assert!(g.add_edge_dedup(edge.clone())); // Returns true (new edge)
+    /// assert!(!g.add_edge_dedup(edge)); // Returns false (duplicate)
+    /// ```
+    pub fn add_edge_dedup(&mut self, edge: Edge) -> bool {
+        let exists = self.edges.iter().any(|e| {
+            e.from == edge.from && e.to == edge.to && e.relation == edge.relation
+        });
+        if !exists {
+            self.edges.push(edge);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Ensures a node ID is unique by appending -2, -3, etc. if needed.
+    fn ensure_unique_id(&self, base: String) -> String {
+        if self.get_node(&base).is_none() {
+            return base;
+        }
+        for i in 2..1000 {
+            let candidate = format!("{}-{}", base, i);
+            if self.get_node(&candidate).is_none() {
+                return candidate;
+            }
+        }
+        format!("{}-overflow", base)
+    }
+
+    /// Create a feature node with task nodes and all edges in one operation.
+    ///
+    /// - Creates `feat-{slug}` feature node
+    /// - Creates `task-{feature_slug}-{task_slug}` task nodes
+    /// - Adds `implements` edges from each task to the feature
+    /// - Adds `depends_on` edges between tasks per TaskSpec.deps (matched by title)
+    /// - Returns the feature node ID
+    pub fn add_feature(&mut self, name: &str, tasks: &[TaskSpec]) -> String {
+        use crate::slugify::slugify;
+
+        let feature_slug = slugify(name);
+        let feat_id = self.ensure_unique_id(format!("feat-{}", feature_slug));
+
+        let mut feat = Node::new(&feat_id, name);
+        feat.node_type = Some("feature".into());
+        feat.status = NodeStatus::Todo;
+        self.add_node(feat);
+
+        // Map title -> actual task ID for dep resolution
+        let mut task_ids: HashMap<String, String> = HashMap::new();
+
+        for spec in tasks {
+            let task_slug = slugify(&spec.title);
+            let base_id = format!("task-{}-{}", feature_slug, task_slug);
+            let task_id = self.ensure_unique_id(base_id);
+
+            let mut task = Node::new(&task_id, &spec.title);
+            task.node_type = Some("task".into());
+            task.status = spec.status.clone().unwrap_or(NodeStatus::Todo);
+            task.tags = spec.tags.clone();
+            self.add_node(task);
+
+            // implements edge: task -> feature
+            self.add_edge_dedup(Edge::new(&task_id, &feat_id, "implements"));
+
+            task_ids.insert(spec.title.clone(), task_id);
+        }
+
+        // Add dependency edges between tasks
+        for spec in tasks {
+            if let Some(from_id) = task_ids.get(&spec.title) {
+                for dep_title in &spec.deps {
+                    if let Some(to_id) = task_ids.get(dep_title.as_str()) {
+                        self.add_edge_dedup(Edge::new(from_id, to_id, "depends_on"));
+                    }
+                }
+            }
+        }
+
+        feat_id
+    }
+
+    /// Add a standalone task node (no parent feature required).
+    /// Returns the task node ID.
+    pub fn add_task(
+        &mut self,
+        title: &str,
+        for_feature: Option<&str>,
+        depends_on: &[String],
+        tags: &[String],
+        priority: Option<u8>,
+    ) -> String {
+        use crate::slugify::slugify;
+
+        let task_slug = slugify(title);
+        let base_id = if let Some(feat_id) = for_feature {
+            // If attached to a feature, prefix with feature slug
+            let feat_slug = feat_id.strip_prefix("feat-").unwrap_or(feat_id);
+            format!("task-{}-{}", feat_slug, task_slug)
+        } else {
+            format!("task-{}", task_slug)
+        };
+        let task_id = self.ensure_unique_id(base_id);
+
+        let mut task = Node::new(&task_id, title);
+        task.node_type = Some("task".into());
+        task.status = NodeStatus::Todo;
+        task.tags = tags.to_vec();
+        task.priority = priority;
+        self.add_node(task);
+
+        // If for_feature specified, add implements edge
+        if let Some(feat_id) = for_feature {
+            self.add_edge_dedup(Edge::new(&task_id, feat_id, "implements"));
+        }
+
+        // Add depends_on edges - support both exact IDs and fuzzy resolution
+        for dep in depends_on {
+            let resolved = self.resolve_node(dep);
+            if let Some(dep_node) = resolved.first() {
+                let dep_id = dep_node.id.clone();
+                self.add_edge_dedup(Edge::new(&task_id, &dep_id, "depends_on"));
+            } else {
+                eprintln!("⚠ Could not resolve dependency: {}", dep);
+            }
+        }
+
+        task_id
+    }
+
+    /// Merge incoming nodes into this graph, scoped to a specific feature.
+    ///
+    /// 1. Finds all existing task nodes that `implements` the target feature
+    /// 2. Removes those old task nodes (cascading edge cleanup via remove_node)
+    /// 3. Adds all incoming nodes
+    /// 4. Adds `implements` edges from incoming task nodes to the feature
+    /// 5. Adds incoming edges with deduplication
+    ///
+    /// Returns (removed_count, added_count) for reporting.
+    pub fn merge_feature_nodes(&mut self, feature_id: &str, incoming: Graph) -> (usize, usize) {
+        // Step 1: Find old feature tasks
+        let old_task_ids: Vec<String> = self.edges.iter()
+            .filter(|e| e.to == feature_id && e.relation == "implements")
+            .map(|e| e.from.clone())
+            .collect();
+
+        let removed = old_task_ids.len();
+
+        // Step 2: Remove old task nodes (remove_node cascades edges)
+        for id in &old_task_ids {
+            self.remove_node(id);
+        }
+
+        // Step 3: Collect incoming node IDs
+        let incoming_node_ids: std::collections::HashSet<String> = incoming.nodes.iter()
+            .map(|n| n.id.clone())
+            .collect();
+        let added = incoming.nodes.len();
+
+        // Step 4: Add all incoming nodes
+        for node in incoming.nodes {
+            self.add_node(node);
+        }
+
+        // Step 5: Add implements edges for each new node
+        for id in &incoming_node_ids {
+            self.add_edge_dedup(Edge::new(id, feature_id, "implements"));
+        }
+
+        // Step 6: Add incoming edges with dedup
+        for edge in incoming.edges {
+            self.add_edge_dedup(edge);
+        }
+
+        (removed, added)
+    }
+
+    /// Resolve a node reference to actual node(s) using a 7-tier priority cascade.
+    ///
+    /// Priority tiers (highest to lowest):
+    /// 1. Exact ID match
+    /// 2. Exact title match (case-insensitive)
+    /// 3. Structural segment match (`:`, `-`, `/` delimiters)
+    /// 4. Word segment match (`_` delimiter)
+    /// 5. File path match
+    /// 6. Title substring match (case-insensitive)
+    /// 7. ID substring match (case-insensitive)
+    ///
+    /// Returns a vector of matching nodes. Empty vector if no match found.
+    /// May return multiple nodes if there's ambiguity (e.g., multiple substring matches).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use gid_core::{Graph, Node};
+    ///
+    /// let mut g = Graph::new();
+    /// g.add_node(Node::new("feat-auth", "Authentication Feature"));
+    /// g.add_node(Node::new("impl-jwt", "Implement JWT validation"));
+    ///
+    /// // Exact ID match
+    /// let results = g.resolve_node("feat-auth");
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].id, "feat-auth");
+    ///
+    /// // Case-insensitive title match
+    /// let results = g.resolve_node("authentication feature");
+    /// assert_eq!(results.len(), 1);
+    ///
+    /// // No match
+    /// let results = g.resolve_node("nonexistent");
+    /// assert_eq!(results.len(), 0);
+    /// ```
+    pub fn resolve_node(&self, reference: &str) -> Vec<&Node> {
+        let reference_lower = reference.to_lowercase();
+
+        // Tier 1: Exact ID match
+        if let Some(node) = self.nodes.iter().find(|n| n.id == reference) {
+            return vec![node];
+        }
+
+        // Tier 2: Exact title match (case-insensitive)
+        let exact_title: Vec<&Node> = self.nodes.iter()
+            .filter(|n| n.title.to_lowercase() == reference_lower)
+            .collect();
+        if !exact_title.is_empty() {
+            return exact_title;
+        }
+
+        // Tier 3: Structural segment match (: - / delimiters)
+        let structural_segments = extract_segments(&reference_lower, &[':', '-', '/']);
+        if !structural_segments.is_empty() {
+            let matches: Vec<&Node> = self.nodes.iter()
+                .filter(|n| {
+                    let id_segs = extract_segments(&n.id.to_lowercase(), &[':', '-', '/']);
+                    let title_segs = extract_segments(&n.title.to_lowercase(), &[':', '-', '/']);
+                    segments_match(&structural_segments, &id_segs) || 
+                    segments_match(&structural_segments, &title_segs)
+                })
+                .collect();
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+
+        // Tier 4: Word segment match (_ delimiter)
+        let word_segments = extract_segments(&reference_lower, &['_']);
+        if !word_segments.is_empty() {
+            let matches: Vec<&Node> = self.nodes.iter()
+                .filter(|n| {
+                    let id_segs = extract_segments(&n.id.to_lowercase(), &['_']);
+                    let title_segs = extract_segments(&n.title.to_lowercase(), &['_']);
+                    segments_match(&word_segments, &id_segs) || 
+                    segments_match(&word_segments, &title_segs)
+                })
+                .collect();
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+
+        // Tier 5: File path match
+        let matches: Vec<&Node> = self.nodes.iter()
+            .filter(|n| {
+                n.file_path.as_ref()
+                    .map(|fp| fp.to_lowercase().contains(&reference_lower))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !matches.is_empty() {
+            return matches;
+        }
+
+        // Tier 6: Title substring match (case-insensitive)
+        let matches: Vec<&Node> = self.nodes.iter()
+            .filter(|n| n.title.to_lowercase().contains(&reference_lower))
+            .collect();
+        if !matches.is_empty() {
+            return matches;
+        }
+
+        // Tier 7: ID substring match (case-insensitive)
+        let matches: Vec<&Node> = self.nodes.iter()
+            .filter(|n| n.id.to_lowercase().contains(&reference_lower))
+            .collect();
+        
+        matches
+    }
+
     pub fn edges_from(&self, id: &str) -> Vec<&Edge> {
         self.edges.iter().filter(|e| e.from == id).collect()
     }
@@ -383,8 +692,6 @@ impl Graph {
     pub fn edges_to(&self, id: &str) -> Vec<&Edge> {
         self.edges.iter().filter(|e| e.to == id).collect()
     }
-
-    // ── Query helpers ──
 
     // ── Layer filtering helpers ──
 
@@ -615,6 +922,36 @@ impl std::fmt::Display for GraphSummary {
     }
 }
 
+
+// ── Helper functions for resolve_node ──
+
+/// Extract segments from text using the given delimiters.
+fn extract_segments(text: &str, delimiters: &[char]) -> Vec<String> {
+    let mut segments = vec![text.to_string()];
+    
+    for &delimiter in delimiters {
+        let mut new_segments = Vec::new();
+        for segment in segments {
+            new_segments.extend(
+                segment.split(delimiter)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+            );
+        }
+        segments = new_segments;
+    }
+    
+    segments
+}
+
+/// Check if all query segments appear in target segments (order-independent).
+fn segments_match(query_segments: &[String], target_segments: &[String]) -> bool {
+    if query_segments.is_empty() {
+        return false;
+    }
+    query_segments.iter().all(|q| target_segments.contains(q))
+}
+
 #[cfg(test)]
 mod layer_filter_tests {
     use super::*;
@@ -723,5 +1060,419 @@ mod layer_filter_tests {
         // task-1 should be ready, code nodes should NOT appear
         assert!(ready.iter().any(|n| n.id == "task-1"));
         assert!(!ready.iter().any(|n| n.source.as_deref() == Some("extract")));
+    }
+}
+
+#[cfg(test)]
+mod add_edge_dedup_tests {
+    use super::*;
+
+    #[test]
+    fn test_new_edge_returns_true() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("a", "A"));
+        g.add_node(Node::new("b", "B"));
+        let result = g.add_edge_dedup(Edge::new("a", "b", "depends_on"));
+        assert!(result);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_duplicate_returns_false() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("a", "A"));
+        g.add_node(Node::new("b", "B"));
+        g.add_edge_dedup(Edge::new("a", "b", "depends_on"));
+        let result = g.add_edge_dedup(Edge::new("a", "b", "depends_on"));
+        assert!(!result);
+        assert_eq!(g.edges.len(), 1);
+    }
+
+    #[test]
+    fn test_same_from_to_different_relation() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("a", "A"));
+        g.add_node(Node::new("b", "B"));
+        assert!(g.add_edge_dedup(Edge::new("a", "b", "depends_on")));
+        assert!(g.add_edge_dedup(Edge::new("a", "b", "blocks")));
+        assert_eq!(g.edges.len(), 2);
+    }
+
+    #[test]
+    fn test_same_from_relation_different_to() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("a", "A"));
+        g.add_node(Node::new("b", "B"));
+        g.add_node(Node::new("c", "C"));
+        assert!(g.add_edge_dedup(Edge::new("a", "b", "depends_on")));
+        assert!(g.add_edge_dedup(Edge::new("a", "c", "depends_on")));
+        assert_eq!(g.edges.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod resolve_node_tests {
+    use super::*;
+
+    fn test_graph() -> Graph {
+        let mut g = Graph::new();
+        g.add_node(Node::new("task-auth", "Auth Module"));
+        g.add_node(Node::new("feat:auth:login", "Login Feature"));
+        g.add_node(Node::new("validate_auth_token", "Token Validator"));
+        g.add_node(Node::new("file:src/main.rs", "Main Entry"));
+        g.add_node(Node::new("impl-auth-middleware", "User Login Flow"));
+        g.add_node(Node::new("task-db", "Database Setup"));
+        g
+    }
+
+    #[test]
+    fn test_exact_id_match() {
+        let g = test_graph();
+        let results = g.resolve_node("task-auth");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "task-auth");
+    }
+
+    #[test]
+    fn test_exact_title_match_case_insensitive() {
+        let g = test_graph();
+        let results = g.resolve_node("auth module");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "task-auth");
+    }
+
+    #[test]
+    fn test_structural_segment_colon() {
+        let g = test_graph();
+        // "auth" appears as a segment in "feat:auth:login" when split on ':'
+        // But it also appears in "task-auth" split on '-', and "validate_auth_token" split on '_'
+        // and in ID substrings. Tier 3 (structural) should find feat:auth:login and task-auth (split on '-')
+        let results = g.resolve_node("login");
+        // "login" is a structural segment of "feat:auth:login" (colon-split)
+        assert!(results.iter().any(|n| n.id == "feat:auth:login"));
+    }
+
+    #[test]
+    fn test_word_segment_underscore() {
+        let g = test_graph();
+        // "validate" splits on '_' in "validate_auth_token"
+        let results = g.resolve_node("validate");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "validate_auth_token");
+    }
+
+    #[test]
+    fn test_file_path_match() {
+        let g = test_graph();
+        let results = g.resolve_node("main.rs");
+        assert!(results.iter().any(|n| n.id == "file:src/main.rs"));
+    }
+
+    #[test]
+    fn test_title_substring() {
+        let g = test_graph();
+        // "Login Flow" is a substring of "User Login Flow"
+        let results = g.resolve_node("Login Flow");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "impl-auth-middleware");
+    }
+
+    #[test]
+    fn test_id_substring() {
+        let g = test_graph();
+        // "middleware" is a substring of "impl-auth-middleware"
+        // But it's also a structural segment (split on '-'), so tier 3 catches it
+        let results = g.resolve_node("middleware");
+        assert!(results.iter().any(|n| n.id == "impl-auth-middleware"));
+    }
+
+    #[test]
+    fn test_zero_matches() {
+        let g = test_graph();
+        let results = g.resolve_node("nonexistent_xyz");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_tier_priority() {
+        // If query matches exact ID (tier 1), should NOT return title substring matches (tier 6)
+        let mut g = Graph::new();
+        g.add_node(Node::new("auth", "Something"));
+        g.add_node(Node::new("other", "auth related"));
+        let results = g.resolve_node("auth");
+        // Only tier 1 (exact ID) should match
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "auth");
+    }
+
+    #[test]
+    fn test_multiple_matches_same_tier() {
+        let mut g = Graph::new();
+        g.add_node(Node::new("node-1", "Auth Login"));
+        g.add_node(Node::new("node-2", "Auth Signup"));
+        // "auth" doesn't match any exact ID or title, structural segment matches both on '-' split? No.
+        // "auth" as structural segment: "node-1" splits to ["node", "1"], "node-2" splits to ["node", "2"]
+        // None match. Underscore split: no underscores. File path: no "file:" prefix.
+        // Title substring (tier 6): both contain "auth" (case-insensitive)
+        let results = g.resolve_node("auth");
+        assert_eq!(results.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod add_feature_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_feature_with_tasks() {
+        let mut g = Graph::new();
+        let tasks = vec![
+            TaskSpec { title: "Design API".into(), status: None, tags: vec![], deps: vec![] },
+            TaskSpec { title: "Write Tests".into(), status: None, tags: vec![], deps: vec![] },
+        ];
+        let feat_id = g.add_feature("User Auth", &tasks);
+        assert_eq!(feat_id, "feat-user-auth");
+
+        // Feature node exists
+        let feat = g.get_node("feat-user-auth").unwrap();
+        assert_eq!(feat.title, "User Auth");
+        assert_eq!(feat.node_type.as_deref(), Some("feature"));
+        assert_eq!(feat.status, NodeStatus::Todo);
+
+        // Task nodes exist
+        assert!(g.get_node("task-user-auth-design-api").is_some());
+        assert!(g.get_node("task-user-auth-write-tests").is_some());
+
+        // Implements edges exist
+        let implements: Vec<_> = g.edges.iter()
+            .filter(|e| e.relation == "implements" && e.to == "feat-user-auth")
+            .collect();
+        assert_eq!(implements.len(), 2);
+    }
+
+    #[test]
+    fn test_feature_with_deps() {
+        let mut g = Graph::new();
+        let tasks = vec![
+            TaskSpec { title: "Setup DB".into(), status: None, tags: vec![], deps: vec![] },
+            TaskSpec { title: "Write Schema".into(), status: None, tags: vec![], deps: vec!["Setup DB".into()] },
+            TaskSpec { title: "Add Migrations".into(), status: None, tags: vec![], deps: vec!["Write Schema".into()] },
+        ];
+        let feat_id = g.add_feature("Database", &tasks);
+        assert_eq!(feat_id, "feat-database");
+
+        // depends_on edges
+        let deps: Vec<_> = g.edges.iter()
+            .filter(|e| e.relation == "depends_on")
+            .collect();
+        assert_eq!(deps.len(), 2);
+
+        // Write Schema depends on Setup DB
+        assert!(g.edges.iter().any(|e| {
+            e.from == "task-database-write-schema" && e.to == "task-database-setup-db" && e.relation == "depends_on"
+        }));
+
+        // Add Migrations depends on Write Schema
+        assert!(g.edges.iter().any(|e| {
+            e.from == "task-database-add-migrations" && e.to == "task-database-write-schema" && e.relation == "depends_on"
+        }));
+    }
+
+    #[test]
+    fn test_feature_id_collision() {
+        let mut g = Graph::new();
+        let tasks = vec![
+            TaskSpec { title: "Task A".into(), status: None, tags: vec![], deps: vec![] },
+        ];
+        let id1 = g.add_feature("Auth", &tasks);
+        assert_eq!(id1, "feat-auth");
+
+        let id2 = g.add_feature("Auth", &[]);
+        assert_eq!(id2, "feat-auth-2");
+
+        // Both exist
+        assert!(g.get_node("feat-auth").is_some());
+        assert!(g.get_node("feat-auth-2").is_some());
+    }
+}
+
+#[cfg(test)]
+mod add_task_tests {
+    use super::*;
+
+    #[test]
+    fn test_standalone_task() {
+        let mut g = Graph::new();
+        let task_id = g.add_task("Fix login bug", None, &[], &[], None);
+        assert_eq!(task_id, "task-fix-login-bug");
+
+        let node = g.get_node(&task_id).unwrap();
+        assert_eq!(node.title, "Fix login bug");
+        assert_eq!(node.node_type.as_deref(), Some("task"));
+        assert_eq!(node.status, NodeStatus::Todo);
+
+        // No edges
+        assert!(g.edges.is_empty());
+    }
+
+    #[test]
+    fn test_task_with_feature() {
+        let mut g = Graph::new();
+        // Create a feature first
+        g.add_feature("Auth", &[]);
+
+        let task_id = g.add_task("Add OAuth", Some("feat-auth"), &[], &["backend".into()], Some(1));
+        assert_eq!(task_id, "task-auth-add-oauth");
+
+        let node = g.get_node(&task_id).unwrap();
+        assert_eq!(node.tags, vec!["backend".to_string()]);
+        assert_eq!(node.priority, Some(1));
+
+        // implements edge
+        assert!(g.edges.iter().any(|e| {
+            e.from == "task-auth-add-oauth" && e.to == "feat-auth" && e.relation == "implements"
+        }));
+    }
+
+    #[test]
+    fn test_task_with_deps() {
+        let mut g = Graph::new();
+        // Create some nodes to depend on
+        g.add_node(Node::new("task-setup", "Setup Environment"));
+        g.add_node(Node::new("task-config", "Write Config"));
+
+        let task_id = g.add_task("Deploy App", None, &["task-setup".into(), "Write Config".into()], &[], None);
+        assert_eq!(task_id, "task-deploy-app");
+
+        // depends_on edges
+        let deps: Vec<_> = g.edges.iter()
+            .filter(|e| e.from == "task-deploy-app" && e.relation == "depends_on")
+            .collect();
+        assert_eq!(deps.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod merge_feature_nodes_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_merge() {
+        let mut g = Graph::new();
+        // Create feature with tasks
+        g.add_feature("Auth", &[
+            TaskSpec { title: "Old Task 1".into(), status: None, tags: vec![], deps: vec![] },
+            TaskSpec { title: "Old Task 2".into(), status: None, tags: vec![], deps: vec![] },
+        ]);
+
+        // Build incoming graph with new tasks
+        let mut incoming = Graph::new();
+        incoming.add_node({
+            let mut n = Node::new("new-task-a", "New Task A");
+            n.node_type = Some("task".into());
+            n
+        });
+        incoming.add_node({
+            let mut n = Node::new("new-task-b", "New Task B");
+            n.node_type = Some("task".into());
+            n
+        });
+
+        let (removed, added) = g.merge_feature_nodes("feat-auth", incoming);
+        assert_eq!(removed, 2);
+        assert_eq!(added, 2);
+
+        // Old tasks gone
+        assert!(g.get_node("task-auth-old-task-1").is_none());
+        assert!(g.get_node("task-auth-old-task-2").is_none());
+
+        // New tasks present
+        assert!(g.get_node("new-task-a").is_some());
+        assert!(g.get_node("new-task-b").is_some());
+
+        // Feature still exists
+        assert!(g.get_node("feat-auth").is_some());
+
+        // New implements edges
+        let implements: Vec<_> = g.edges.iter()
+            .filter(|e| e.relation == "implements" && e.to == "feat-auth")
+            .collect();
+        assert_eq!(implements.len(), 2);
+    }
+
+    #[test]
+    fn test_edge_cascade() {
+        let mut g = Graph::new();
+        g.add_feature("Auth", &[
+            TaskSpec { title: "Task X".into(), status: None, tags: vec![], deps: vec![] },
+        ]);
+
+        // Add extra edge to the old task
+        g.add_edge(Edge::new("task-auth-task-x", "some-other-node", "related_to"));
+        g.add_node(Node::new("some-other-node", "Other"));
+
+        // Before merge: task-auth-task-x has edges
+        assert!(g.edges.iter().any(|e| e.from == "task-auth-task-x"));
+
+        let (removed, _added) = g.merge_feature_nodes("feat-auth", Graph::new());
+
+        assert_eq!(removed, 1);
+        // Old task and all its edges removed
+        assert!(g.get_node("task-auth-task-x").is_none());
+        assert!(!g.edges.iter().any(|e| e.from == "task-auth-task-x" || e.to == "task-auth-task-x"));
+    }
+
+    #[test]
+    fn test_empty_merge() {
+        let mut g = Graph::new();
+        g.add_feature("Auth", &[
+            TaskSpec { title: "Task 1".into(), status: None, tags: vec![], deps: vec![] },
+            TaskSpec { title: "Task 2".into(), status: None, tags: vec![], deps: vec![] },
+        ]);
+
+        let (removed, added) = g.merge_feature_nodes("feat-auth", Graph::new());
+        assert_eq!(removed, 2);
+        assert_eq!(added, 0);
+
+        // Feature still exists
+        assert!(g.get_node("feat-auth").is_some());
+        // No implements edges left
+        let implements: Vec<_> = g.edges.iter()
+            .filter(|e| e.relation == "implements" && e.to == "feat-auth")
+            .collect();
+        assert_eq!(implements.len(), 0);
+    }
+
+    #[test]
+    fn test_edge_dedup_on_merge() {
+        let mut g = Graph::new();
+        g.add_feature("Auth", &[]);
+
+        let mut incoming = Graph::new();
+        incoming.add_node({
+            let mut n = Node::new("task-new", "New Task");
+            n.node_type = Some("task".into());
+            n
+        });
+
+        // First merge
+        g.merge_feature_nodes("feat-auth", incoming.clone());
+
+        // Second merge of same nodes (simulate re-merge)
+        // Remove the node first so add_node can re-add it
+        g.remove_node("task-new");
+        let mut incoming2 = Graph::new();
+        incoming2.add_node({
+            let mut n = Node::new("task-new", "New Task");
+            n.node_type = Some("task".into());
+            n
+        });
+        g.merge_feature_nodes("feat-auth", incoming2);
+
+        // Should not have duplicate implements edges
+        let implements: Vec<_> = g.edges.iter()
+            .filter(|e| e.from == "task-new" && e.to == "feat-auth" && e.relation == "implements")
+            .collect();
+        assert_eq!(implements.len(), 1);
     }
 }

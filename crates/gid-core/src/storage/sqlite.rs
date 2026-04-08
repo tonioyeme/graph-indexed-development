@@ -156,6 +156,46 @@ impl SqliteStorage {
 
         Ok(())
     }
+
+    /// Execute a batch of operations with FK enforcement disabled.
+    ///
+    /// Used by the migration pipeline to insert nodes and edges atomically,
+    /// even when edges reference nodes that don't exist (dangling edges are
+    /// migrated as warnings per GOAL-2.9).
+    pub fn execute_migration_batch(&self, ops: &[BatchOp]) -> Result<(), StorageError> {
+        let mut conn = self.conn.borrow_mut();
+        let tx = conn.transaction()?;
+
+        // Disable FK enforcement for migration
+        tx.execute_batch("PRAGMA foreign_keys = OFF")?;
+
+        for op in ops {
+            match op {
+                BatchOp::PutNode(node) => put_node_on(&tx, node)?,
+                BatchOp::DeleteNode(id) => {
+                    tx.execute("DELETE FROM nodes WHERE id = ?", params![id])?;
+                }
+                BatchOp::AddEdge(edge) => add_edge_on(&tx, edge)?,
+                BatchOp::RemoveEdge { from, to, relation } => {
+                    remove_edge_on(&tx, from, to, relation)?;
+                }
+                BatchOp::SetTags(node_id, tags) => set_tags_on(&tx, node_id, tags)?,
+                BatchOp::SetMetadata(node_id, metadata) => {
+                    set_metadata_on(&tx, node_id, metadata)?;
+                }
+                BatchOp::SetKnowledge(node_id, knowledge) => {
+                    set_knowledge_on(&tx, node_id, knowledge)?;
+                }
+            }
+        }
+
+        // Re-enable FK enforcement
+        tx.execute_batch("PRAGMA foreign_keys = ON")?;
+
+        tx.commit()?;
+        tracing::debug!(ops_count = ops.len(), "execute_migration_batch committed (FK-off)");
+        Ok(())
+    }
 }
 
 // ── row_to_node helper ─────────────────────────────────────

@@ -31,6 +31,8 @@ tree-sitter-rust = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-javascript = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha2 = { workspace = true }
+deunicode = "1.6"
 
 # Optional: SQLite storage backend
 rusqlite = { version = "0.32", features = ["bundled", "backup"], optional = true }

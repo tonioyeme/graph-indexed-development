@@ -1,4 +1,5 @@
 pub mod graph;
+pub mod slugify;
 pub mod query;
 pub mod parser;
 pub mod validator;
@@ -26,6 +27,7 @@ pub mod ritual;
 
 // Re-export commonly used types
 pub use graph::*;
+pub use slugify::slugify;
 pub use query::QueryEngine;
 pub use parser::{load_graph, save_graph, find_graph_file, find_graph_file_walk_up, find_project_root};
 pub use code_graph::{
@@ -47,7 +49,8 @@ pub use history::{HistoryManager, HistoryEntry, GraphDiff};
 pub use visual::{render, render_ascii, render_dot, render_mermaid, VisualFormat};
 pub use advise::{analyze, AnalysisResult, Advice, Severity, AdviceType};
 pub use design::{
-    generate_graph_prompt, generate_features_prompt, generate_components_prompt,
+    generate_graph_prompt, generate_scoped_graph_prompt,
+    generate_features_prompt, generate_components_prompt,
     parse_llm_response, parse_features_response, parse_components_response,
     build_graph_from_proposals, FeatureProposal, ComponentProposal, DesignResult,
 };
@@ -79,7 +82,6 @@ pub use complexity::{
 pub use lsp_client::{
     LspClient, LspEnrichmentStats, LspLocation, LspRefinementStats, LspServerConfig,
 };
-
 // Ritual re-exports (requires "ritual" feature)
 #[cfg(feature = "ritual")]
 pub use ritual::{

@@ -9,7 +9,7 @@ use chrono::Utc;
 use anyhow::Result;
 
 /// Record of a tool call made during exploration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     pub tool_name: String,
     pub timestamp: String,
@@ -17,7 +17,7 @@ pub struct ToolCallRecord {
 }
 
 /// Task node with knowledge storage capabilities
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeNode {
     /// Findings attached to this node (key-value pairs)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

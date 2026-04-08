@@ -185,6 +185,68 @@ Only output valid YAML. No explanation before or after.
 Start your response with "```yaml" and end with "```"."#, requirements)
 }
 
+/// Generate a graph prompt scoped to a single feature, including existing graph context.
+///
+/// Unlike `generate_graph_prompt()` which generates a full graph from scratch, this function
+/// generates ONLY new nodes for the specified feature while referencing existing nodes by ID.
+/// This avoids ID collisions and enables cross-feature dependency edges.
+pub fn generate_scoped_graph_prompt(
+    design_doc: &str,
+    existing_nodes: &[&Node],
+    feature_scope: &str,
+) -> String {
+    let existing_context = if existing_nodes.is_empty() {
+        "  (none — this is the first feature)\n".to_string()
+    } else {
+        existing_nodes
+            .iter()
+            .map(|n| {
+                let node_type = n.node_type.as_deref().unwrap_or("unknown");
+                format!("  - {} ({}): {}", n.id, node_type, n.title)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+
+    format!(
+        r#"You are a software architect. Generate ONLY the new graph nodes for feature "{feature_scope}".
+
+EXISTING GRAPH NODES (do NOT recreate these, reference them by ID in edges):
+{existing_context}
+NEW FEATURE DESIGN:
+{design_doc}
+
+Instructions:
+- Generate YAML with ONLY new nodes and edges for this feature
+- Use existing node IDs in edges for cross-feature dependencies
+- New task IDs should follow the pattern: task-{{feature-slug}}-{{task-slug}}
+- Create a feature node: feat-{{feature-slug}}
+- Each task should have: implements edge to the feature node
+- Add depends_on edges where tasks have dependencies
+
+Output format:
+```yaml
+nodes:
+  - id: ...
+    title: ...
+    node_type: task|feature
+    status: todo
+    ...
+edges:
+  - from: ...
+    to: ...
+    relation: implements|depends_on|...
+```
+
+Only output valid YAML. No explanation before or after.
+Start your response with "```yaml" and end with "```"."#,
+        feature_scope = feature_scope,
+        existing_context = existing_context,
+        design_doc = design_doc,
+    )
+}
+
 /// Parse an LLM response containing features JSON.
 pub fn parse_features_response(response: &str) -> Result<Vec<FeatureProposal>> {
     let json_str = extract_json(response)?;
@@ -454,5 +516,54 @@ edges: []
         
         let graph = build_graph_from_proposals("test", &features, &components);
         assert_eq!(graph.nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_scoped_prompt_includes_existing_node_context() {
+        let mut node1 = Node::new("feat-auth", "Authentication system");
+        node1.node_type = Some("feature".to_string());
+        let mut node2 = Node::new("task-auth-jwt", "Implement JWT validation");
+        node2.node_type = Some("task".to_string());
+
+        let existing: Vec<&Node> = vec![&node1, &node2];
+        let prompt = generate_scoped_graph_prompt(
+            "Add payment processing",
+            &existing,
+            "payments",
+        );
+
+        assert!(prompt.contains("feat-auth (feature): Authentication system"));
+        assert!(prompt.contains("task-auth-jwt (task): Implement JWT validation"));
+    }
+
+    #[test]
+    fn test_scoped_prompt_includes_design_doc() {
+        let design_doc = "Add Stripe-based payment processing with webhooks";
+        let prompt = generate_scoped_graph_prompt(design_doc, &[], "payments");
+
+        assert!(prompt.contains(design_doc));
+    }
+
+    #[test]
+    fn test_scoped_prompt_specifies_feature_scope() {
+        let prompt = generate_scoped_graph_prompt("Some design", &[], "payments");
+
+        assert!(prompt.contains(r#"feature "payments""#));
+    }
+
+    #[test]
+    fn test_scoped_prompt_with_empty_existing_nodes() {
+        let prompt = generate_scoped_graph_prompt(
+            "Build the first feature",
+            &[],
+            "initial-setup",
+        );
+
+        assert!(prompt.contains("(none — this is the first feature)"));
+        assert!(prompt.contains(r#"feature "initial-setup""#));
+        assert!(prompt.contains("Build the first feature"));
+        // Should still contain output format instructions
+        assert!(prompt.contains("implements|depends_on"));
+        assert!(prompt.contains("task-{feature-slug}-{task-slug}"));
     }
 }

@@ -6,12 +6,13 @@ mod llm_client;
 // ApiLlmClient now lives in gid-core (ritual::api_llm_client)
 
 use std::path::PathBuf;
+use std::path::Path;
 use std::collections::HashSet;
 use std::io::{self, Read};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use gid_core::{
-    Graph, Node, Edge, NodeStatus,
+    Graph, Node, Edge, NodeStatus, TaskSpec,
     load_graph, save_graph,
     parser::find_graph_file_walk_up,
     query::QueryEngine,
@@ -123,6 +124,36 @@ enum Commands {
         /// Node type (task, file, component, etc.)
         #[arg(long, name = "type")]
         node_type: Option<String>,
+    },
+
+    /// Add a feature with tasks in one command
+    AddFeature {
+        /// Feature name
+        name: String,
+        /// Task titles (repeat for each task)
+        #[arg(short, long = "task")]
+        tasks: Vec<String>,
+        /// Task dependencies: "task-title:depends-on-title" (repeat for each dep)
+        #[arg(short, long = "dep")]
+        deps: Vec<String>,
+    },
+
+    /// Add a standalone task (with optional feature parent)
+    AddTask {
+        /// Task title
+        title: String,
+        /// Parent feature ID (e.g., feat-auth)
+        #[arg(long = "for")]
+        for_feature: Option<String>,
+        /// Dependencies (node IDs or fuzzy references, repeat for each)
+        #[arg(short, long = "depends")]
+        depends: Vec<String>,
+        /// Tags (comma-separated)
+        #[arg(short, long)]
+        tags: Option<String>,
+        /// Priority (0=highest, 255=lowest)
+        #[arg(short, long)]
+        priority: Option<u8>,
     },
 
     /// Remove a node from the graph
@@ -340,6 +371,15 @@ enum Commands {
         /// Parse LLM response from stdin instead of generating prompt
         #[arg(long)]
         parse: bool,
+        /// Merge into existing graph instead of overwriting
+        #[arg(long)]
+        merge: bool,
+        /// Feature scope for merge (requires --merge)
+        #[arg(long, requires = "merge")]
+        scope: Option<String>,
+        /// Preview merge without saving (requires --merge)
+        #[arg(long, requires = "merge")]
+        dry_run: bool,
     },
 
     /// Generate LLM prompt to semantify the graph
@@ -391,6 +431,29 @@ enum Commands {
 
     /// Stop execution gracefully (marks cancel_requested)
     Stop,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Migration Commands (requires "sqlite" feature)
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Migrate graph data from YAML (graph.yml) to SQLite (graph.db)
+    Migrate {
+        /// Source YAML file (default: .gid/graph.yml)
+        #[arg(long)]
+        source: Option<PathBuf>,
+        /// Target SQLite database (default: .gid/graph.db)
+        #[arg(long)]
+        target: Option<PathBuf>,
+        /// Overwrite existing database
+        #[arg(long)]
+        force: bool,
+        /// Skip validation
+        #[arg(long)]
+        no_validate: bool,
+        /// Show detailed output
+        #[arg(short, long)]
+        verbose: bool,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // Ritual Commands (requires "ritual" feature)
@@ -629,6 +692,55 @@ fn main() -> Result<()> {
         Commands::AddNode { id, title, desc, status, tags, node_type } => {
             cmd_add_node(resolve_graph_path(cli.graph)?, &id, &title, desc, status, tags, node_type, cli.json)
         }
+        Commands::AddFeature { name, tasks, deps } => {
+            let graph_path = resolve_graph_path(cli.graph)?;
+            let mut graph = load_graph(&graph_path)?;
+
+            // Parse task specs - for CLI, all tasks start as todo with no tags
+            let mut task_specs: Vec<TaskSpec> = tasks.iter().map(|t| TaskSpec {
+                title: t.clone(),
+                status: None,
+                tags: vec![],
+                deps: vec![],
+            }).collect();
+
+            // Add deps from --dep flags (format: "from_title:to_title")
+            for dep_str in &deps {
+                if let Some((from_title, to_title)) = dep_str.split_once(':') {
+                    if let Some(spec) = task_specs.iter_mut().find(|s| s.title == from_title) {
+                        spec.deps.push(to_title.to_string());
+                    }
+                }
+            }
+
+            let feat_id = graph.add_feature(&name, &task_specs);
+            save_graph(&graph, &graph_path)?;
+
+            println!("✅ Created feature '{}' with {} tasks", feat_id, tasks.len());
+            let feature_slug = gid_core::slugify::slugify(&name);
+            for spec in &task_specs {
+                let slug = gid_core::slugify::slugify(&spec.title);
+                println!("  📋 task-{}-{}: {}", feature_slug, slug, spec.title);
+            }
+            Ok(())
+        }
+        Commands::AddTask { title, for_feature, depends, tags, priority } => {
+            let graph_path = resolve_graph_path(cli.graph)?;
+            let mut graph = load_graph(&graph_path)?;
+            let tag_vec: Vec<String> = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+
+            let task_id = graph.add_task(&title, for_feature.as_deref(), &depends, &tag_vec, priority);
+            save_graph(&graph, &graph_path)?;
+
+            println!("✅ Created task '{}'", task_id);
+            if let Some(ref feat) = for_feature {
+                println!("  🔗 implements → {}", feat);
+            }
+            for dep in &depends {
+                println!("  🔗 depends_on → {}", dep);
+            }
+            Ok(())
+        }
         Commands::RemoveNode { id } => cmd_remove_node(resolve_graph_path(cli.graph)?, &id, cli.json),
         Commands::AddEdge { from, to, relation } => {
             cmd_add_edge(resolve_graph_path(cli.graph)?, &from, &to, &relation, cli.json)
@@ -671,7 +783,7 @@ fn main() -> Result<()> {
         }
         Commands::Visual { format, output, layer } => cmd_visual(resolve_graph_path(cli.graph)?, &format, output.as_deref(), layer, cli.json),
         Commands::Advise { errors_only } => cmd_advise(resolve_graph_path(cli.graph)?, errors_only, cli.json),
-        Commands::Design { requirements, parse } => cmd_design(requirements, parse, cli.graph, cli.json),
+        Commands::Design { requirements, parse, merge, scope, dry_run } => cmd_design(requirements, parse, merge, scope, dry_run, cli.graph, cli.json),
         Commands::Semantify { heuristic, parse } => cmd_semantify(resolve_graph_path(cli.graph)?, heuristic, parse, cli.json),
         Commands::Refactor(rc) => match rc {
             RefactorCommands::Rename { old, new, apply } => {
@@ -696,6 +808,11 @@ fn main() -> Result<()> {
         Commands::Stats => cmd_stats(resolve_graph_path(cli.graph)?, cli.json),
         Commands::Approve => cmd_approve(resolve_graph_path(cli.graph)?, cli.json),
         Commands::Stop => cmd_stop(resolve_graph_path(cli.graph)?, cli.json),
+
+        // Migration command
+        Commands::Migrate { source, target, force, no_validate, verbose } => {
+            cmd_migrate(resolve_graph_path(cli.graph)?, source, target, force, no_validate, verbose, cli.json)
+        }
 
         // Ritual commands
         Commands::Ritual(rc) => {
@@ -1042,21 +1159,61 @@ fn cmd_remove_edge(path: PathBuf, from: &str, to: &str, relation: Option<&str>, 
     Ok(())
 }
 
+/// Resolve a node reference, handling disambiguation.
+/// Returns Ok(node_id) for unambiguous match, Err for no match or ambiguous.
+fn resolve_or_disambiguate(graph: &Graph, query: &str, json: bool) -> Result<String> {
+    let matches = graph.resolve_node(query);
+    match matches.len() {
+        0 => bail!("No node found matching '{}'", query),
+        1 => Ok(matches[0].id.clone()),
+        n => {
+            if json {
+                let match_list: Vec<_> = matches.iter().map(|m| {
+                    serde_json::json!({"id": &m.id, "title": &m.title, "type": m.node_type.as_deref()})
+                }).collect();
+                println!("{}", serde_json::json!({"ambiguous": true, "query": query, "matches": match_list}));
+                bail!("Ambiguous query '{}' — {} matches", query, n);
+            } else {
+                eprintln!("Ambiguous query \"{}\" — {} matches:", query, n);
+                for (i, m) in matches.iter().enumerate() {
+                    eprintln!("  {}. {} ({})", i + 1, m.id, m.node_type.as_deref().unwrap_or("?"));
+                }
+                eprintln!("Use a more specific query or pass the exact ID.");
+                bail!("Ambiguous query");
+            }
+        }
+    }
+}
+
+/// Resolve a node reference with layer-filtered graph, falling back to full graph.
+/// Reports if the node was found in a filtered-out layer.
+fn resolve_with_layer_fallback(filtered: &Graph, graph: &Graph, query: &str, layer: LayerFilter, json: bool) -> Result<String> {
+    match resolve_or_disambiguate(filtered, query, json) {
+        Ok(id) => Ok(id),
+        Err(_) => {
+            // Try full graph
+            if let Ok(id) = resolve_or_disambiguate(graph, query, json) {
+                let layer_name = graph.get_node(&id)
+                    .and_then(|n| n.source.as_deref())
+                    .unwrap_or("unknown");
+                bail!("Node '{}' exists but is not in the '{}' layer (found in '{}' layer)", id, match layer {
+                    LayerFilter::Code => "code",
+                    LayerFilter::Project => "project",
+                    LayerFilter::All => "all",
+                }, layer_name);
+            } else {
+                bail!("No node found matching '{}'", query);
+            }
+        }
+    }
+}
+
 fn cmd_query_impact(path: PathBuf, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
     let filtered = apply_layer_filter(&graph, layer);
 
-    if filtered.get_node(node).is_none() {
-        // Try original graph in case node was filtered out
-        if graph.get_node(node).is_some() {
-            bail!("Node '{}' exists but is not in the '{}' layer", node, match layer {
-                LayerFilter::Code => "code",
-                LayerFilter::Project => "project",
-                LayerFilter::All => "all",
-            });
-        }
-        bail!("Node not found: {}", node);
-    }
+    let resolved_id = resolve_with_layer_fallback(&filtered, &graph, node, layer, json)?;
+    let node = &resolved_id;
 
     let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
@@ -1093,16 +1250,8 @@ fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<
     let graph = load_graph(&path)?;
     let filtered = apply_layer_filter(&graph, layer);
 
-    if filtered.get_node(node).is_none() {
-        if graph.get_node(node).is_some() {
-            bail!("Node '{}' exists but is not in the '{}' layer", node, match layer {
-                LayerFilter::Code => "code",
-                LayerFilter::Project => "project",
-                LayerFilter::All => "all",
-            });
-        }
-        bail!("Node not found: {}", node);
-    }
+    let resolved_id = resolve_with_layer_fallback(&filtered, &graph, node, layer, json)?;
+    let node = &resolved_id;
 
     let engine = QueryEngine::new(&filtered);
     let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
@@ -1141,12 +1290,10 @@ fn cmd_query_deps(path: PathBuf, node: &str, transitive: bool, relation: Option<
 fn cmd_query_path(path: PathBuf, from: &str, to: &str, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
 
-    if graph.get_node(from).is_none() {
-        bail!("Node not found: {}", from);
-    }
-    if graph.get_node(to).is_none() {
-        bail!("Node not found: {}", to);
-    }
+    let resolved_from = resolve_or_disambiguate(&graph, from, json)?;
+    let from = &resolved_from;
+    let resolved_to = resolve_or_disambiguate(&graph, to, json)?;
+    let to = &resolved_to;
 
     let engine = QueryEngine::new(&graph);
     let result = engine.path(from, to);
@@ -1170,12 +1317,10 @@ fn cmd_query_path(path: PathBuf, from: &str, to: &str, json: bool) -> Result<()>
 fn cmd_query_common(path: PathBuf, a: &str, b: &str, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
 
-    if graph.get_node(a).is_none() {
-        bail!("Node not found: {}", a);
-    }
-    if graph.get_node(b).is_none() {
-        bail!("Node not found: {}", b);
-    }
+    let resolved_a = resolve_or_disambiguate(&graph, a, json)?;
+    let a = &resolved_a;
+    let resolved_b = resolve_or_disambiguate(&graph, b, json)?;
+    let b = &resolved_b;
 
     let engine = QueryEngine::new(&graph);
     let common = engine.common_cause(a, b);
@@ -1790,28 +1935,113 @@ fn cmd_advise(path: PathBuf, errors_only: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_design(requirements: Option<String>, parse: bool, graph_path: Option<PathBuf>, json: bool) -> Result<()> {
+fn cmd_design(requirements: Option<String>, parse: bool, merge: bool, scope: Option<String>, dry_run: bool, graph_path: Option<PathBuf>, json: bool) -> Result<()> {
     if parse {
         // Read LLM response from stdin and parse it
         let mut response = String::new();
         io::stdin().read_to_string(&mut response)?;
         
-        let graph = parse_llm_response(&response)?;
+        let incoming = parse_llm_response(&response)?;
         
-        if let Some(path) = graph_path {
-            // Save to specified path
-            save_graph(&graph, &path)?;
-            if json {
-                println!("{}", serde_json::json!({"success": true, "path": path.display().to_string()}));
+        if merge {
+            // Merge mode: requires a graph path
+            let path = match graph_path {
+                Some(p) => p,
+                None => resolve_graph_path(None)?,
+            };
+            let mut graph = load_graph(&path)?;
+            
+            if let Some(ref feature_id) = scope {
+                // Scoped merge: replace tasks under a specific feature
+                if dry_run {
+                    // Count old tasks (implements edges to feature_id)
+                    let old_task_count = graph.edges.iter()
+                        .filter(|e| e.to == *feature_id && e.relation == "implements")
+                        .count();
+                    let new_node_count = incoming.nodes.len();
+                    let new_edge_count = incoming.edges.len();
+                    
+                    if json {
+                        println!("{}", serde_json::json!({
+                            "dry_run": true,
+                            "feature_id": feature_id,
+                            "old_tasks": old_task_count,
+                            "new_nodes": new_node_count,
+                            "new_edges": new_edge_count,
+                        }));
+                    } else {
+                        println!("Dry run — merge preview for scope '{}'", feature_id);
+                        println!("  Old tasks to remove: {}", old_task_count);
+                        println!("  New nodes to add:    {}", new_node_count);
+                        println!("  New edges to add:    {}", new_edge_count);
+                        println!("\nRun without --dry-run to apply.");
+                    }
+                    return Ok(());
+                }
+                
+                let (removed, added) = graph.merge_feature_nodes(feature_id, incoming);
+                save_graph(&graph, &path)?;
+                
+                if json {
+                    println!("{}", serde_json::json!({
+                        "success": true,
+                        "path": path.display().to_string(),
+                        "feature_id": feature_id,
+                        "removed": removed,
+                        "added": added,
+                    }));
+                } else {
+                    println!("✓ Merged into '{}': removed {} old tasks, added {} new nodes", feature_id, removed, added);
+                    println!("  Saved to {}", path.display());
+                }
             } else {
-                println!("✓ Saved graph to {}", path.display());
+                // Unscoped merge: add nodes/edges if not already present
+                let mut nodes_added = 0usize;
+                let mut edges_added = 0usize;
+                
+                for node in incoming.nodes {
+                    if graph.get_node(&node.id).is_none() {
+                        graph.add_node(node);
+                        nodes_added += 1;
+                    }
+                }
+                for edge in incoming.edges {
+                    if graph.add_edge_dedup(edge) {
+                        edges_added += 1;
+                    }
+                }
+                
+                save_graph(&graph, &path)?;
+                
+                if json {
+                    println!("{}", serde_json::json!({
+                        "success": true,
+                        "path": path.display().to_string(),
+                        "nodes_added": nodes_added,
+                        "edges_added": edges_added,
+                    }));
+                } else {
+                    println!("✓ Merged: added {} nodes, {} edges", nodes_added, edges_added);
+                    println!("  Saved to {}", path.display());
+                }
             }
         } else {
-            // Output as YAML
-            if json {
-                println!("{}", serde_json::to_string_pretty(&graph)?);
+            // Overwrite mode (original behavior)
+            if let Some(path) = graph_path {
+                // Save to specified path
+                save_graph(&incoming, &path)?;
+                if json {
+                    println!("{}", serde_json::json!({"success": true, "path": path.display().to_string()}));
+                } else {
+                    println!("✓ Saved graph to {}", path.display());
+                }
             } else {
-                println!("{}", serde_yaml::to_string(&graph)?);
+                // Output as YAML
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&incoming)?);
+                } else {
+                    println!("{}", serde_yaml::to_string(&incoming)?);
+                }
             }
         }
     } else {
@@ -2733,6 +2963,111 @@ fn status_icon(status: &NodeStatus) -> &'static str {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Ritual Commands
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Migration command
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn cmd_migrate(
+    graph_path: PathBuf,
+    source: Option<PathBuf>,
+    target: Option<PathBuf>,
+    force: bool,
+    no_validate: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
+    use gid_core::storage::migration::{
+        migrate, MigrationConfig, MigrationStatus, ValidationLevel,
+    };
+
+    // Derive paths from graph_path (.gid/graph.yml)
+    let gid_dir = graph_path.parent().unwrap_or(Path::new(".gid"));
+    let source_path = source.unwrap_or_else(|| graph_path.clone());
+    let target_path = target.unwrap_or_else(|| gid_dir.join("graph.db"));
+    let backup_dir = gid_dir.join("backups");
+
+    let config = MigrationConfig {
+        source_path: source_path.clone(),
+        target_path: target_path.clone(),
+        backup_dir: Some(backup_dir),
+        validation_level: if no_validate {
+            ValidationLevel::None
+        } else {
+            ValidationLevel::Strict
+        },
+        force,
+        verbose,
+    };
+
+    if !json {
+        println!("Migrating: {} → {}", source_path.display(), target_path.display());
+        if force {
+            println!("  (--force: will overwrite existing DB)");
+        }
+    }
+
+    match migrate(&config) {
+        Ok(report) => {
+            if json {
+                let obj = serde_json::json!({
+                    "status": format!("{:?}", report.status),
+                    "nodes_migrated": report.nodes_migrated,
+                    "edges_migrated": report.edges_migrated,
+                    "knowledge_migrated": report.knowledge_migrated,
+                    "tags_migrated": report.tags_migrated,
+                    "metadata_migrated": report.metadata_migrated,
+                    "warnings": report.warnings.len(),
+                    "duration_ms": report.duration.as_millis(),
+                    "backup_path": report.backup_path.as_ref().map(|p| p.display().to_string()),
+                    "source_fingerprint": report.source_fingerprint,
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                let status_str = match report.status {
+                    MigrationStatus::Success => "✅ Success",
+                    MigrationStatus::SuccessWithWarnings => "⚠️  Success (with warnings)",
+                    MigrationStatus::Failed => "❌ Failed",
+                };
+                println!("\n{status_str}");
+                println!("  Nodes:      {}", report.nodes_migrated);
+                println!("  Edges:      {}", report.edges_migrated);
+                println!("  Knowledge:  {}", report.knowledge_migrated);
+                println!("  Tags:       {}", report.tags_migrated);
+                println!("  Metadata:   {}", report.metadata_migrated);
+                println!("  Duration:   {:?}", report.duration);
+                if let Some(ref backup) = report.backup_path {
+                    println!("  Backup:     {}", backup.display());
+                }
+                println!("  Fingerprint: {}", &report.source_fingerprint[..16]);
+
+                if !report.warnings.is_empty() {
+                    println!("\n  Warnings ({}):", report.warnings.len());
+                    let max_show = if verbose { report.warnings.len() } else { 10 };
+                    for (i, w) in report.warnings.iter().take(max_show).enumerate() {
+                        println!("    {}. {w}", i + 1);
+                    }
+                    if report.warnings.len() > max_show {
+                        println!("    ... and {} more (use --verbose to see all)", report.warnings.len() - max_show);
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                let obj = serde_json::json!({
+                    "error": e.to_string(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+                std::process::exit(1);
+            } else {
+                eprintln!("❌ Migration failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
 
 fn cmd_ritual_init(project_root: &std::path::Path, template_name: &str, json: bool) -> Result<()> {
     use gid_core::ritual::TemplateRegistry;
