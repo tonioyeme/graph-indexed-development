@@ -1105,4 +1105,358 @@ mod tests {
             "Non-dangling edge should be unchanged"
         );
     }
+
+    #[test]
+    fn test_debug_full_extract_with_cfg_test_calls() {
+        let content = r#"
+struct LeakDetector;
+impl LeakDetector {
+    fn new() -> Self { LeakDetector }
+}
+
+struct Sanitizer;
+impl Sanitizer {
+    fn new() -> Self { Sanitizer }
+    fn sanitize(&self, input: &str) -> String { input.to_string() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitizer_detect_system_injection() {
+        let _ld = LeakDetector::new();
+        let s = Sanitizer::new();
+        s.sanitize("hello");
+    }
+    
+    #[test]
+    fn test_sanitizer_clean() {
+        let s = Sanitizer::new();
+        s.sanitize("clean");
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, mut edges, _imports, struct_field_types) = extract_rust_tree_sitter("safety.rs", content, &mut parser, &mut class_map);
+
+        let mut func_map: HashMap<String, Vec<String>> = HashMap::new();
+        for n in &nodes {
+            if n.kind == NodeKind::Function {
+                func_map.entry(n.name.clone()).or_default().push(n.id.clone());
+            }
+        }
+        let mut method_to_class: HashMap<String, String> = HashMap::new();
+        for e in &edges {
+            if e.relation == EdgeRelation::DefinedIn && e.to.starts_with("class:") {
+                method_to_class.insert(e.from.clone(), e.to.clone());
+            }
+        }
+        let mut file_func_ids: HashSet<String> = HashSet::new();
+        for n in &nodes {
+            if n.kind == NodeKind::Function {
+                file_func_ids.insert(n.id.clone());
+            }
+        }
+        let mut node_pkg_map: HashMap<String, String> = HashMap::new();
+        for n in &nodes {
+            node_pkg_map.insert(n.id.clone(), String::new());
+        }
+        let file_imported_names: HashMap<String, HashSet<String>> = HashMap::new();
+
+        let tree = parser.parse(content, None).unwrap();
+        let root = tree.root_node();
+
+        extract_calls_rust(
+            root,
+            content.as_bytes(),
+            "safety.rs",
+            &func_map,
+            &method_to_class,
+            &file_func_ids,
+            &node_pkg_map,
+            &file_imported_names,
+            &struct_field_types,
+            &mut edges,
+        );
+
+        let call_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::Calls)
+            .collect();
+
+        eprintln!("\n=== CALL EDGES ===");
+        for e in &call_edges {
+            eprintln!("  {} -> {} (conf: {})", e.from, e.to, e.confidence);
+        }
+        
+        let bad_edges: Vec<_> = call_edges.iter()
+            .filter(|e| e.from.contains("test_") && !e.from.contains("tests::"))
+            .collect();
+        
+        assert!(bad_edges.is_empty(), 
+            "Found {} call edges without tests:: prefix: {:?}", 
+            bad_edges.len(),
+            bad_edges.iter().map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_impl_trait_for_primitive_no_dangling_edges() {
+        // When we have `impl Trait for str`, we should NOT create a class node
+        // for the primitive type `str`, and methods should be attributed to the trait.
+        let content = r#"
+trait ToTitleCase {
+    fn to_title_case(&self) -> String;
+}
+
+impl ToTitleCase for str {
+    fn to_title_case(&self) -> String {
+        self.to_string()
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("skills.rs", content, &mut parser, &mut class_map);
+
+        // Should have a class node for the trait
+        assert!(
+            nodes.iter().any(|n| n.id == "class:skills.rs:ToTitleCase"),
+            "Should have ToTitleCase trait node. Nodes: {:?}",
+            nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // Should NOT have a class node for `str`
+        assert!(
+            !nodes.iter().any(|n| n.id == "class:skills.rs:str"),
+            "Should NOT create a class node for primitive `str`. Nodes: {:?}",
+            nodes.iter().map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // The method should be attributed to the trait, not the primitive
+        let method_node = nodes.iter().find(|n| n.name == "to_title_case");
+        assert!(method_node.is_some(), "Should have to_title_case method node");
+        let method_id = &method_node.unwrap().id;
+        assert!(
+            method_id.contains("ToTitleCase"),
+            "Method should be attributed to trait, got: {}",
+            method_id
+        );
+
+        // No edges should reference a non-existent node
+        let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        for edge in &edges {
+            // Skip external references (class_ref:, module_ref:)
+            if edge.to.starts_with("class_ref:") || edge.to.starts_with("module_ref:") {
+                continue;
+            }
+            assert!(
+                node_ids.contains(edge.from.as_str()),
+                "Dangling edge FROM: {} → {} (relation: {:?})",
+                edge.from, edge.to, edge.relation
+            );
+            assert!(
+                node_ids.contains(edge.to.as_str()) || edge.to.starts_with("file:"),
+                "Dangling edge TO: {} → {} (relation: {:?})",
+                edge.from, edge.to, edge.relation
+            );
+        }
+
+        // No inherits edge from primitive to trait
+        assert!(
+            !edges.iter().any(|e| e.from.contains(":str") && e.relation == EdgeRelation::Inherits),
+            "Should NOT have inherits edge from primitive `str`. Edges: {:?}",
+            edges.iter().filter(|e| e.relation == EdgeRelation::Inherits)
+                .map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_impl_trait_for_multiple_primitives_no_dangling() {
+        // Test with multiple primitive types
+        let content = r#"
+trait MyTrait {
+    fn do_something(&self) -> String;
+}
+
+impl MyTrait for i32 {
+    fn do_something(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl MyTrait for bool {
+    fn do_something(&self) -> String {
+        if *self { "true".into() } else { "false".into() }
+    }
+}
+
+impl MyTrait for f64 {
+    fn do_something(&self) -> String {
+        format!("{:.2}", self)
+    }
+}
+
+pub struct MyStruct;
+impl MyTrait for MyStruct {
+    fn do_something(&self) -> String {
+        "struct".into()
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("multi.rs", content, &mut parser, &mut class_map);
+
+        // Should NOT have class nodes for primitives
+        for prim in &["i32", "bool", "f64"] {
+            assert!(
+                !nodes.iter().any(|n| n.id == format!("class:multi.rs:{}", prim)),
+                "Should NOT create class node for primitive `{}`",
+                prim
+            );
+        }
+
+        // SHOULD have class node for MyStruct
+        assert!(
+            nodes.iter().any(|n| n.id == "class:multi.rs:MyStruct"),
+            "Should have MyStruct class node"
+        );
+
+        // MyStruct impl should produce inherits edge
+        assert!(
+            edges.iter().any(|e| e.from.contains("MyStruct") && e.relation == EdgeRelation::Inherits),
+            "MyStruct should have inherits edge to MyTrait"
+        );
+
+        // Primitives should NOT produce inherits edges
+        for prim in &["i32", "bool", "f64"] {
+            assert!(
+                !edges.iter().any(|e| e.from.contains(&format!(":{}", prim)) && e.relation == EdgeRelation::Inherits),
+                "Primitive `{}` should NOT have inherits edge",
+                prim
+            );
+        }
+
+        // Methods from primitive impls should be attributed to the trait
+        let prim_methods: Vec<_> = nodes.iter()
+            .filter(|n| n.kind == NodeKind::Function && n.name == "do_something")
+            .collect();
+        // One method from the trait definition + 4 impl methods (3 primitive + 1 struct)
+        // But primitive impls attribute to trait, so we may see duplicates
+        // The key check: no method should reference a primitive type
+        for m in &prim_methods {
+            assert!(
+                !m.id.contains(":i32.") && !m.id.contains(":bool.") && !m.id.contains(":f64."),
+                "Method should not reference primitive in ID: {}",
+                m.id
+            );
+        }
+
+        // No dangling edges
+        let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        for edge in &edges {
+            if edge.to.starts_with("class_ref:") || edge.to.starts_with("module_ref:") {
+                continue;
+            }
+            assert!(
+                node_ids.contains(edge.from.as_str()),
+                "Dangling edge FROM: {} → {}",
+                edge.from, edge.to
+            );
+            assert!(
+                node_ids.contains(edge.to.as_str()) || edge.to.starts_with("file:"),
+                "Dangling edge TO: {} → {}",
+                edge.from, edge.to
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_rust_primitive_or_builtin() {
+        // Primitives
+        assert!(is_rust_primitive_or_builtin("str"));
+        assert!(is_rust_primitive_or_builtin("String"));
+        assert!(is_rust_primitive_or_builtin("i32"));
+        assert!(is_rust_primitive_or_builtin("u64"));
+        assert!(is_rust_primitive_or_builtin("bool"));
+        assert!(is_rust_primitive_or_builtin("char"));
+        assert!(is_rust_primitive_or_builtin("f64"));
+        assert!(is_rust_primitive_or_builtin("usize"));
+        assert!(is_rust_primitive_or_builtin("isize"));
+
+        // Std library types
+        assert!(is_rust_primitive_or_builtin("Vec"));
+        assert!(is_rust_primitive_or_builtin("Option"));
+        assert!(is_rust_primitive_or_builtin("HashMap"));
+        assert!(is_rust_primitive_or_builtin("Arc"));
+
+        // User-defined types should NOT match
+        assert!(!is_rust_primitive_or_builtin("MyStruct"));
+        assert!(!is_rust_primitive_or_builtin("CodeGraph"));
+        assert!(!is_rust_primitive_or_builtin("UserService"));
+        assert!(!is_rust_primitive_or_builtin("Calculator"));
+    }
+
+    #[test]
+    fn test_impl_trait_for_user_type_still_works() {
+        // Ensure the fix doesn't break normal impl blocks
+        let content = r#"
+pub trait Greeter {
+    fn greet(&self) -> String;
+}
+
+pub struct Person {
+    name: String,
+}
+
+impl Greeter for Person {
+    fn greet(&self) -> String {
+        format!("Hello, {}", self.name)
+    }
+}
+
+impl Person {
+    pub fn new(name: String) -> Self {
+        Self { name }
+    }
+}
+"#;
+        let mut parser = Parser::new();
+        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+
+        let mut class_map = HashMap::new();
+        let (nodes, edges, _, _) = extract_rust_tree_sitter("person.rs", content, &mut parser, &mut class_map);
+
+        // Should have class nodes for both trait and struct
+        assert!(nodes.iter().any(|n| n.id == "class:person.rs:Greeter"));
+        assert!(nodes.iter().any(|n| n.id == "class:person.rs:Person"));
+
+        // greet method should be attributed to Person (not the trait)
+        assert!(
+            nodes.iter().any(|n| n.id == "method:person.rs:Person.greet"),
+            "greet should be attributed to Person. Nodes: {:?}",
+            nodes.iter().filter(|n| n.name == "greet").map(|n| &n.id).collect::<Vec<_>>()
+        );
+
+        // new method should be attributed to Person
+        assert!(
+            nodes.iter().any(|n| n.id == "method:person.rs:Person.new"),
+            "new should be attributed to Person"
+        );
+
+        // Should have inherits edge from Person to Greeter
+        assert!(
+            edges.iter().any(|e| e.from.contains("Person") && e.relation == EdgeRelation::Inherits),
+            "Person should have inherits edge"
+        );
+    }
 }

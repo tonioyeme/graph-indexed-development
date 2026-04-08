@@ -330,24 +330,46 @@ pub(crate) fn extract_rust_node(
                 None => return,
             };
 
+            let is_primitive = is_rust_primitive_or_builtin(&type_name);
+
             // Look for existing type node or create reference
             let type_id = class_id_map.get(&type_name)
                 .cloned()
                 .unwrap_or_else(|| format!("class:{}:{}", path, type_name));
 
-            // If this is a trait impl, add inheritance edge
+            // Determine the parent ID for methods in this impl block.
+            // For primitives/builtins with a trait impl, attribute methods to the trait
+            // instead of creating a dangling class node for the primitive.
+            let method_parent_id = if is_primitive {
+                if let Some(ref trait_n) = trait_name {
+                    // Use the trait's class ID as parent for methods
+                    class_id_map.get(trait_n)
+                        .cloned()
+                        .unwrap_or_else(|| format!("class:{}:{}", path, trait_n))
+                } else {
+                    // impl for a bare primitive with no trait — skip entirely
+                    // (e.g., `impl str { ... }` is invalid Rust, but handle gracefully)
+                    return;
+                }
+            } else {
+                type_id.clone()
+            };
+
+            // If this is a trait impl, add inheritance edge (skip for primitives)
             if let Some(ref trait_n) = trait_name {
-                edges.push(CodeEdge {
-                    from: type_id.clone(),
-                    to: format!("class_ref:{}", trait_n),
-                    relation: EdgeRelation::Inherits,
-                    weight: 0.5,
-                    call_count: 1,
-                    in_error_path: false,
-                    confidence: 1.0,
-                    call_site_line: None,
-                    call_site_column: None,
-                });
+                if !is_primitive {
+                    edges.push(CodeEdge {
+                        from: type_id.clone(),
+                        to: format!("class_ref:{}", trait_n),
+                        relation: EdgeRelation::Inherits,
+                        weight: 0.5,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 1.0,
+                        call_site_line: None,
+                        call_site_column: None,
+                    });
+                }
             }
 
             // Extract methods from impl block
@@ -355,7 +377,7 @@ pub(crate) fn extract_rust_node(
                 let mut body_cursor = body.walk();
                 for body_child in body.children(&mut body_cursor) {
                     if body_child.kind() == "function_item" {
-                        extract_rust_method(body_child, source, source_str, path, &type_id, nodes, edges);
+                        extract_rust_method(body_child, source, source_str, path, &method_parent_id, nodes, edges);
                     }
                 }
             }
@@ -788,6 +810,35 @@ pub(crate) fn infer_receiver_type(
     };
     
     fields.get(field_name).cloned()
+}
+
+/// Check if a type name is a Rust primitive or well-known standard library type.
+///
+/// These types are NOT defined in user source files, so creating `class:file.rs:str`
+/// nodes for them would produce dangling edges. When we encounter `impl Trait for str`,
+/// methods should be attributed to the trait instead.
+pub(crate) fn is_rust_primitive_or_builtin(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "str" | "String"
+        | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+        | "u8" | "u16" | "u32" | "u64" | "u128" | "usize"
+        | "f32" | "f64"
+        | "bool" | "char"
+        | "Vec" | "Option" | "Result" | "Box" | "Rc" | "Arc"
+        | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet"
+        | "Cow" | "Cell" | "RefCell" | "Mutex" | "RwLock"
+        | "Pin" | "Future" | "Iterator" | "IntoIterator"
+        | "Display" | "Debug" | "Clone" | "Copy" | "Default"
+        | "From" | "Into" | "TryFrom" | "TryInto"
+        | "AsRef" | "AsMut" | "Borrow" | "BorrowMut"
+        | "Deref" | "DerefMut" | "Drop"
+        | "PartialEq" | "Eq" | "PartialOrd" | "Ord" | "Hash"
+        | "Send" | "Sync" | "Sized" | "Unpin"
+        | "Fn" | "FnMut" | "FnOnce"
+        | "Read" | "Write" | "Seek" | "BufRead"
+        | "Error" | "Any"
+    )
 }
 
 /// Extract the base type name from a Rust type annotation.
