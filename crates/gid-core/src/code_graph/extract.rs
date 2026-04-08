@@ -59,6 +59,12 @@ fn collect_source_files(
         .max_depth(20)
         .into_iter()
         .filter_entry(|e| {
+            // Always enter the root directory (depth 0) — the user explicitly
+            // chose this path, so we should respect it even if the directory
+            // name starts with '.' (e.g. temp dirs like .tmpXXXX).
+            if e.depth() == 0 {
+                return true;
+            }
             let name = e.file_name().to_str().unwrap_or("");
             !name.starts_with('.')
                 && name != "node_modules"
@@ -1586,19 +1592,16 @@ fn compute_file_delta_with_mtime(
     for (rel_path, content, _lang) in current_files {
         if let Some(stored) = metadata.files.get(rel_path.as_str()) {
             // File exists in both — check if changed
-            // Quick check: mtime
+            let content_hash = xxh64(content.as_bytes(), 0);
             let mtime = get_file_mtime(dir, rel_path);
-            if mtime == stored.mtime {
+            if mtime == stored.mtime && content_hash == stored.content_hash {
+                // Both mtime and content match — definitely unchanged
+                delta.unchanged.push(rel_path.clone());
+            } else if content_hash == stored.content_hash {
+                // Content same despite mtime change (e.g. touch)
                 delta.unchanged.push(rel_path.clone());
             } else {
-                // mtime changed — verify with content hash
-                let content_hash = xxh64(content.as_bytes(), 0);
-                if content_hash == stored.content_hash {
-                    // Content same despite mtime change (e.g. touch)
-                    delta.unchanged.push(rel_path.clone());
-                } else {
-                    delta.modified.push(rel_path.clone());
-                }
+                delta.modified.push(rel_path.clone());
             }
         } else {
             // New file

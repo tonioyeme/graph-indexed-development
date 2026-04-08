@@ -496,6 +496,19 @@ enum Commands {
     /// Ritual pipeline orchestration
     #[command(subcommand)]
     Ritual(RitualCommands),
+
+    /// Watch source directory and auto-sync code graph on file changes
+    Watch {
+        /// Directory to watch (default: current directory)
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// Debounce interval in milliseconds (default: 1000)
+        #[arg(long, default_value = "1000")]
+        debounce: u64,
+        /// Skip semantify/bridge edge generation (faster)
+        #[arg(long)]
+        no_semantify: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -921,6 +934,9 @@ fn main() -> Result<()> {
                 RitualCommands::Cancel => cmd_ritual_cancel(&cwd, cli.json),
                 RitualCommands::Templates => cmd_ritual_templates(&cwd, cli.json),
             }
+        }
+        Commands::Watch { dir, debounce, no_semantify } => {
+            cmd_watch(&dir, debounce, no_semantify, cli.graph.as_ref())
         }
     }
 }
@@ -4415,4 +4431,127 @@ fn phase_kind_name(kind: &gid_core::ritual::PhaseKind) -> &'static str {
         PhaseKind::Harness { .. } => "harness",
         PhaseKind::Shell { .. } => "shell",
     }
+}
+
+// =============================================================================
+// Watch Command
+// =============================================================================
+
+fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_semantify: bool, graph_override: Option<&PathBuf>) -> Result<()> {
+    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+    use std::sync::mpsc::channel;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use gid_core::watch::{WatchConfig, sync_on_change, should_trigger_sync};
+    use gid_core::ignore::load_ignore_list;
+
+    let dir = if dir.is_absolute() {
+        dir.clone()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+
+    if !dir.exists() {
+        bail!("Directory not found: {}", dir.display());
+    }
+
+    // Resolve .gid/ directory
+    let gid_dir = if let Some(graph_path) = graph_override {
+        graph_path.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".gid"))
+    } else {
+        find_graph_file_walk_up(&dir)
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| {
+                std::env::current_dir().ok()
+                    .and_then(|cwd| find_graph_file_walk_up(&cwd))
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            })
+            .unwrap_or_else(|| dir.join(".gid"))
+    };
+
+    if !gid_dir.exists() {
+        bail!(".gid/ directory not found. Run 'gid init' first, or specify --graph <path>.");
+    }
+
+    let ignore_list = load_ignore_list(&dir);
+
+    let config = WatchConfig {
+        watch_dir: dir.clone(),
+        gid_dir: gid_dir.clone(),
+        debounce_ms,
+        lsp: false,
+        no_semantify,
+    };
+
+    eprintln!("👁 Watching {} for changes (debounce: {}ms)", dir.display(), debounce_ms);
+    eprintln!("   Graph: {}/graph.yml", gid_dir.display());
+    eprintln!("   Press Ctrl+C to stop.\n");
+
+    // Initial sync to ensure graph is up-to-date
+    match sync_on_change(&config) {
+        Ok(result) if result.graph_modified => {
+            eprintln!("♻ Initial sync: {} files, {} nodes, {} edges ({}ms)",
+                result.files_changed, result.code_nodes, result.code_edges, result.duration_ms);
+        }
+        Ok(_) => eprintln!("✓ Graph is up-to-date."),
+        Err(e) => eprintln!("⚠ Initial sync failed: {}", e),
+    }
+
+    // Set up file watcher
+    let (tx, rx) = channel();
+    let mut watcher = RecommendedWatcher::new(tx, Config::default())
+        .context("failed to create file watcher")?;
+
+    watcher.watch(&dir, RecursiveMode::Recursive)
+        .context("failed to start watching directory")?;
+
+    // Set up Ctrl+C handler
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    }).context("failed to set Ctrl+C handler")?;
+
+    while running.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(Ok(event)) => {
+                // Check if any changed path is relevant
+                let relevant = event.paths.iter().any(|p| {
+                    should_trigger_sync(p, &dir, &gid_dir, &ignore_list)
+                });
+
+                if !relevant {
+                    continue;
+                }
+
+                // Debounce: drain any queued events within the debounce window
+                std::thread::sleep(Duration::from_millis(debounce_ms));
+                while rx.try_recv().is_ok() {}
+
+                // Panic-safe extraction
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sync_on_change(&config)
+                }));
+
+                match result {
+                    Ok(Ok(r)) if r.graph_modified => {
+                        eprintln!("♻ Synced: {} files changed, {} nodes, {} edges ({}ms)",
+                            r.files_changed, r.code_nodes, r.code_edges, r.duration_ms);
+                    }
+                    Ok(Ok(_)) => {} // no change
+                    Ok(Err(e)) => eprintln!("⚠ Extraction error: {}", e),
+                    Err(_) => eprintln!("⚠ Extraction panicked, continuing watch"),
+                }
+            }
+            Ok(Err(e)) => eprintln!("⚠ Watch error: {}", e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    eprintln!("\n👋 Watch stopped.");
+    Ok(())
 }

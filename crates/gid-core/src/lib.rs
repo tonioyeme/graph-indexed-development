@@ -21,6 +21,7 @@ pub mod lsp_daemon;
 pub mod harness;
 pub mod storage;
 pub mod identity;
+pub mod watch;
 
 // Ritual module (requires "ritual" feature)
 #[cfg(feature = "ritual")]
