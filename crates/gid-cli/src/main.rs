@@ -31,6 +31,8 @@ use gid_core::{
     preview_merge, apply_merge,
     preview_split, apply_split, SplitDefinition,
     preview_extract, apply_extract,
+    // Storage
+    storage::{StorageBackend, load_graph_auto, save_graph_auto},
     // Harness
     harness::{
         create_plan,
@@ -47,6 +49,10 @@ struct Cli {
     /// Path to graph file (default: auto-find .gid/graph.yml)
     #[arg(short, long, global = true)]
     graph: Option<PathBuf>,
+
+    /// Storage backend: yaml or sqlite (default: auto-detect)
+    #[arg(long, global = true)]
+    backend: Option<String>,
 
     /// Output as JSON instead of human-readable text
     #[arg(long, global = true)]
@@ -682,19 +688,39 @@ fn apply_layer_filter(graph: &Graph, layer: LayerFilter) -> Graph {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // For commands that use the graph, resolve context with backend detection.
+    // Commands that don't need the graph (Init, code-graph commands) skip this.
+    let backend_arg = cli.backend.clone();
+
     match cli.command {
         Commands::Init { name, desc } => cmd_init(name, desc, cli.json),
-        Commands::Read { layer } => cmd_read(resolve_graph_path(cli.graph)?, layer, cli.json),
-        Commands::Validate => cmd_validate(resolve_graph_path(cli.graph)?, cli.json),
-        Commands::Tasks { status, ready, layer } => cmd_tasks(resolve_graph_path(cli.graph)?, status, ready, layer, cli.json),
-        Commands::TaskUpdate { id, status } => cmd_task_update(resolve_graph_path(cli.graph)?, &id, &status, cli.json),
-        Commands::Complete { id } => cmd_complete(resolve_graph_path(cli.graph)?, &id, cli.json),
+        Commands::Read { layer } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_read_ctx(&ctx, layer, cli.json)
+        }
+        Commands::Validate => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_validate_ctx(&ctx, cli.json)
+        }
+        Commands::Tasks { status, ready, layer } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_tasks_ctx(&ctx, status, ready, layer, cli.json)
+        }
+        Commands::TaskUpdate { id, status } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_task_update_ctx(&ctx, &id, &status, cli.json)
+        }
+        Commands::Complete { id } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_complete_ctx(&ctx, &id, cli.json)
+        }
         Commands::AddNode { id, title, desc, status, tags, node_type } => {
-            cmd_add_node(resolve_graph_path(cli.graph)?, &id, &title, desc, status, tags, node_type, cli.json)
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_add_node_ctx(&ctx, &id, &title, desc, status, tags, node_type, cli.json)
         }
         Commands::AddFeature { name, tasks, deps } => {
-            let graph_path = resolve_graph_path(cli.graph)?;
-            let mut graph = load_graph(&graph_path)?;
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            let mut graph = ctx.load()?;
 
             // Parse task specs - for CLI, all tasks start as todo with no tags
             let mut task_specs: Vec<TaskSpec> = tasks.iter().map(|t| TaskSpec {
@@ -714,7 +740,7 @@ fn main() -> Result<()> {
             }
 
             let feat_id = graph.add_feature(&name, &task_specs);
-            save_graph(&graph, &graph_path)?;
+            ctx.save(&graph)?;
 
             println!("✅ Created feature '{}' with {} tasks", feat_id, tasks.len());
             let feature_slug = gid_core::slugify::slugify(&name);
@@ -725,12 +751,12 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::AddTask { title, for_feature, depends, tags, priority } => {
-            let graph_path = resolve_graph_path(cli.graph)?;
-            let mut graph = load_graph(&graph_path)?;
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            let mut graph = ctx.load()?;
             let tag_vec: Vec<String> = tags.map(|t| t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
 
             let task_id = graph.add_task(&title, for_feature.as_deref(), &depends, &tag_vec, priority);
-            save_graph(&graph, &graph_path)?;
+            ctx.save(&graph)?;
 
             println!("✅ Created task '{}'", task_id);
             if let Some(ref feat) = for_feature {
@@ -741,23 +767,34 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Commands::RemoveNode { id } => cmd_remove_node(resolve_graph_path(cli.graph)?, &id, cli.json),
+        Commands::RemoveNode { id } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_remove_node_ctx(&ctx, &id, cli.json)
+        }
         Commands::AddEdge { from, to, relation } => {
-            cmd_add_edge(resolve_graph_path(cli.graph)?, &from, &to, &relation, cli.json)
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_add_edge_ctx(&ctx, &from, &to, &relation, cli.json)
         }
         Commands::RemoveEdge { from, to, relation } => {
-            cmd_remove_edge(resolve_graph_path(cli.graph)?, &from, &to, relation.as_deref(), cli.json)
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_remove_edge_ctx(&ctx, &from, &to, relation.as_deref(), cli.json)
         }
-        Commands::Query(qc) => match qc {
-            QueryCommands::Impact { node, relation, layer, type_filter } => cmd_query_impact(resolve_graph_path(cli.graph)?, &node, relation.as_deref(), layer, type_filter.as_deref(), cli.json),
-            QueryCommands::Deps { node, transitive, relation, layer, type_filter } => {
-                cmd_query_deps(resolve_graph_path(cli.graph)?, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), cli.json)
+        Commands::Query(qc) => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            match qc {
+                QueryCommands::Impact { node, relation, layer, type_filter } => cmd_query_impact_ctx(&ctx, &node, relation.as_deref(), layer, type_filter.as_deref(), cli.json),
+                QueryCommands::Deps { node, transitive, relation, layer, type_filter } => {
+                    cmd_query_deps_ctx(&ctx, &node, transitive, relation.as_deref(), layer, type_filter.as_deref(), cli.json)
+                }
+                QueryCommands::Path { from, to } => cmd_query_path_ctx(&ctx, &from, &to, cli.json),
+                QueryCommands::CommonCause { a, b } => cmd_query_common_ctx(&ctx, &a, &b, cli.json),
+                QueryCommands::Topo => cmd_query_topo_ctx(&ctx, cli.json),
             }
-            QueryCommands::Path { from, to } => cmd_query_path(resolve_graph_path(cli.graph)?, &from, &to, cli.json),
-            QueryCommands::CommonCause { a, b } => cmd_query_common(resolve_graph_path(cli.graph)?, &a, &b, cli.json),
-            QueryCommands::Topo => cmd_query_topo(resolve_graph_path(cli.graph)?, cli.json),
-        },
-        Commands::EditGraph { operations } => cmd_edit_graph(resolve_graph_path(cli.graph)?, &operations, cli.json),
+        }
+        Commands::EditGraph { operations } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_edit_graph_ctx(&ctx, &operations, cli.json)
+        }
         Commands::Extract { dir, format, output, lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, lsp, force, no_semantify, cli.graph.as_ref()),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
@@ -772,36 +809,50 @@ fn main() -> Result<()> {
         
         // New commands
         Commands::History(hc) => {
-            let graph_path = resolve_graph_path(cli.graph)?;
-            let gid_dir = graph_path.parent().unwrap_or(std::path::Path::new("."));
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             match hc {
-                HistoryCommands::List => cmd_history_list(gid_dir, cli.json),
-                HistoryCommands::Save { message } => cmd_history_save(&graph_path, gid_dir, message.as_deref(), cli.json),
-                HistoryCommands::Diff { version } => cmd_history_diff(&graph_path, gid_dir, &version, cli.json),
-                HistoryCommands::Restore { version, force } => cmd_history_restore(&graph_path, gid_dir, &version, force, cli.json),
+                HistoryCommands::List => cmd_history_list(&ctx.gid_dir, cli.json),
+                HistoryCommands::Save { message } => cmd_history_save(&ctx.graph_yml, &ctx.gid_dir, message.as_deref(), cli.json),
+                HistoryCommands::Diff { version } => cmd_history_diff(&ctx.graph_yml, &ctx.gid_dir, &version, cli.json),
+                HistoryCommands::Restore { version, force } => cmd_history_restore(&ctx.graph_yml, &ctx.gid_dir, &version, force, cli.json),
             }
         }
-        Commands::Visual { format, output, layer } => cmd_visual(resolve_graph_path(cli.graph)?, &format, output.as_deref(), layer, cli.json),
-        Commands::Advise { errors_only } => cmd_advise(resolve_graph_path(cli.graph)?, errors_only, cli.json),
+        Commands::Visual { format, output, layer } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_visual_ctx(&ctx, &format, output.as_deref(), layer, cli.json)
+        }
+        Commands::Advise { errors_only } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_advise_ctx(&ctx, errors_only, cli.json)
+        }
         Commands::Design { requirements, parse, merge, scope, dry_run } => cmd_design(requirements, parse, merge, scope, dry_run, cli.graph, cli.json),
-        Commands::Semantify { heuristic, parse } => cmd_semantify(resolve_graph_path(cli.graph)?, heuristic, parse, cli.json),
-        Commands::Refactor(rc) => match rc {
-            RefactorCommands::Rename { old, new, apply } => {
-                cmd_refactor_rename(resolve_graph_path(cli.graph)?, &old, &new, apply, cli.json)
+        Commands::Semantify { heuristic, parse } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_semantify_ctx(&ctx, heuristic, parse, cli.json)
+        }
+        Commands::Refactor(rc) => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            match rc {
+                RefactorCommands::Rename { old, new, apply } => {
+                    cmd_refactor_rename_ctx(&ctx, &old, &new, apply, cli.json)
+                }
+                RefactorCommands::Merge { a, b, new_id, apply } => {
+                    cmd_refactor_merge_ctx(&ctx, &a, &b, &new_id, apply, cli.json)
+                }
+                RefactorCommands::Split { node, into, apply } => {
+                    cmd_refactor_split_ctx(&ctx, &node, &into, apply, cli.json)
+                }
+                RefactorCommands::Extract { nodes, parent, title, apply } => {
+                    cmd_refactor_extract_ctx(&ctx, &nodes, &parent, &title, apply, cli.json)
+                }
             }
-            RefactorCommands::Merge { a, b, new_id, apply } => {
-                cmd_refactor_merge(resolve_graph_path(cli.graph)?, &a, &b, &new_id, apply, cli.json)
-            }
-            RefactorCommands::Split { node, into, apply } => {
-                cmd_refactor_split(resolve_graph_path(cli.graph)?, &node, &into, apply, cli.json)
-            }
-            RefactorCommands::Extract { nodes, parent, title, apply } => {
-                cmd_refactor_extract(resolve_graph_path(cli.graph)?, &nodes, &parent, &title, apply, cli.json)
-            }
-        },
+        }
 
         // Task Harness commands
-        Commands::Plan { format } => cmd_plan(resolve_graph_path(cli.graph)?, &format, cli.json),
+        Commands::Plan { format } => {
+            let ctx = resolve_graph_ctx(cli.graph.clone(), backend_arg.clone())?;
+            cmd_plan_ctx(&ctx, &format, cli.json)
+        }
         Commands::Execute { max_concurrent, model, approval_mode, dry_run } => {
             cmd_execute(resolve_graph_path(cli.graph)?, max_concurrent, model, approval_mode, dry_run, cli.json)
         }
@@ -850,6 +901,522 @@ fn resolve_graph_path(provided: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
+// =============================================================================
+// Backend-Aware Graph Context
+// =============================================================================
+
+/// Resolved graph location with backend information.
+///
+/// Carries the `.gid/` directory path plus the selected backend,
+/// enabling commands to use either YAML or SQLite transparently.
+struct GraphContext {
+    /// Path to the `.gid/` directory.
+    gid_dir: PathBuf,
+    /// Path to graph.yml (for backward compatibility with history, etc.)
+    graph_yml: PathBuf,
+    /// Selected storage backend.
+    backend: StorageBackend,
+}
+
+impl GraphContext {
+    /// Load the full graph from the resolved backend.
+    fn load(&self) -> Result<Graph> {
+        load_graph_auto(&self.gid_dir, Some(self.backend))
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    /// Save the full graph to the resolved backend.
+    fn save(&self, graph: &Graph) -> Result<()> {
+        save_graph_auto(graph, &self.gid_dir, Some(self.backend))
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+}
+
+/// Resolve graph context: find `.gid/` directory, parse backend flag, auto-detect.
+fn resolve_graph_ctx(graph_arg: Option<PathBuf>, backend_arg: Option<String>) -> Result<GraphContext> {
+    // Find the graph.yml path (which tells us where .gid/ is)
+    let graph_yml = resolve_graph_path(graph_arg)?;
+    let gid_dir = graph_yml.parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+
+    // Parse explicit backend flag
+    let explicit_backend = match backend_arg {
+        Some(ref s) => Some(s.parse::<StorageBackend>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?),
+        None => None,
+    };
+
+    // Resolve backend (explicit or auto-detect)
+    let backend = gid_core::storage::resolve_backend(explicit_backend, &gid_dir);
+
+    Ok(GraphContext {
+        gid_dir,
+        graph_yml,
+        backend,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Backend-Aware Command Wrappers
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// These _ctx functions load/save the graph via GraphContext (auto-detect
+// YAML vs SQLite backend). They delegate to the existing command logic
+// by using ctx.load() / ctx.save() instead of load_graph() / save_graph().
+
+fn cmd_read_ctx(ctx: &GraphContext, layer: LayerFilter, json: bool) -> Result<()> {
+    let graph = ctx.load()?;
+    let filtered = apply_layer_filter(&graph, layer);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&filtered)?);
+    } else {
+        let yaml = serde_yaml::to_string(&filtered)?;
+        print!("{}", yaml);
+    }
+    Ok(())
+}
+
+fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
+    let graph = ctx.load()?;
+    let validator = Validator::new(&graph);
+    let result = validator.validate();
+    if json {
+        println!("{}", serde_json::json!({
+            "valid": result.is_valid(),
+            "issues": result.issue_count(),
+            "orphan_nodes": result.orphan_nodes,
+            "missing_refs": result.missing_refs.iter().map(|r| {
+                serde_json::json!({"from": r.edge_from, "to": r.edge_to, "missing": r.missing_node})
+            }).collect::<Vec<_>>(),
+            "cycles": result.cycles,
+            "duplicate_nodes": result.duplicate_nodes,
+        }));
+    } else {
+        println!("{}", result);
+    }
+    if !result.is_valid() {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn cmd_tasks_ctx(ctx: &GraphContext, status_filter: Option<String>, ready_only: bool, layer: LayerFilter, json: bool) -> Result<()> {
+    let graph = ctx.load()?;
+    let filtered = apply_layer_filter(&graph, layer);
+    let tasks: Vec<&Node> = if ready_only {
+        filtered.ready_tasks()
+    } else if let Some(status_str) = &status_filter {
+        let status: NodeStatus = status_str.parse()?;
+        filtered.tasks_by_status(&status)
+    } else {
+        filtered.nodes.iter().collect()
+    };
+    if json {
+        let tasks_json: Vec<_> = tasks.iter().map(|t| {
+            serde_json::json!({
+                "id": t.id,
+                "title": t.title,
+                "status": t.status.to_string(),
+                "tags": t.tags,
+                "description": t.description,
+            })
+        }).collect();
+        let summary = filtered.summary();
+        println!("{}", serde_json::json!({
+            "tasks": tasks_json,
+            "summary": {
+                "total": summary.total_nodes,
+                "todo": summary.todo,
+                "in_progress": summary.in_progress,
+                "done": summary.done,
+                "blocked": summary.blocked,
+                "ready": summary.ready,
+            }
+        }));
+    } else {
+        if tasks.is_empty() {
+            println!("No tasks found.");
+        } else {
+            for task in &tasks {
+                let tags = if task.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", task.tags.join(", "))
+                };
+                println!("{} {} — {}{}", status_icon(&task.status), task.id, task.title, tags);
+            }
+        }
+        let summary = filtered.summary();
+        println!("\n{}", summary);
+    }
+    Ok(())
+}
+
+fn cmd_task_update_ctx(ctx: &GraphContext, id: &str, status_str: &str, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    let status: NodeStatus = status_str.parse()?;
+    if !graph.update_status(id, status.clone()) {
+        bail!("Node not found: {}", id);
+    }
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({"success": true, "id": id, "status": status.to_string()}));
+    } else {
+        println!("✓ Updated {} to {}", id, status);
+    }
+    Ok(())
+}
+
+fn cmd_complete_ctx(ctx: &GraphContext, id: &str, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    if graph.get_node(id).is_none() {
+        bail!("Node not found: {}", id);
+    }
+    let ready_before: HashSet<String> = graph.ready_tasks().iter().map(|n| n.id.clone()).collect();
+    graph.update_status(id, NodeStatus::Done);
+    ctx.save(&graph)?;
+    let ready_after: HashSet<String> = graph.ready_tasks().iter().map(|n| n.id.clone()).collect();
+    let newly_unblocked: Vec<&String> = ready_after.difference(&ready_before).collect();
+    if json {
+        println!("{}", serde_json::json!({"success": true, "id": id, "newly_unblocked": newly_unblocked}));
+    } else {
+        println!("✓ Completed: {}", id);
+        if !newly_unblocked.is_empty() {
+            println!("\n🔓 Newly unblocked tasks:");
+            for task_id in newly_unblocked {
+                if let Some(task) = graph.get_node(task_id) {
+                    println!("   {} — {}", task.id, task.title);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_add_node_ctx(
+    ctx: &GraphContext,
+    id: &str, title: &str, desc: Option<String>,
+    status: Option<String>, tags: Option<String>, node_type: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let mut graph = ctx.load()?;
+    if graph.get_node(id).is_some() {
+        bail!("Node already exists: {}", id);
+    }
+    let mut node = Node::new(id, title);
+    if let Some(d) = desc { node.description = Some(d); }
+    if let Some(s) = status { node.status = s.parse()?; }
+    if let Some(t) = tags {
+        node.tags = t.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    }
+    if let Some(nt) = node_type { node.node_type = Some(nt); }
+    graph.add_node(node);
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({"success": true, "id": id}));
+    } else {
+        println!("✓ Added node: {} — {}", id, title);
+    }
+    Ok(())
+}
+
+fn cmd_remove_node_ctx(ctx: &GraphContext, id: &str, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    if graph.get_node(id).is_none() {
+        bail!("Node not found: {}", id);
+    }
+    graph.remove_node(id);
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({"success": true, "id": id}));
+    } else {
+        println!("✓ Removed node: {}", id);
+    }
+    Ok(())
+}
+
+fn cmd_add_edge_ctx(ctx: &GraphContext, from: &str, to: &str, relation: &str, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    if graph.get_node(from).is_none() {
+        bail!("Source node not found: {}", from);
+    }
+    if graph.get_node(to).is_none() {
+        bail!("Target node not found: {}", to);
+    }
+    graph.add_edge(Edge::new(from, to, relation));
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({"success": true, "from": from, "to": to, "relation": relation}));
+    } else {
+        println!("✓ Added edge: {} —[{}]→ {}", from, relation, to);
+    }
+    Ok(())
+}
+
+fn cmd_remove_edge_ctx(ctx: &GraphContext, from: &str, to: &str, relation: Option<&str>, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    let before = graph.edges.len();
+    if let Some(rel) = relation {
+        graph.edges.retain(|e| !(e.from == from && e.to == to && e.relation == rel));
+    } else {
+        graph.edges.retain(|e| !(e.from == from && e.to == to));
+    }
+    let removed = before - graph.edges.len();
+    if removed == 0 {
+        bail!("No matching edge found");
+    }
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({"success": true, "removed": removed}));
+    } else {
+        println!("✓ Removed {} edge(s): {} → {}", removed, from, to);
+    }
+    Ok(())
+}
+
+fn cmd_query_impact_ctx(ctx: &GraphContext, node: &str, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+    // For SQLite backend, load graph into memory and use same logic as YAML
+    match ctx.backend {
+        StorageBackend::Yaml => cmd_query_impact(ctx.graph_yml.clone(), node, relation, layer, type_filter, json),
+        _ => {
+            let graph = ctx.load()?;
+            let filtered = apply_layer_filter(&graph, layer);
+            let engine = QueryEngine::new(&filtered);
+            let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+            let impacted = match &rels {
+                Some(r) => engine.impact_filtered(node, Some(r)),
+                None => engine.impact(node),
+            };
+            let impacted: Vec<&Node> = if let Some(tf) = type_filter {
+                impacted.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+            } else {
+                impacted
+            };
+            if json {
+                let nodes: Vec<_> = impacted.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title})).collect();
+                println!("{}", serde_json::json!({"node": node, "impacted": nodes}));
+            } else {
+                if impacted.is_empty() {
+                    println!("No nodes would be affected by changes to '{}'", node);
+                } else {
+                    println!("Changes to '{}' would affect {} node(s):", node, impacted.len());
+                    for n in &impacted { println!("  {} — {}", n.id, n.title); }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_query_deps_ctx(ctx: &GraphContext, node: &str, transitive: bool, relation: Option<&str>, layer: LayerFilter, type_filter: Option<&str>, json: bool) -> Result<()> {
+    match ctx.backend {
+        StorageBackend::Yaml => cmd_query_deps(ctx.graph_yml.clone(), node, transitive, relation, layer, type_filter, json),
+        _ => {
+            let graph = ctx.load()?;
+            let filtered = apply_layer_filter(&graph, layer);
+            let engine = QueryEngine::new(&filtered);
+            let rels: Option<Vec<&str>> = relation.map(|r| r.split(',').map(|s| s.trim()).collect());
+            let deps = match &rels {
+                Some(r) => engine.deps_filtered(node, transitive, Some(r)),
+                None => engine.deps(node, transitive),
+            };
+            let deps: Vec<&Node> = if let Some(tf) = type_filter {
+                deps.into_iter().filter(|n| n.node_type.as_deref() == Some(tf)).collect()
+            } else {
+                deps
+            };
+            if json {
+                let nodes: Vec<_> = deps.iter().map(|n| serde_json::json!({"id": n.id, "title": n.title, "status": n.status.to_string()})).collect();
+                println!("{}", serde_json::json!({"node": node, "transitive": transitive, "dependencies": nodes}));
+            } else {
+                let label = if transitive { "Transitive" } else { "Direct" };
+                if deps.is_empty() {
+                    println!("'{}' has no {} dependencies", node, label.to_lowercase());
+                } else {
+                    println!("{} dependencies of '{}' ({}):", label, node, deps.len());
+                    for n in &deps { println!("  {} {} — {}", status_icon(&n.status), n.id, n.title); }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_query_path_ctx(ctx: &GraphContext, from: &str, to: &str, json: bool) -> Result<()> {
+    match ctx.backend {
+        StorageBackend::Yaml => cmd_query_path(ctx.graph_yml.clone(), from, to, json),
+        _ => {
+            let graph = ctx.load()?;
+            let engine = QueryEngine::new(&graph);
+            let result = engine.path(from, to);
+            if json {
+                println!("{}", serde_json::json!({"from": from, "to": to, "path": result}));
+            } else {
+                match result {
+                    Some(p) => {
+                        println!("Path from '{}' to '{}' ({} hops):", from, to, p.len() - 1);
+                        println!("  {}", p.join(" → "));
+                    }
+                    None => println!("No path found between '{}' and '{}'", from, to),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_query_common_ctx(ctx: &GraphContext, a: &str, b: &str, json: bool) -> Result<()> {
+    match ctx.backend {
+        StorageBackend::Yaml => cmd_query_common(ctx.graph_yml.clone(), a, b, json),
+        _ => {
+            let graph = ctx.load()?;
+            let engine = QueryEngine::new(&graph);
+            let common = engine.common_cause(a, b);
+            if json {
+                let ids: Vec<&str> = common.iter().map(|n| n.id.as_str()).collect();
+                println!("{}", serde_json::json!({"a": a, "b": b, "common_ancestors": ids}));
+            } else {
+                if common.is_empty() {
+                    println!("No common ancestors between {} and {}", a, b);
+                } else {
+                    println!("Common ancestors of {} and {}:", a, b);
+                    for n in &common { println!("  {} — {}", n.id, n.title); }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_query_topo_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
+    match ctx.backend {
+        StorageBackend::Yaml => cmd_query_topo(ctx.graph_yml.clone(), json),
+        _ => {
+            let graph = ctx.load()?;
+            let engine = QueryEngine::new(&graph);
+            match engine.topological_sort() {
+                Ok(order) => {
+                    if json {
+                        println!("{}", serde_json::json!({"order": order}));
+                    } else {
+                        println!("Topological order ({} nodes):", order.len());
+                        for (i, id) in order.iter().enumerate() {
+                            if let Some(node) = graph.get_node(id) {
+                                println!("  {}. {} — {}", i + 1, node.id, node.title);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if json { println!("{}", serde_json::json!({"error": e.to_string()})); }
+                    else { println!("Error: {}", e); }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_edit_graph_ctx(ctx: &GraphContext, operations_json: &str, json: bool) -> Result<()> {
+    let mut graph = ctx.load()?;
+    let ops: Vec<serde_json::Value> = serde_json::from_str(operations_json)
+        .context("Invalid JSON array for operations")?;
+    let mut added_nodes = 0;
+    let mut added_edges = 0;
+    let mut removed = 0;
+    let mut updated = 0;
+    for op in &ops {
+        let op_type = op["op"].as_str().unwrap_or("");
+        match op_type {
+            "add_node" => {
+                let id = op["id"].as_str().unwrap_or("");
+                let title = op["title"].as_str().unwrap_or(id);
+                if !id.is_empty() {
+                    let mut node = Node::new(id, title);
+                    if let Some(s) = op["status"].as_str() { node.status = s.parse().unwrap_or_default(); }
+                    if let Some(d) = op["description"].as_str() { node.description = Some(d.to_string()); }
+                    if let Some(t) = op["type"].as_str() { node.node_type = Some(t.to_string()); }
+                    graph.add_node(node);
+                    added_nodes += 1;
+                }
+            }
+            "add_edge" => {
+                let from = op["from"].as_str().unwrap_or("");
+                let to = op["to"].as_str().unwrap_or("");
+                let rel = op["relation"].as_str().unwrap_or("depends_on");
+                if !from.is_empty() && !to.is_empty() {
+                    graph.add_edge(Edge::new(from, to, rel));
+                    added_edges += 1;
+                }
+            }
+            "remove_node" => {
+                let id = op["id"].as_str().unwrap_or("");
+                if !id.is_empty() { graph.remove_node(id); removed += 1; }
+            }
+            "update_status" => {
+                let id = op["id"].as_str().unwrap_or("");
+                let status = op["status"].as_str().unwrap_or("");
+                if !id.is_empty() && !status.is_empty() {
+                    if let Ok(s) = status.parse() {
+                        graph.update_status(id, s);
+                        updated += 1;
+                    }
+                }
+            }
+            _ => {
+                eprintln!("Warning: unknown operation '{}'", op_type);
+            }
+        }
+    }
+    ctx.save(&graph)?;
+    if json {
+        println!("{}", serde_json::json!({
+            "success": true,
+            "added_nodes": added_nodes,
+            "added_edges": added_edges,
+            "removed": removed,
+            "updated": updated
+        }));
+    } else {
+        println!("✓ Applied {} operations: {} nodes added, {} edges added, {} removed, {} updated",
+            ops.len(), added_nodes, added_edges, removed, updated);
+    }
+    Ok(())
+}
+
+fn cmd_visual_ctx(ctx: &GraphContext, format: &str, output: Option<&std::path::Path>, layer: LayerFilter, json: bool) -> Result<()> {
+    cmd_visual(ctx.graph_yml.clone(), format, output, layer, json)
+}
+
+fn cmd_advise_ctx(ctx: &GraphContext, errors_only: bool, json: bool) -> Result<()> {
+    cmd_advise(ctx.graph_yml.clone(), errors_only, json)
+}
+
+fn cmd_semantify_ctx(ctx: &GraphContext, heuristic: bool, parse: bool, json: bool) -> Result<()> {
+    cmd_semantify(ctx.graph_yml.clone(), heuristic, parse, json)
+}
+
+fn cmd_refactor_rename_ctx(ctx: &GraphContext, old: &str, new: &str, apply: bool, json: bool) -> Result<()> {
+    cmd_refactor_rename(ctx.graph_yml.clone(), old, new, apply, json)
+}
+
+fn cmd_refactor_merge_ctx(ctx: &GraphContext, a: &str, b: &str, new_id: &str, apply: bool, json: bool) -> Result<()> {
+    cmd_refactor_merge(ctx.graph_yml.clone(), a, b, new_id, apply, json)
+}
+
+fn cmd_refactor_split_ctx(ctx: &GraphContext, node: &str, into: &[String], apply: bool, json: bool) -> Result<()> {
+    cmd_refactor_split(ctx.graph_yml.clone(), node, into, apply, json)
+}
+
+fn cmd_refactor_extract_ctx(ctx: &GraphContext, nodes: &[String], parent: &str, title: &str, apply: bool, json: bool) -> Result<()> {
+    cmd_refactor_extract(ctx.graph_yml.clone(), nodes, parent, title, apply, json)
+}
+
+fn cmd_plan_ctx(ctx: &GraphContext, format: &str, json: bool) -> Result<()> {
+    cmd_plan(ctx.graph_yml.clone(), format, json)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Original Commands (updated for --json)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -891,6 +1458,7 @@ fn cmd_init(name: Option<String>, desc: Option<String>, json: bool) -> Result<()
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_read(path: PathBuf, layer: LayerFilter, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
     let filtered = apply_layer_filter(&graph, layer);
@@ -903,6 +1471,7 @@ fn cmd_read(path: PathBuf, layer: LayerFilter, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_validate(path: PathBuf, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
     let validator = Validator::new(&graph);
@@ -929,6 +1498,7 @@ fn cmd_validate(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, layer: LayerFilter, json: bool) -> Result<()> {
     let graph = load_graph(&path)?;
     let filtered = apply_layer_filter(&graph, layer);
@@ -984,6 +1554,7 @@ fn cmd_tasks(path: PathBuf, status_filter: Option<String>, ready_only: bool, lay
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_task_update(path: PathBuf, id: &str, status_str: &str, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
     let status: NodeStatus = status_str.parse()?;
@@ -1006,6 +1577,7 @@ fn cmd_task_update(path: PathBuf, id: &str, status_str: &str, json: bool) -> Res
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_complete(path: PathBuf, id: &str, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
 
@@ -1051,6 +1623,7 @@ fn cmd_complete(path: PathBuf, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_add_node(
     path: PathBuf,
     id: &str,
@@ -1092,6 +1665,7 @@ fn cmd_add_node(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_remove_node(path: PathBuf, id: &str, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
 
@@ -1109,6 +1683,7 @@ fn cmd_remove_node(path: PathBuf, id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_add_edge(path: PathBuf, from: &str, to: &str, relation: &str, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
 
@@ -1137,6 +1712,7 @@ fn cmd_add_edge(path: PathBuf, from: &str, to: &str, relation: &str, json: bool)
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_remove_edge(path: PathBuf, from: &str, to: &str, relation: Option<&str>, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
 
@@ -1372,6 +1948,7 @@ fn cmd_query_topo(path: PathBuf, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn cmd_edit_graph(path: PathBuf, operations_json: &str, json: bool) -> Result<()> {
     let mut graph = load_graph(&path)?;
 

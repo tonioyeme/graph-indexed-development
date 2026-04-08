@@ -48,6 +48,19 @@ impl From<rusqlite::Error> for StorageError {
     }
 }
 
+// ── Edge traversal direction ───────────────────────────────
+
+/// Direction for BFS neighbor traversal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Follow edges where the current node is `from_node` (outgoing).
+    Outgoing,
+    /// Follow edges where the current node is `to_node` (incoming).
+    Incoming,
+    /// Follow edges in both directions.
+    Both,
+}
+
 // ── SqliteStorage struct ───────────────────────────────────
 
 pub struct SqliteStorage {
@@ -195,6 +208,83 @@ impl SqliteStorage {
         tx.commit()?;
         tracing::debug!(ops_count = ops.len(), "execute_migration_batch committed (FK-off)");
         Ok(())
+    }
+
+    /// BFS k-hop neighbor query using a recursive CTE.
+    ///
+    /// Returns all nodes reachable within `depth` hops from node `id`,
+    /// following edges in the specified `direction`. The root node itself
+    /// is included in the result (at depth 0).
+    ///
+    /// - `depth = 0` returns only the root node.
+    /// - Maximum depth is capped at 10 to prevent runaway CTEs on large graphs.
+    ///
+    /// This is an **inherent method** (not on `GraphStorage` trait) because
+    /// recursive CTEs are a SQL-specific feature. Used internally by the
+    /// context assembly pipeline.
+    pub fn neighbors(
+        &self,
+        id: &str,
+        depth: usize,
+        direction: Direction,
+    ) -> Result<Vec<Node>, StorageError> {
+        let conn = self.conn.borrow();
+        let effective_depth = depth.min(10);
+
+        let sql = match direction {
+            Direction::Outgoing => {
+                "WITH RECURSIVE hop(nid, d) AS (
+                     VALUES(?1, 0)
+                   UNION
+                     SELECT e.to_node, hop.d + 1
+                     FROM edges e
+                     JOIN hop ON e.from_node = hop.nid
+                     WHERE hop.d < ?2
+                 )
+                 SELECT DISTINCT n.* FROM hop
+                 JOIN nodes n ON n.id = hop.nid"
+            }
+            Direction::Incoming => {
+                "WITH RECURSIVE hop(nid, d) AS (
+                     VALUES(?1, 0)
+                   UNION
+                     SELECT e.from_node, hop.d + 1
+                     FROM edges e
+                     JOIN hop ON e.to_node = hop.nid
+                     WHERE hop.d < ?2
+                 )
+                 SELECT DISTINCT n.* FROM hop
+                 JOIN nodes n ON n.id = hop.nid"
+            }
+            Direction::Both => {
+                "WITH RECURSIVE hop(nid, d) AS (
+                     VALUES(?1, 0)
+                   UNION
+                     SELECT CASE WHEN e.from_node = hop.nid THEN e.to_node
+                                 ELSE e.from_node END,
+                            hop.d + 1
+                     FROM edges e
+                     JOIN hop ON (e.from_node = hop.nid OR e.to_node = hop.nid)
+                     WHERE hop.d < ?2
+                 )
+                 SELECT DISTINCT n.* FROM hop
+                 JOIN nodes n ON n.id = hop.nid"
+            }
+        };
+
+        let mut stmt = conn.prepare(sql)?;
+        let nodes: Vec<Node> = stmt
+            .query_map(params![id, effective_depth as i64], row_to_node)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        drop(stmt);
+        drop(conn);
+
+        let mut nodes = nodes;
+        for node in &mut nodes {
+            self.load_node_extras(node)?;
+        }
+        Ok(nodes)
     }
 }
 
@@ -991,5 +1081,1040 @@ mod tests {
         let mut ids = storage.get_all_node_ids().unwrap();
         ids.sort();
         assert_eq!(ids, vec!["x", "y"]);
+    }
+
+    // ── neighbors() BFS tests ──────────────────────────────
+
+    /// Build a linear graph: A → B → C → D
+    fn setup_linear_graph() -> SqliteStorage {
+        let s = temp_storage();
+        for id in &["a", "b", "c", "d"] {
+            s.put_node(&Node::new(id, &id.to_uppercase())).unwrap();
+        }
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("b", "c", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("c", "d", "depends_on")).unwrap();
+        s
+    }
+
+    /// Build a diamond graph: A → B, A → C, B → D, C → D
+    fn setup_diamond_graph() -> SqliteStorage {
+        let s = temp_storage();
+        for id in &["a", "b", "c", "d"] {
+            s.put_node(&Node::new(id, &id.to_uppercase())).unwrap();
+        }
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("a", "c", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("b", "d", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("c", "d", "depends_on")).unwrap();
+        s
+    }
+
+    #[test]
+    fn test_neighbors_depth_zero_returns_self() {
+        let s = setup_linear_graph();
+        let result = s.neighbors("a", 0, Direction::Both).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "a");
+    }
+
+    #[test]
+    fn test_neighbors_outgoing_depth_1() {
+        let s = setup_linear_graph();
+        let result = s.neighbors("a", 1, Direction::Outgoing).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_neighbors_outgoing_depth_2() {
+        let s = setup_linear_graph();
+        let result = s.neighbors("a", 2, Direction::Outgoing).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_neighbors_outgoing_full_chain() {
+        let s = setup_linear_graph();
+        let result = s.neighbors("a", 10, Direction::Outgoing).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_incoming_depth_1() {
+        let s = setup_linear_graph();
+        // D has incoming edge from C
+        let result = s.neighbors("d", 1, Direction::Incoming).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_incoming_full_chain() {
+        let s = setup_linear_graph();
+        // Walking backwards from D: D ← C ← B ← A
+        let result = s.neighbors("d", 10, Direction::Incoming).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_outgoing_leaf_node() {
+        let s = setup_linear_graph();
+        // D is a leaf — no outgoing edges
+        let result = s.neighbors("d", 5, Direction::Outgoing).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "d");
+    }
+
+    #[test]
+    fn test_neighbors_incoming_root_node() {
+        let s = setup_linear_graph();
+        // A is a root — no incoming edges
+        let result = s.neighbors("a", 5, Direction::Incoming).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "a");
+    }
+
+    #[test]
+    fn test_neighbors_both_from_middle() {
+        let s = setup_linear_graph();
+        // B can reach A (incoming) and C (outgoing) at depth 1
+        let result = s.neighbors("b", 1, Direction::Both).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_neighbors_both_full_reach() {
+        let s = setup_linear_graph();
+        // From B, with enough depth, should reach all nodes in both directions
+        let result = s.neighbors("b", 10, Direction::Both).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_diamond_outgoing() {
+        let s = setup_diamond_graph();
+        // A → B and A → C at depth 1, then B → D and C → D at depth 2
+        let result = s.neighbors("a", 2, Direction::Outgoing).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_diamond_incoming_from_d() {
+        let s = setup_diamond_graph();
+        // D ← B and D ← C at depth 1; B ← A and C ← A at depth 2
+        let result = s.neighbors("d", 2, Direction::Incoming).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn test_neighbors_nonexistent_node() {
+        let s = setup_linear_graph();
+        let result = s.neighbors("zzz", 5, Direction::Both).unwrap();
+        // Node doesn't exist in nodes table, so JOIN yields nothing
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_neighbors_depth_capped_at_10() {
+        let s = setup_linear_graph();
+        // depth=100 should behave same as depth=10 (cap)
+        let r1 = s.neighbors("a", 100, Direction::Outgoing).unwrap();
+        let r2 = s.neighbors("a", 10, Direction::Outgoing).unwrap();
+        let mut ids1: Vec<&str> = r1.iter().map(|n| n.id.as_str()).collect();
+        let mut ids2: Vec<&str> = r2.iter().map(|n| n.id.as_str()).collect();
+        ids1.sort();
+        ids2.sort();
+        assert_eq!(ids1, ids2);
+    }
+
+    #[test]
+    fn test_neighbors_loads_extras() {
+        let s = temp_storage();
+        let node = Node::new("n1", "Node One")
+            .with_tags(vec!["important".into()]);
+        s.put_node(&node).unwrap();
+        s.put_node(&Node::new("n2", "Node Two")).unwrap();
+        s.add_edge(&Edge::new("n1", "n2", "depends_on")).unwrap();
+
+        let result = s.neighbors("n1", 1, Direction::Outgoing).unwrap();
+        let n1 = result.iter().find(|n| n.id == "n1").unwrap();
+        assert_eq!(n1.tags, vec!["important"]);
+    }
+
+    #[test]
+    fn test_neighbors_mixed_relations() {
+        // Edges with different relation types should all be traversed
+        let s = temp_storage();
+        for id in &["a", "b", "c"] {
+            s.put_node(&Node::new(id, &id.to_uppercase())).unwrap();
+        }
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("a", "c", "calls")).unwrap();
+
+        let result = s.neighbors("a", 1, Direction::Outgoing).unwrap();
+        let mut ids: Vec<&str> = result.iter().map(|n| n.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_neighbors_isolated_node() {
+        let s = temp_storage();
+        s.put_node(&Node::new("lonely", "Lonely Node")).unwrap();
+        let result = s.neighbors("lonely", 5, Direction::Both).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "lonely");
+    }
+
+    // ── CRUD edge cases ────────────────────────────────────
+
+    #[test]
+    fn test_put_node_all_fields() {
+        let s = temp_storage();
+        let mut node = Node::new("full", "Fully Populated Node");
+        node.status = NodeStatus::InProgress;
+        node.description = Some("A comprehensive test node".into());
+        node.node_type = Some("function".into());
+        node.file_path = Some("src/storage/sqlite.rs".into());
+        node.lang = Some("rust".into());
+        node.start_line = Some(42);
+        node.end_line = Some(100);
+        node.signature = Some("fn do_stuff(&self) -> Result<()>".into());
+        node.visibility = Some("pub".into());
+        node.doc_comment = Some("/// Does important stuff".into());
+        node.body_hash = Some("abc123def456".into());
+        node.node_kind = Some("method".into());
+        node.owner = Some("potato".into());
+        node.source = Some("code_extract".into());
+        node.repo = Some("gid-rs".into());
+        node.priority = Some(3);
+        node.assigned_to = Some("rustclaw".into());
+        node.parent_id = Some("parent-mod".into());
+        node.depth = Some(2);
+        node.complexity = Some(4.5);
+        node.is_public = Some(true);
+        node.body = Some("fn do_stuff(&self) -> Result<()> { Ok(()) }".into());
+        node.created_at = Some("2026-04-07T12:00:00Z".into());
+        node.updated_at = Some("2026-04-08T01:00:00Z".into());
+        node.tags = vec!["important".into(), "tested".into()];
+        node.metadata.insert("design_ref".into(), serde_json::json!("3.2"));
+        node.knowledge = KnowledgeNode {
+            findings: {
+                let mut f = HashMap::new();
+                f.insert("f1".into(), "found something".into());
+                f
+            },
+            file_cache: HashMap::new(),
+            tool_history: vec![],
+        };
+
+        s.put_node(&node).unwrap();
+        let loaded = s.get_node("full").unwrap().expect("node should exist");
+
+        assert_eq!(loaded.id, "full");
+        assert_eq!(loaded.title, "Fully Populated Node");
+        assert_eq!(loaded.status, NodeStatus::InProgress);
+        assert_eq!(loaded.description.as_deref(), Some("A comprehensive test node"));
+        assert_eq!(loaded.node_type.as_deref(), Some("function"));
+        assert_eq!(loaded.file_path.as_deref(), Some("src/storage/sqlite.rs"));
+        assert_eq!(loaded.lang.as_deref(), Some("rust"));
+        assert_eq!(loaded.start_line, Some(42));
+        assert_eq!(loaded.end_line, Some(100));
+        assert_eq!(loaded.signature.as_deref(), Some("fn do_stuff(&self) -> Result<()>"));
+        assert_eq!(loaded.visibility.as_deref(), Some("pub"));
+        assert_eq!(loaded.doc_comment.as_deref(), Some("/// Does important stuff"));
+        assert_eq!(loaded.body_hash.as_deref(), Some("abc123def456"));
+        assert_eq!(loaded.node_kind.as_deref(), Some("method"));
+        assert_eq!(loaded.owner.as_deref(), Some("potato"));
+        assert_eq!(loaded.source.as_deref(), Some("code_extract"));
+        assert_eq!(loaded.repo.as_deref(), Some("gid-rs"));
+        assert_eq!(loaded.priority, Some(3));
+        assert_eq!(loaded.assigned_to.as_deref(), Some("rustclaw"));
+        assert_eq!(loaded.parent_id.as_deref(), Some("parent-mod"));
+        assert_eq!(loaded.depth, Some(2));
+        assert_eq!(loaded.complexity, Some(4.5));
+        assert_eq!(loaded.is_public, Some(true));
+        assert_eq!(loaded.body.as_deref(), Some("fn do_stuff(&self) -> Result<()> { Ok(()) }"));
+        assert_eq!(loaded.created_at.as_deref(), Some("2026-04-07T12:00:00Z"));
+        assert_eq!(loaded.updated_at.as_deref(), Some("2026-04-08T01:00:00Z"));
+        assert_eq!(loaded.tags.len(), 2);
+        assert!(loaded.tags.contains(&"important".to_string()));
+        assert!(loaded.tags.contains(&"tested".to_string()));
+        assert_eq!(loaded.metadata.get("design_ref"), Some(&serde_json::json!("3.2")));
+        assert_eq!(loaded.knowledge.findings.get("f1").unwrap(), "found something");
+    }
+
+    #[test]
+    fn test_put_node_upsert() {
+        let s = temp_storage();
+        let node = Node::new("u1", "Original Title")
+            .with_status(NodeStatus::Todo)
+            .with_description("original desc");
+        s.put_node(&node).unwrap();
+
+        // Update via upsert
+        let updated = Node::new("u1", "Updated Title")
+            .with_status(NodeStatus::Done)
+            .with_description("updated desc");
+        s.put_node(&updated).unwrap();
+
+        let loaded = s.get_node("u1").unwrap().unwrap();
+        assert_eq!(loaded.title, "Updated Title");
+        assert_eq!(loaded.status, NodeStatus::Done);
+        assert_eq!(loaded.description.as_deref(), Some("updated desc"));
+        assert_eq!(s.get_node_count().unwrap(), 1); // still just one node
+    }
+
+    #[test]
+    fn test_put_node_minimal() {
+        let s = temp_storage();
+        s.put_node(&Node::new("min", "Minimal")).unwrap();
+        let loaded = s.get_node("min").unwrap().unwrap();
+        assert_eq!(loaded.id, "min");
+        assert_eq!(loaded.title, "Minimal");
+        assert_eq!(loaded.status, NodeStatus::Todo); // default
+        assert!(loaded.description.is_none());
+        assert!(loaded.tags.is_empty());
+        assert!(loaded.metadata.is_empty());
+        assert!(loaded.knowledge.is_empty());
+        assert!(loaded.file_path.is_none());
+        assert!(loaded.priority.is_none());
+    }
+
+    #[test]
+    fn test_get_node_nonexistent() {
+        let s = temp_storage();
+        assert!(s.get_node("xxx").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_node_cascades_edges() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 1);
+
+        s.delete_node("a").unwrap();
+        // ON DELETE CASCADE should remove the edge
+        assert_eq!(s.get_edge_count().unwrap(), 0);
+        assert!(s.get_edges("b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_delete_node_cascades_tags_metadata_knowledge() {
+        let s = temp_storage();
+        let mut node = Node::new("del", "To Delete");
+        node.tags = vec!["tag1".into()];
+        node.metadata.insert("k".into(), serde_json::json!("v"));
+        node.knowledge.findings.insert("f".into(), "v".into());
+        s.put_node(&node).unwrap();
+
+        // Verify extras exist
+        assert_eq!(s.get_tags("del").unwrap().len(), 1);
+        assert_eq!(s.get_metadata("del").unwrap().len(), 1);
+        assert!(s.get_knowledge("del").unwrap().is_some());
+
+        s.delete_node("del").unwrap();
+        // CASCADE should clean up all auxiliary tables
+        assert!(s.get_tags("del").unwrap().is_empty());
+        assert!(s.get_metadata("del").unwrap().is_empty());
+        assert!(s.get_knowledge("del").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_node_nonexistent() {
+        let s = temp_storage();
+        // Should not error on deleting non-existent node
+        s.delete_node("ghost").unwrap();
+    }
+
+    // ── Edge operations ────────────────────────────────────
+
+    #[test]
+    fn test_edge_with_weight_confidence() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+
+        let mut edge = Edge::new("a", "b", "calls");
+        edge.weight = Some(0.8);
+        edge.confidence = Some(0.95);
+        s.add_edge(&edge).unwrap();
+
+        let edges = s.get_edges("a").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].weight, Some(0.8));
+        assert_eq!(edges[0].confidence, Some(0.95));
+    }
+
+    #[test]
+    fn test_edge_with_metadata() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+
+        let mut edge = Edge::new("a", "b", "relates_to");
+        edge.metadata = Some(serde_json::json!({
+            "reason": "shared interface",
+            "confidence_source": "manual"
+        }));
+        s.add_edge(&edge).unwrap();
+
+        let edges = s.get_edges("a").unwrap();
+        assert_eq!(edges.len(), 1);
+        let meta = edges[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["reason"], "shared interface");
+    }
+
+    #[test]
+    fn test_edge_get_both_directions() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+
+        // get_edges queries both from_node and to_node
+        let from_a = s.get_edges("a").unwrap();
+        let from_b = s.get_edges("b").unwrap();
+        assert_eq!(from_a.len(), 1);
+        assert_eq!(from_b.len(), 1);
+        assert_eq!(from_a[0].from, "a");
+        assert_eq!(from_b[0].from, "a"); // same edge, both queries find it
+    }
+
+    #[test]
+    fn test_edge_multiple_relations() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "calls")).unwrap();
+
+        let edges = s.get_edges("a").unwrap();
+        assert_eq!(edges.len(), 2);
+        let relations: Vec<&str> = edges.iter().map(|e| e.relation.as_str()).collect();
+        assert!(relations.contains(&"depends_on"));
+        assert!(relations.contains(&"calls"));
+    }
+
+    #[test]
+    fn test_remove_edge_specific_relation() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "calls")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 2);
+
+        s.remove_edge("a", "b", "calls").unwrap();
+        let edges = s.get_edges("a").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relation, "depends_on");
+    }
+
+    // ── query_nodes comprehensive ──────────────────────────
+
+    #[test]
+    fn test_query_by_file_path_prefix() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Main");
+        n1.file_path = Some("src/main.rs".into());
+        let mut n2 = Node::new("n2", "Lib");
+        n2.file_path = Some("src/lib.rs".into());
+        let mut n3 = Node::new("n3", "Test");
+        n3.file_path = Some("tests/test.rs".into());
+        s.put_node(&n1).unwrap();
+        s.put_node(&n2).unwrap();
+        s.put_node(&n3).unwrap();
+
+        let results = s.query_nodes(&NodeFilter::new().with_file_path("src/")).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"n1"));
+        assert!(ids.contains(&"n2"));
+    }
+
+    #[test]
+    fn test_query_by_tag() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "One").with_tags(vec!["rust".into(), "backend".into()])).unwrap();
+        s.put_node(&Node::new("n2", "Two").with_tags(vec!["rust".into()])).unwrap();
+        s.put_node(&Node::new("n3", "Three").with_tags(vec!["python".into()])).unwrap();
+
+        let results = s.query_nodes(&NodeFilter::new().with_tag("rust")).unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"n1"));
+        assert!(ids.contains(&"n2"));
+    }
+
+    #[test]
+    fn test_query_by_owner() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Owned");
+        n1.owner = Some("potato".into());
+        let mut n2 = Node::new("n2", "Unowned");
+        s.put_node(&n1).unwrap();
+        s.put_node(&n2).unwrap();
+
+        let results = s.query_nodes(&NodeFilter::new().with_owner("potato")).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "n1");
+    }
+
+    #[test]
+    fn test_query_combined_filters() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Task Todo");
+        n1.node_type = Some("task".into());
+        n1.status = NodeStatus::Todo;
+        let mut n2 = Node::new("n2", "Task Done");
+        n2.node_type = Some("task".into());
+        n2.status = NodeStatus::Done;
+        let mut n3 = Node::new("n3", "File Todo");
+        n3.node_type = Some("file".into());
+        n3.status = NodeStatus::Todo;
+        s.put_node(&n1).unwrap();
+        s.put_node(&n2).unwrap();
+        s.put_node(&n3).unwrap();
+
+        // Type=task AND status=todo → only n1
+        let results = s.query_nodes(
+            &NodeFilter::new().with_node_type("task").with_status("todo")
+        ).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "n1");
+    }
+
+    #[test]
+    fn test_query_offset_pagination() {
+        let s = temp_storage();
+        for i in 1..=5 {
+            s.put_node(&Node::new(&format!("n{}", i), &format!("Node {}", i))).unwrap();
+        }
+
+        // Get page 2 (items 3-4) with limit=2, offset=2
+        let results = s.query_nodes(
+            &NodeFilter::new().with_limit(2).with_offset(2)
+        ).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_query_offset_without_limit() {
+        let s = temp_storage();
+        for i in 1..=5 {
+            s.put_node(&Node::new(&format!("n{}", i), &format!("Node {}", i))).unwrap();
+        }
+
+        // Offset=2 without explicit limit → should use LIMIT -1
+        let results = s.query_nodes(
+            &NodeFilter::new().with_offset(2)
+        ).unwrap();
+        assert_eq!(results.len(), 3); // 5 - 2 = 3
+    }
+
+    #[test]
+    fn test_query_no_results() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node")).unwrap();
+        let results = s.query_nodes(
+            &NodeFilter::new().with_node_type("nonexistent")
+        ).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_query_empty_filter() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "One")).unwrap();
+        s.put_node(&Node::new("n2", "Two")).unwrap();
+        s.put_node(&Node::new("n3", "Three")).unwrap();
+
+        let results = s.query_nodes(&NodeFilter::new()).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    // ── FTS search ─────────────────────────────────────────
+
+    #[test]
+    fn test_search_by_description() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Generic Title");
+        n1.description = Some("Add OAuth2 authentication flow".into());
+        s.put_node(&n1).unwrap();
+
+        let results = s.search("OAuth2").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "n1");
+    }
+
+    #[test]
+    fn test_search_by_signature() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "A Function");
+        n1.signature = Some("fn calculate_score(input: &[f64]) -> f64".into());
+        s.put_node(&n1).unwrap();
+
+        let results = s.search("calculate_score").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "n1");
+    }
+
+    #[test]
+    fn test_search_by_doc_comment() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Helper");
+        n1.doc_comment = Some("/// Truncates a UTF-8 string safely at byte boundaries".into());
+        s.put_node(&n1).unwrap();
+
+        let results = s.search("truncates").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_special_characters() {
+        let s = temp_storage();
+        let mut n1 = Node::new("n1", "Test with (parentheses)");
+        n1.description = Some("Uses \"quotes\" and special chars: AND OR NOT".into());
+        s.put_node(&n1).unwrap();
+
+        // FTS5 special chars should be sanitized (wrapped in quotes)
+        let results = s.search("parentheses").unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Double-quote handling
+        let results = s.search("quotes").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_multiple_results() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Implement authentication")).unwrap();
+        s.put_node(&Node::new("n2", "Test authentication flow")).unwrap();
+        s.put_node(&Node::new("n3", "Deploy database")).unwrap();
+
+        let results = s.search("authentication").unwrap();
+        assert_eq!(results.len(), 2);
+        let ids: Vec<&str> = results.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"n1"));
+        assert!(ids.contains(&"n2"));
+    }
+
+    // ── Metadata/Tags advanced ─────────────────────────────
+
+    #[test]
+    fn test_tags_empty_set() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node").with_tags(vec!["a".into(), "b".into()])).unwrap();
+        assert_eq!(s.get_tags("n1").unwrap().len(), 2);
+
+        s.set_tags("n1", &[]).unwrap();
+        assert!(s.get_tags("n1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_tags_overwrite() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node")).unwrap();
+        s.set_tags("n1", &["old1".into(), "old2".into()]).unwrap();
+        s.set_tags("n1", &["new1".into()]).unwrap();
+
+        let tags = s.get_tags("n1").unwrap();
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0], "new1");
+    }
+
+    #[test]
+    fn test_metadata_complex_values() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node")).unwrap();
+
+        let mut meta = HashMap::new();
+        meta.insert("string".into(), serde_json::json!("hello"));
+        meta.insert("number".into(), serde_json::json!(42));
+        meta.insert("float".into(), serde_json::json!(3.14));
+        meta.insert("bool".into(), serde_json::json!(true));
+        meta.insert("null".into(), serde_json::json!(null));
+        meta.insert("array".into(), serde_json::json!([1, 2, 3]));
+        meta.insert("object".into(), serde_json::json!({"nested": "value", "count": 7}));
+
+        s.set_metadata("n1", &meta).unwrap();
+        let loaded = s.get_metadata("n1").unwrap();
+
+        assert_eq!(loaded.get("string"), Some(&serde_json::json!("hello")));
+        assert_eq!(loaded.get("number"), Some(&serde_json::json!(42)));
+        assert_eq!(loaded.get("float"), Some(&serde_json::json!(3.14)));
+        assert_eq!(loaded.get("bool"), Some(&serde_json::json!(true)));
+        assert_eq!(loaded.get("null"), Some(&serde_json::json!(null)));
+        assert_eq!(loaded.get("array"), Some(&serde_json::json!([1, 2, 3])));
+        assert_eq!(loaded.get("object"), Some(&serde_json::json!({"nested": "value", "count": 7})));
+    }
+
+    #[test]
+    fn test_metadata_overwrite() {
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node")).unwrap();
+
+        let mut meta1 = HashMap::new();
+        meta1.insert("old_key".into(), serde_json::json!("old_value"));
+        s.set_metadata("n1", &meta1).unwrap();
+
+        let mut meta2 = HashMap::new();
+        meta2.insert("new_key".into(), serde_json::json!("new_value"));
+        s.set_metadata("n1", &meta2).unwrap();
+
+        let loaded = s.get_metadata("n1").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.get("old_key").is_none());
+        assert_eq!(loaded.get("new_key"), Some(&serde_json::json!("new_value")));
+    }
+
+    #[test]
+    fn test_knowledge_full_roundtrip() {
+        use crate::task_graph_knowledge::ToolCallRecord;
+
+        let s = temp_storage();
+        s.put_node(&Node::new("n1", "Node")).unwrap();
+
+        let knowledge = KnowledgeNode {
+            findings: {
+                let mut f = HashMap::new();
+                f.insert("FINDING-1".into(), "Critical: missing error handling".into());
+                f.insert("FINDING-2".into(), "Minor: naming convention".into());
+                f
+            },
+            file_cache: {
+                let mut fc = HashMap::new();
+                fc.insert("src/main.rs".into(), "fn main() {}".into());
+                fc
+            },
+            tool_history: vec![
+                ToolCallRecord {
+                    tool_name: "read_file".into(),
+                    timestamp: "2026-04-08T01:00:00Z".into(),
+                    summary: "Read sqlite.rs".into(),
+                },
+                ToolCallRecord {
+                    tool_name: "edit_file".into(),
+                    timestamp: "2026-04-08T01:05:00Z".into(),
+                    summary: "Added tests".into(),
+                },
+            ],
+        };
+
+        s.set_knowledge("n1", &knowledge).unwrap();
+        let loaded = s.get_knowledge("n1").unwrap().unwrap();
+
+        assert_eq!(loaded.findings.len(), 2);
+        assert_eq!(loaded.findings.get("FINDING-1").unwrap(), "Critical: missing error handling");
+        assert_eq!(loaded.file_cache.len(), 1);
+        assert_eq!(loaded.file_cache.get("src/main.rs").unwrap(), "fn main() {}");
+        assert_eq!(loaded.tool_history.len(), 2);
+        assert_eq!(loaded.tool_history[0].tool_name, "read_file");
+        assert_eq!(loaded.tool_history[1].summary, "Added tests");
+    }
+
+    // ── Batch operations ───────────────────────────────────
+
+    #[test]
+    fn test_batch_all_op_types() {
+        let s = temp_storage();
+        // Pre-populate a node for deletion and edge removal
+        s.put_node(&Node::new("pre", "Pre-existing")).unwrap();
+        s.put_node(&Node::new("pre2", "Pre-existing 2")).unwrap();
+        s.add_edge(&Edge::new("pre", "pre2", "depends_on")).unwrap();
+
+        let knowledge = KnowledgeNode {
+            findings: {
+                let mut f = HashMap::new();
+                f.insert("k".into(), "v".into());
+                f
+            },
+            file_cache: HashMap::new(),
+            tool_history: vec![],
+        };
+
+        let mut metadata = HashMap::new();
+        metadata.insert("batch_key".into(), serde_json::json!("batch_value"));
+
+        let ops = vec![
+            BatchOp::PutNode(Node::new("b1", "Batch Node")),
+            BatchOp::AddEdge(Edge::new("b1", "pre2", "calls")),
+            BatchOp::SetTags("b1".into(), vec!["batched".into()]),
+            BatchOp::SetMetadata("b1".into(), metadata),
+            BatchOp::SetKnowledge("b1".into(), knowledge),
+            BatchOp::RemoveEdge {
+                from: "pre".into(),
+                to: "pre2".into(),
+                relation: "depends_on".into(),
+            },
+            BatchOp::DeleteNode("pre".into()),
+        ];
+        s.execute_batch(&ops).unwrap();
+
+        // Verify all effects
+        assert!(s.get_node("pre").unwrap().is_none()); // deleted
+        assert!(s.get_node("b1").unwrap().is_some()); // added
+        assert_eq!(s.get_tags("b1").unwrap(), vec!["batched"]);
+        assert_eq!(s.get_metadata("b1").unwrap().get("batch_key"), Some(&serde_json::json!("batch_value")));
+        assert!(s.get_knowledge("b1").unwrap().is_some());
+        // Only edge left is b1→pre2 (pre→pre2 was removed, then pre was deleted)
+        let edges = s.get_edges("pre2").unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "b1");
+    }
+
+    #[test]
+    fn test_batch_ordering() {
+        let s = temp_storage();
+        // PutNode first, then AddEdge referencing it — ordering matters
+        let ops = vec![
+            BatchOp::PutNode(Node::new("first", "First")),
+            BatchOp::PutNode(Node::new("second", "Second")),
+            BatchOp::AddEdge(Edge::new("first", "second", "depends_on")),
+        ];
+        s.execute_batch(&ops).unwrap();
+
+        assert_eq!(s.get_edge_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_batch_empty() {
+        let s = temp_storage();
+        s.execute_batch(&[]).unwrap();
+        assert_eq!(s.get_node_count().unwrap(), 0);
+    }
+
+    // ── Count operations ───────────────────────────────────
+
+    #[test]
+    fn test_node_count_after_operations() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.put_node(&Node::new("c", "C")).unwrap();
+        assert_eq!(s.get_node_count().unwrap(), 3);
+
+        s.delete_node("b").unwrap();
+        assert_eq!(s.get_node_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_edge_count_after_operations() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.put_node(&Node::new("c", "C")).unwrap();
+        s.add_edge(&Edge::new("a", "b", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("b", "c", "depends_on")).unwrap();
+        s.add_edge(&Edge::new("a", "c", "calls")).unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 3);
+
+        s.remove_edge("a", "c", "calls").unwrap();
+        assert_eq!(s.get_edge_count().unwrap(), 2);
+    }
+
+    // ── Migration batch ────────────────────────────────────
+
+    #[test]
+    fn test_migration_batch_valid_edges() {
+        let s = temp_storage();
+        // Migration batch with valid edges should work fine
+        let ops = vec![
+            BatchOp::PutNode(Node::new("a", "A")),
+            BatchOp::PutNode(Node::new("b", "B")),
+            BatchOp::AddEdge(Edge::new("a", "b", "depends_on")),
+        ];
+        s.execute_migration_batch(&ops).unwrap();
+
+        assert_eq!(s.get_node_count().unwrap(), 2);
+        assert_eq!(s.get_edge_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_migration_batch_fk_disabled_bug() {
+        // BUG: execute_migration_batch sets PRAGMA foreign_keys=OFF inside
+        // a transaction, but SQLite ignores FK pragma changes within transactions.
+        // This means dangling edges still cause FK violations.
+        // This test documents the current (buggy) behavior.
+        let s = temp_storage();
+        let ops = vec![
+            BatchOp::PutNode(Node::new("a", "A")),
+            BatchOp::AddEdge(Edge::new("a", "nonexistent", "depends_on")),
+        ];
+        // Currently fails due to the PRAGMA-in-transaction bug
+        let result = s.execute_migration_batch(&ops);
+        assert!(result.is_err(), "FK violation expected — PRAGMA foreign_keys=OFF is no-op inside a transaction");
+    }
+
+    #[test]
+    fn test_normal_batch_rejects_dangling_edge() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+
+        // Normal batch with dangling edge should fail (FK on)
+        let ops = vec![
+            BatchOp::AddEdge(Edge::new("a", "ghost", "depends_on")),
+        ];
+        let result = s.execute_batch(&ops);
+        assert!(result.is_err());
+        // No edge should have been inserted (transaction rolled back)
+        assert_eq!(s.get_edge_count().unwrap(), 0);
+    }
+
+    // ── Node extras roundtrip via put_node ──────────────────
+
+    #[test]
+    fn test_put_node_with_tags_roundtrip() {
+        let s = temp_storage();
+        let node = Node::new("t1", "Tagged")
+            .with_tags(vec!["alpha".into(), "beta".into(), "gamma".into()]);
+        s.put_node(&node).unwrap();
+
+        let loaded = s.get_node("t1").unwrap().unwrap();
+        assert_eq!(loaded.tags.len(), 3);
+        assert!(loaded.tags.contains(&"alpha".to_string()));
+        assert!(loaded.tags.contains(&"beta".to_string()));
+        assert!(loaded.tags.contains(&"gamma".to_string()));
+    }
+
+    #[test]
+    fn test_put_node_upsert_clears_old_tags() {
+        let s = temp_storage();
+        let node = Node::new("t1", "Tagged")
+            .with_tags(vec!["old1".into(), "old2".into()]);
+        s.put_node(&node).unwrap();
+
+        // Upsert with different tags
+        let node2 = Node::new("t1", "Tagged")
+            .with_tags(vec!["new1".into()]);
+        s.put_node(&node2).unwrap();
+
+        let loaded = s.get_node("t1").unwrap().unwrap();
+        assert_eq!(loaded.tags, vec!["new1"]);
+    }
+
+    #[test]
+    fn test_put_node_upsert_clears_old_metadata() {
+        let s = temp_storage();
+        let mut node = Node::new("m1", "Meta");
+        node.metadata.insert("old".into(), serde_json::json!("value"));
+        s.put_node(&node).unwrap();
+
+        // Upsert with different metadata
+        let mut node2 = Node::new("m1", "Meta");
+        node2.metadata.insert("new".into(), serde_json::json!(42));
+        s.put_node(&node2).unwrap();
+
+        let loaded = s.get_node("m1").unwrap().unwrap();
+        assert!(loaded.metadata.get("old").is_none());
+        assert_eq!(loaded.metadata.get("new"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn test_put_node_upsert_clears_knowledge_when_empty() {
+        let s = temp_storage();
+        let mut node = Node::new("k1", "Knowledge");
+        node.knowledge.findings.insert("f1".into(), "val".into());
+        s.put_node(&node).unwrap();
+        assert!(s.get_knowledge("k1").unwrap().is_some());
+
+        // Upsert with empty knowledge → should clear
+        let node2 = Node::new("k1", "Knowledge");
+        s.put_node(&node2).unwrap();
+        // Empty knowledge → deleted from knowledge table
+        assert!(s.get_knowledge("k1").unwrap().is_none());
+    }
+
+    // ── Project meta edge cases ────────────────────────────
+
+    #[test]
+    fn test_project_meta_overwrite() {
+        let s = temp_storage();
+        s.set_project_meta(&ProjectMeta {
+            name: "old-project".into(),
+            description: Some("old desc".into()),
+        }).unwrap();
+
+        s.set_project_meta(&ProjectMeta {
+            name: "new-project".into(),
+            description: None,
+        }).unwrap();
+
+        let loaded = s.get_project_meta().unwrap().unwrap();
+        assert_eq!(loaded.name, "new-project");
+        // description is set to "" when None (INSERT OR REPLACE with "")
+        assert!(loaded.description.is_some());
+    }
+
+    // ── FTS after update ───────────────────────────────────
+
+    #[test]
+    fn test_search_after_node_update() {
+        let s = temp_storage();
+        let n = Node::new("s1", "Old Title");
+        s.put_node(&n).unwrap();
+
+        assert_eq!(s.search("Old").unwrap().len(), 1);
+
+        // Update title via upsert
+        let n2 = Node::new("s1", "New Title");
+        s.put_node(&n2).unwrap();
+
+        // Old title should no longer match
+        assert_eq!(s.search("Old").unwrap().len(), 0);
+        // New title should match
+        assert_eq!(s.search("New").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_search_after_node_delete() {
+        let s = temp_storage();
+        s.put_node(&Node::new("s1", "Searchable Node")).unwrap();
+        assert_eq!(s.search("Searchable").unwrap().len(), 1);
+
+        s.delete_node("s1").unwrap();
+        assert_eq!(s.search("Searchable").unwrap().len(), 0);
+    }
+
+    // ── get_all_node_ids ordering ──────────────────────────
+
+    #[test]
+    fn test_get_all_node_ids_empty() {
+        let s = temp_storage();
+        assert!(s.get_all_node_ids().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_all_node_ids_after_delete() {
+        let s = temp_storage();
+        s.put_node(&Node::new("a", "A")).unwrap();
+        s.put_node(&Node::new("b", "B")).unwrap();
+        s.put_node(&Node::new("c", "C")).unwrap();
+        s.delete_node("b").unwrap();
+
+        let mut ids = s.get_all_node_ids().unwrap();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "c"]);
     }
 }

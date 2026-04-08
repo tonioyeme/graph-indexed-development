@@ -1,6 +1,7 @@
 //! Rust code extraction using tree-sitter AST parsing
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use tree_sitter::Parser;
@@ -690,11 +691,17 @@ pub(crate) fn extract_rust_regex(path: &str, content: &str) -> (Vec<CodeNode>, V
 
     let file_id = format!("file:{}", path);
 
-    let re_use = Regex::new(r"(?m)^use\s+([\w:]+)").unwrap();
-    let re_struct = Regex::new(r"(?m)^(?:pub\s+)?struct\s+(\w+)").unwrap();
-    let re_enum = Regex::new(r"(?m)^(?:pub\s+)?enum\s+(\w+)").unwrap();
-    let re_impl = Regex::new(r"(?m)^impl(?:<[^>]+>)?\s+(?:(\w+)\s+for\s+)?(\w+)").unwrap();
-    let re_fn = Regex::new(r"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
+    static RE_USE: OnceLock<Regex> = OnceLock::new();
+    static RE_STRUCT: OnceLock<Regex> = OnceLock::new();
+    static RE_ENUM: OnceLock<Regex> = OnceLock::new();
+    static RE_IMPL: OnceLock<Regex> = OnceLock::new();
+    static RE_FN: OnceLock<Regex> = OnceLock::new();
+
+    let re_use = RE_USE.get_or_init(|| Regex::new(r"(?m)^use\s+([\w:]+)").unwrap());
+    let re_struct = RE_STRUCT.get_or_init(|| Regex::new(r"(?m)^(?:pub\s+)?struct\s+(\w+)").unwrap());
+    let re_enum = RE_ENUM.get_or_init(|| Regex::new(r"(?m)^(?:pub\s+)?enum\s+(\w+)").unwrap());
+    let re_impl = RE_IMPL.get_or_init(|| Regex::new(r"(?m)^impl(?:<[^>]+>)?\s+(?:(\w+)\s+for\s+)?(\w+)").unwrap());
+    let re_fn = RE_FN.get_or_init(|| Regex::new(r"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap());
 
     for cap in re_use.captures_iter(content) {
         let module = cap[1].to_string();

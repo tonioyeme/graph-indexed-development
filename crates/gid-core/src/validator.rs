@@ -11,6 +11,7 @@ pub struct ValidationResult {
     pub cycles: Vec<Vec<String>>,
     pub duplicate_nodes: Vec<String>,
     pub duplicate_edges: Vec<DuplicateEdge>,
+    pub self_edges: Vec<SelfEdge>,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,12 @@ pub struct DuplicateEdge {
     pub relation: String,
 }
 
+#[derive(Debug)]
+pub struct SelfEdge {
+    pub node: String,
+    pub relation: String,
+}
+
 impl ValidationResult {
     pub fn is_valid(&self) -> bool {
         self.orphan_nodes.is_empty()
@@ -34,6 +41,7 @@ impl ValidationResult {
             && self.cycles.is_empty()
             && self.duplicate_nodes.is_empty()
             && self.duplicate_edges.is_empty()
+            && self.self_edges.is_empty()
     }
 
     pub fn issue_count(&self) -> usize {
@@ -42,6 +50,7 @@ impl ValidationResult {
             + self.cycles.len()
             + self.duplicate_nodes.len()
             + self.duplicate_edges.len()
+            + self.self_edges.len()
     }
 }
 
@@ -85,6 +94,13 @@ impl std::fmt::Display for ValidationResult {
             ));
         }
 
+        for se in &self.self_edges {
+            lines.push(format!(
+                "Self-referential edge: {} → {} ({})",
+                se.node, se.node, se.relation
+            ));
+        }
+
         write!(f, "✗ {} issues found:\n  {}", self.issue_count(), lines.join("\n  "))
     }
 }
@@ -108,6 +124,7 @@ impl<'a> Validator<'a> {
         result.orphan_nodes = self.find_orphan_nodes();
         result.cycles = self.find_cycles();
         result.duplicate_edges = self.find_duplicate_edges();
+        result.self_edges = self.find_self_edges();
 
         result
     }
@@ -243,6 +260,17 @@ impl<'a> Validator<'a> {
         duplicates
     }
 
+    /// Find self-referential edges (from == to).
+    pub fn find_self_edges(&self) -> Vec<SelfEdge> {
+        self.graph.edges.iter()
+            .filter(|e| e.from == e.to)
+            .map(|e| SelfEdge {
+                node: e.from.clone(),
+                relation: e.relation.clone(),
+            })
+            .collect()
+    }
+
     /// Check if adding an edge would create a cycle.
     pub fn would_create_cycle(&self, from: &str, to: &str) -> bool {
         // Adding from -> to creates a cycle if there's already a path from to -> from
@@ -296,6 +324,53 @@ mod tests {
         let missing = validator.find_missing_refs();
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].missing_node, "missing");
+    }
+
+    #[test]
+    fn test_self_edge_detection() {
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        graph.edges.push(Edge::depends_on("a", "a")); // self-edge
+        graph.add_edge(Edge::depends_on("a", "b"));    // normal edge
+
+        let validator = Validator::new(&graph);
+        let self_edges = validator.find_self_edges();
+        assert_eq!(self_edges.len(), 1);
+        assert_eq!(self_edges[0].node, "a");
+        assert_eq!(self_edges[0].relation, "depends_on");
+    }
+
+    #[test]
+    fn test_self_edge_makes_graph_invalid() {
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        graph.add_edge(Edge::depends_on("a", "b"));
+
+        let validator = Validator::new(&graph);
+        assert!(validator.find_self_edges().is_empty());
+
+        // Add self-edge
+        graph.edges.push(Edge::depends_on("b", "b"));
+        let validator = Validator::new(&graph);
+        let result = validator.validate();
+        assert!(!result.self_edges.is_empty());
+        // self_edges contribute to issue_count and is_valid
+        assert!(result.issue_count() > 0);
+    }
+
+    #[test]
+    fn test_no_self_edges_in_clean_graph() {
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("a", "A"));
+        graph.add_node(Node::new("b", "B"));
+        graph.add_node(Node::new("c", "C"));
+        graph.add_edge(Edge::depends_on("a", "b"));
+        graph.add_edge(Edge::depends_on("b", "c"));
+
+        let validator = Validator::new(&graph);
+        assert!(validator.find_self_edges().is_empty());
     }
 
     #[test]

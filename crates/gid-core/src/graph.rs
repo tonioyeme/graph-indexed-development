@@ -728,19 +728,36 @@ impl Graph {
 
     /// Get tasks that are ready (todo + all depends_on are done).
     /// Only considers project nodes; code nodes are excluded.
+    ///
+    /// Uses pre-built HashMaps for O(N+M) instead of O(N×M×N).
     pub fn ready_tasks(&self) -> Vec<&Node> {
+        // Build O(1) lookup: node_id → status
+        let status_map: HashMap<&str, &NodeStatus> = self
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), &n.status))
+            .collect();
+
+        // Build O(1) adjacency: from_id → Vec<&Edge> (depends_on only)
+        let mut dep_edges: HashMap<&str, Vec<&Edge>> = HashMap::new();
+        for e in &self.edges {
+            if e.relation == "depends_on" {
+                dep_edges.entry(e.from.as_str()).or_default().push(e);
+            }
+        }
+
         self.project_nodes()
             .into_iter()
             .filter(|n| n.status == NodeStatus::Todo)
             .filter(|n| {
-                let deps: Vec<&Edge> = self.edges_from(&n.id)
-                    .into_iter()
-                    .filter(|e| e.relation == "depends_on")
-                    .collect();
-                deps.iter().all(|e| {
-                    self.get_node(&e.to)
-                        .map_or(true, |dep| dep.status == NodeStatus::Done)
-                })
+                match dep_edges.get(n.id.as_str()) {
+                    None => true, // no dependencies → ready
+                    Some(deps) => deps.iter().all(|e| {
+                        status_map
+                            .get(e.to.as_str())
+                            .map_or(true, |s| **s == NodeStatus::Done)
+                    }),
+                }
             })
             .collect()
     }

@@ -13,12 +13,19 @@ use serde::{Deserialize, Serialize};
 /// Path to the execution state file (relative to .gid directory).
 pub const EXECUTION_STATE_FILENAME: &str = "execution-state.json";
 
+/// Current schema version for execution state.
+pub const CURRENT_EXECUTION_STATE_VERSION: u32 = 1;
+
 /// Persistent execution state.
 ///
 /// This is the source of truth for the current execution status,
 /// read/written by both the scheduler and CLI commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionState {
+    /// Schema version for forward/backward compatibility.
+    /// Old files without this field default to 0 via serde(default).
+    #[serde(default)]
+    pub version: u32,
     /// Current execution status.
     pub status: ExecutionStatus,
     /// IDs of currently executing tasks.
@@ -34,6 +41,7 @@ pub struct ExecutionState {
 impl Default for ExecutionState {
     fn default() -> Self {
         Self {
+            version: CURRENT_EXECUTION_STATE_VERSION,
             status: ExecutionStatus::Idle,
             active_tasks: Vec::new(),
             pending_approvals: Vec::new(),
@@ -47,6 +55,7 @@ impl ExecutionState {
     /// Create a new execution state with the given status.
     pub fn new(status: ExecutionStatus) -> Self {
         Self {
+            version: CURRENT_EXECUTION_STATE_VERSION,
             status,
             active_tasks: Vec::new(),
             pending_approvals: Vec::new(),
@@ -270,6 +279,56 @@ mod tests {
         assert_eq!(state.status, ExecutionStatus::Completed);
         assert!(state.active_tasks.is_empty());
         assert!(state.pending_approvals.is_empty());
+    }
+
+    #[test]
+    fn test_version_set_on_new() {
+        let state = ExecutionState::new(ExecutionStatus::Running);
+        assert_eq!(state.version, CURRENT_EXECUTION_STATE_VERSION);
+        assert_eq!(state.version, 1);
+    }
+
+    #[test]
+    fn test_version_set_on_default() {
+        let state = ExecutionState::default();
+        assert_eq!(state.version, CURRENT_EXECUTION_STATE_VERSION);
+    }
+
+    #[test]
+    fn test_version_serialized() {
+        let state = ExecutionState::new(ExecutionStatus::Idle);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"version\":1"));
+    }
+
+    #[test]
+    fn test_backward_compat_no_version_field() {
+        // Simulate old execution-state.json without version field
+        let old_json = r#"{
+            "status": "running",
+            "active_tasks": ["task-1"],
+            "pending_approvals": [],
+            "cancel_requested": false,
+            "last_updated": "2026-04-07T10:00:00Z"
+        }"#;
+        let state: ExecutionState = serde_json::from_str(old_json).unwrap();
+        // serde(default) gives version = 0 for old files
+        assert_eq!(state.version, 0);
+        assert_eq!(state.status, ExecutionStatus::Running);
+        assert_eq!(state.active_tasks, vec!["task-1"]);
+    }
+
+    #[test]
+    fn test_version_persists_through_save_load() {
+        let tmp = tempdir().unwrap();
+        let gid_dir = tmp.path().join(".gid");
+
+        let mut state = ExecutionState::new(ExecutionStatus::Running);
+        assert_eq!(state.version, 1);
+        state.save(&gid_dir).unwrap();
+
+        let loaded = ExecutionState::load(&gid_dir).unwrap();
+        assert_eq!(loaded.version, 1);
     }
 
     #[test]
