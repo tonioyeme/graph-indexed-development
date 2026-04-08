@@ -8,6 +8,10 @@ pub mod sqlite;
 #[cfg(feature = "sqlite")]
 pub mod migration;
 
+#[cfg(test)]
+#[cfg(feature = "sqlite")]
+mod integration_tests;
+
 // Re-export key types for convenience.
 pub use error::{StorageError, StorageOp, StorageResult};
 pub use trait_def::{BatchOp, GraphStorage, NodeFilter};

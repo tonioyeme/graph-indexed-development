@@ -307,7 +307,7 @@ GID graph 应该是多层结构，层内有细分层级，层间有 edges 连接
 
 ---
 
-## ISS-010 [improvement] [P1] [open]
+## ISS-010 [improvement] [P1] [closed]
 **Triage Size 驱动 Review 深度分级**
 
 **发现日期**: 2026-04-07

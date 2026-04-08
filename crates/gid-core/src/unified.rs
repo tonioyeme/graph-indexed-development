@@ -137,11 +137,16 @@ pub fn build_unified_graph(code_graph: &CodeGraph, task_graph: &Graph) -> Graph 
         edges.push(task_edge.clone());
     }
     
-    Graph {
+    let mut unified = Graph {
         project: task_graph.project.clone(),
         nodes,
         edges,
-    }
+    };
+
+    // Auto-link task nodes to code files mentioned in task titles/descriptions
+    link_tasks_to_code(code_graph, &mut unified);
+
+    unified
 }
 
 /// Merge code nodes relevant to a set of keywords into an existing task graph.

@@ -327,6 +327,35 @@ pub struct TaskSpec {
     pub deps: Vec<String>,           // titles of tasks this depends on
 }
 
+/// Infer the node type from the ID prefix (text before the first `:`).
+///
+/// Returns `Some(type_name)` if the prefix is recognized, `None` otherwise.
+///
+/// # Examples
+/// ```
+/// use gid_core::infer_node_type;
+/// assert_eq!(infer_node_type("file:src/main.rs"), Some("file"));
+/// assert_eq!(infer_node_type("fn:my_func"), Some("function"));
+/// assert_eq!(infer_node_type("struct:MyStruct"), Some("class"));
+/// assert_eq!(infer_node_type("unknown-id"), None);
+/// ```
+pub fn infer_node_type(id: &str) -> Option<&str> {
+    let prefix = id.split(':').next()?;
+    match prefix {
+        "file" => Some("file"),
+        "fn" | "func" => Some("function"),
+        "struct" | "class" => Some("class"),
+        "mod" | "module" => Some("module"),
+        "method" => Some("method"),
+        "trait" | "interface" => Some("trait"),
+        "enum" => Some("enum"),
+        "const" | "static" => Some("constant"),
+        "test" => Some("test"),
+        "impl" => Some("impl"),
+        _ => None,
+    }
+}
+
 // ─── Graph operations ────────────────────────────────────────
 
 impl Graph {
@@ -346,6 +375,13 @@ impl Graph {
 
     pub fn add_node(&mut self, node: Node) {
         if self.get_node(&node.id).is_none() {
+            let mut node = node;
+            // Auto-infer node_type from ID prefix if not already set
+            if node.node_type.is_none() {
+                if let Some(inferred) = infer_node_type(&node.id) {
+                    node.node_type = Some(inferred.to_string());
+                }
+            }
             self.nodes.push(node);
         }
     }
@@ -1491,5 +1527,69 @@ mod merge_feature_nodes_tests {
             .filter(|e| e.from == "task-new" && e.to == "feat-auth" && e.relation == "implements")
             .collect();
         assert_eq!(implements.len(), 1);
+    }
+
+    #[test]
+    fn test_infer_node_type_known_prefixes() {
+        assert_eq!(infer_node_type("file:src/main.rs"), Some("file"));
+        assert_eq!(infer_node_type("fn:my_func"), Some("function"));
+        assert_eq!(infer_node_type("func:my_func"), Some("function"));
+        assert_eq!(infer_node_type("struct:MyStruct"), Some("class"));
+        assert_eq!(infer_node_type("class:MyClass"), Some("class"));
+        assert_eq!(infer_node_type("mod:mymod"), Some("module"));
+        assert_eq!(infer_node_type("module:mymod"), Some("module"));
+        assert_eq!(infer_node_type("method:do_thing"), Some("method"));
+        assert_eq!(infer_node_type("trait:MyTrait"), Some("trait"));
+        assert_eq!(infer_node_type("interface:IFoo"), Some("trait"));
+        assert_eq!(infer_node_type("enum:Color"), Some("enum"));
+        assert_eq!(infer_node_type("const:MAX_SIZE"), Some("constant"));
+        assert_eq!(infer_node_type("static:INSTANCE"), Some("constant"));
+        assert_eq!(infer_node_type("test:test_foo"), Some("test"));
+        assert_eq!(infer_node_type("impl:MyStruct"), Some("impl"));
+    }
+
+    #[test]
+    fn test_infer_node_type_unknown_prefix() {
+        assert_eq!(infer_node_type("task-auth-login"), None);
+        assert_eq!(infer_node_type("feat-pipeline"), None);
+        assert_eq!(infer_node_type("random-id"), None);
+        assert_eq!(infer_node_type(""), None);
+    }
+
+    #[test]
+    fn test_infer_node_type_no_colon() {
+        // Without a colon the whole ID is the "prefix" — should not match known types
+        // unless the ID itself happens to be e.g. "file" (unlikely but valid)
+        assert_eq!(infer_node_type("file"), Some("file"));
+        assert_eq!(infer_node_type("something"), None);
+    }
+
+    #[test]
+    fn test_add_node_auto_infers_type() {
+        let mut g = Graph::new();
+        let node = Node::new("fn:process_data", "Process Data");
+        assert!(node.node_type.is_none()); // not set on Node::new
+        g.add_node(node);
+        let added = g.get_node("fn:process_data").unwrap();
+        assert_eq!(added.node_type.as_deref(), Some("function"));
+    }
+
+    #[test]
+    fn test_add_node_does_not_override_explicit_type() {
+        let mut g = Graph::new();
+        let mut node = Node::new("fn:process_data", "Process Data");
+        node.node_type = Some("custom".to_string());
+        g.add_node(node);
+        let added = g.get_node("fn:process_data").unwrap();
+        assert_eq!(added.node_type.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn test_add_node_no_infer_for_unknown_prefix() {
+        let mut g = Graph::new();
+        let node = Node::new("task-auth-login", "Login task");
+        g.add_node(node);
+        let added = g.get_node("task-auth-login").unwrap();
+        assert!(added.node_type.is_none());
     }
 }

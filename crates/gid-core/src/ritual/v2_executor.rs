@@ -720,7 +720,10 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
                  - Follow existing patterns and conventions in the codebase\n\
                  - Only implement tasks that are status: todo — skip tasks already marked done\n\
                  - Layer order is mandatory: never implement a task before its dependencies are done\n\
-                 - Update graph.yml status incrementally, not all at once at the end"
+                 - Update graph.yml status incrementally, not all at once at the end\n\
+                 - FINAL STEP: After ALL layers are done, run `cargo check` (Rust), `npm run build` (TS),\n\
+                   or `python -m py_compile` (Python) as a final compilation gate. If it fails, fix before exiting.\n\
+                   Do NOT mark the implementation complete until the final check passes."
                     .to_string(),
             ),
             _ => anyhow::bail!("Unknown skill: {}", skill_name),

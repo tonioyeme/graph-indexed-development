@@ -84,6 +84,9 @@ enum Commands {
     /// Validate the graph (cycles, orphans, missing refs)
     Validate,
 
+    /// Show project overview: node/edge counts, languages, features
+    About,
+
     /// List tasks with optional status filter
     Tasks {
         /// Filter by status (todo, in_progress, done, blocked, cancelled)
@@ -95,6 +98,9 @@ enum Commands {
         /// Filter by layer: code, project, all (default: project)
         #[arg(long, value_enum, default_value = "project")]
         layer: LayerFilter,
+        /// Compact one-line-per-task output (icon id status)
+        #[arg(short, long)]
+        compact: bool,
     },
 
     /// Update a task's status
@@ -702,9 +708,13 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_validate_ctx(&ctx, cli.json)
         }
-        Commands::Tasks { status, ready, layer } => {
+        Commands::About => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
-            cmd_tasks_ctx(&ctx, status, ready, layer, cli.json)
+            cmd_about_ctx(&ctx, cli.json)
+        }
+        Commands::Tasks { status, ready, layer, compact } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            cmd_tasks_ctx(&ctx, status, ready, layer, compact, cli.json)
         }
         Commands::TaskUpdate { id, status } => {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
@@ -1001,7 +1011,164 @@ fn cmd_validate_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_tasks_ctx(ctx: &GraphContext, status_filter: Option<String>, ready_only: bool, layer: LayerFilter, json: bool) -> Result<()> {
+fn cmd_about_ctx(ctx: &GraphContext, json: bool) -> Result<()> {
+    let graph = ctx.load()?;
+    
+    // Get project metadata
+    let project_name = graph.project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Unnamed Project".to_string());
+    let project_desc = graph.project.as_ref().and_then(|p| p.description.clone());
+    
+    // Count nodes by type
+    let total_nodes = graph.nodes.len();
+    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for node in &graph.nodes {
+        let node_type = node.node_type.as_deref().unwrap_or("unknown");
+        *type_counts.entry(node_type.to_string()).or_default() += 1;
+    }
+    
+    // Count nodes by status (for tasks)
+    let todo_count = graph.nodes.iter().filter(|n| n.status == NodeStatus::Todo).count();
+    let in_progress_count = graph.nodes.iter().filter(|n| n.status == NodeStatus::InProgress).count();
+    let done_count = graph.nodes.iter().filter(|n| n.status == NodeStatus::Done).count();
+    let blocked_count = graph.nodes.iter().filter(|n| n.status == NodeStatus::Blocked).count();
+    
+    // Count code entities by kind
+    let file_count = graph.nodes.iter().filter(|n| n.node_kind.as_deref() == Some("File")).count();
+    let function_count = graph.nodes.iter().filter(|n| matches!(n.node_kind.as_deref(), Some("Function") | Some("Constant"))).count();
+    let class_count = graph.nodes.iter().filter(|n| matches!(n.node_kind.as_deref(), Some("Class") | Some("Interface") | Some("Enum") | Some("TypeAlias") | Some("Trait"))).count();
+    
+    // Count edges by relation
+    let total_edges = graph.edges.len();
+    let mut relation_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for edge in &graph.edges {
+        *relation_counts.entry(edge.relation.clone()).or_default() += 1;
+    }
+    
+    // Collect languages from node.lang field
+    let mut lang_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for node in &graph.nodes {
+        if let Some(ref lang) = node.lang {
+            *lang_counts.entry(lang.clone()).or_default() += 1;
+        }
+    }
+    let mut languages: Vec<(String, usize)> = lang_counts.into_iter().collect();
+    languages.sort_by(|a, b| b.1.cmp(&a.1));
+    
+    // Collect features (nodes with type=feature)
+    let features: Vec<&Node> = graph.nodes.iter()
+        .filter(|n| n.node_type.as_deref() == Some("feature"))
+        .collect();
+    
+    if json {
+        let mut type_counts_vec: Vec<_> = type_counts.into_iter().collect();
+        type_counts_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        let mut relation_counts_vec: Vec<_> = relation_counts.into_iter().collect();
+        relation_counts_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        
+        println!("{}", serde_json::json!({
+            "project": {
+                "name": project_name,
+                "description": project_desc,
+            },
+            "nodes": {
+                "total": total_nodes,
+                "by_type": type_counts_vec.into_iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
+                "by_status": {
+                    "todo": todo_count,
+                    "in_progress": in_progress_count,
+                    "done": done_count,
+                    "blocked": blocked_count,
+                },
+                "code": {
+                    "files": file_count,
+                    "functions": function_count,
+                    "classes": class_count,
+                },
+            },
+            "edges": {
+                "total": total_edges,
+                "by_relation": relation_counts_vec.into_iter().map(|(k, v)| serde_json::json!({k: v})).collect::<Vec<_>>(),
+            },
+            "languages": languages.iter().map(|(lang, count)| serde_json::json!({lang: count})).collect::<Vec<_>>(),
+            "features": features.iter().map(|f| serde_json::json!({
+                "id": f.id,
+                "title": f.title,
+            })).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!("📊 Project: {}", project_name);
+        if let Some(desc) = project_desc {
+            println!("   Description: {}", desc);
+        }
+        println!();
+        
+        // Node counts
+        println!("📦 Nodes: {} total", total_nodes);
+        
+        // Count tasks (nodes with type=task)
+        let task_count = type_counts.get("task").copied().unwrap_or(0);
+        if task_count > 0 {
+            println!("   Tasks: {} ({} todo, {} in_progress, {} done)", 
+                task_count, todo_count, in_progress_count, done_count);
+        }
+        
+        // Features
+        if let Some(&feat_count) = type_counts.get("feature") {
+            if feat_count > 0 {
+                println!("   Features: {}", feat_count);
+            }
+        }
+        
+        // Components
+        if let Some(&comp_count) = type_counts.get("component") {
+            if comp_count > 0 {
+                println!("   Components: {}", comp_count);
+            }
+        }
+        
+        // Code entities
+        let total_code = file_count + function_count + class_count;
+        if total_code > 0 {
+            println!("   Code: {} ({} files, {} functions, {} classes)", 
+                total_code, file_count, function_count, class_count);
+        }
+        
+        println!();
+        
+        // Edge counts
+        println!("🔗 Edges: {} total", total_edges);
+        let mut sorted_relations: Vec<_> = relation_counts.iter().collect();
+        sorted_relations.sort_by(|a, b| b.1.cmp(a.1));
+        for (relation, count) in sorted_relations.iter().take(5) {
+            println!("   {}: {}", relation, count);
+        }
+        
+        println!();
+        
+        // Languages
+        if !languages.is_empty() {
+            let lang_list: Vec<String> = languages.iter()
+                .take(5)
+                .map(|(lang, count)| format!("{} ({})", lang, count))
+                .collect();
+            println!("🗣️  Languages: {}", lang_list.join(", "));
+        }
+        
+        // Features list
+        if !features.is_empty() {
+            println!();
+            println!("✨ Features:");
+            for feat in &features {
+                println!("   • {} — {}", feat.id, feat.title);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn cmd_tasks_ctx(ctx: &GraphContext, status_filter: Option<String>, ready_only: bool, layer: LayerFilter, compact: bool, json: bool) -> Result<()> {
     let graph = ctx.load()?;
     let filtered = apply_layer_filter(&graph, layer);
     let tasks: Vec<&Node> = if ready_only {
@@ -1034,6 +1201,13 @@ fn cmd_tasks_ctx(ctx: &GraphContext, status_filter: Option<String>, ready_only: 
                 "ready": summary.ready,
             }
         }));
+    } else if compact {
+        // Compact: one line per task, minimal info
+        for task in &tasks {
+            println!("{} {:30} {}", status_icon(&task.status), task.id, task.title);
+        }
+        let summary = filtered.summary();
+        println!("— {} tasks ({} todo, {} in_progress, {} done)", summary.total_nodes, summary.todo, summary.in_progress, summary.done);
     } else {
         if tasks.is_empty() {
             println!("No tasks found.");
@@ -2152,6 +2326,10 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
 
         // Generate bridge edges between project and code nodes
         gid_core::unify::generate_bridge_edges(&mut graph);
+
+        // Auto-link task nodes to code nodes based on file mentions in task titles/descriptions
+        gid_core::link_tasks_to_code(&code_graph, &mut graph);
+
         let bridge_count = graph.bridge_edges().len();
 
         // Re-write graph.yml with semantified results
