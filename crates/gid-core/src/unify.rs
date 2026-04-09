@@ -161,7 +161,7 @@ pub fn graph_to_codegraph(graph: &Graph) -> CodeGraph {
 
 /// Merge code-layer nodes/edges into an existing graph.
 /// Removes old code nodes (`source == "extract"`) and bridge edges (`source == "auto-bridge"`),
-/// then appends new code nodes/edges.
+/// then appends new code nodes/edges. Also prunes dangling edges that reference removed code nodes.
 pub fn merge_code_layer(graph: &mut Graph, code_nodes: Vec<Node>, code_edges: Vec<Edge>) {
     // Remove old code nodes
     graph.nodes.retain(|n| n.source.as_deref() != Some("extract"));
@@ -173,6 +173,37 @@ pub fn merge_code_layer(graph: &mut Graph, code_nodes: Vec<Node>, code_edges: Ve
     // Append new
     graph.nodes.extend(code_nodes);
     graph.edges.extend(code_edges);
+
+    // Prune dangling edges: edges whose from/to references a node that no longer exists.
+    // This catches stale edges left by deprecated code (e.g. old `code_*` node IDs from
+    // build_unified_graph/link_tasks_to_code that lacked a source tag).
+    // Only prune edges where the missing endpoint looks like it was a code node —
+    // project edges are allowed to reference forward-declared / not-yet-created task nodes.
+    let node_ids: std::collections::HashSet<&str> =
+        graph.nodes.iter().map(|n| n.id.as_str()).collect();
+    graph.edges.retain(|e| {
+        let from_ok = node_ids.contains(e.from.as_str());
+        let to_ok = node_ids.contains(e.to.as_str());
+        if from_ok && to_ok {
+            return true;
+        }
+        // Keep project-layer edges (no source tag, or source != extract/auto-bridge)
+        // even if their endpoints are missing — those are task/feature references.
+        let src = e.source();
+        if src != Some("extract") && src != Some("auto-bridge") {
+            // This is a project edge or unmarked edge. Only prune if endpoint
+            // looks like a stale code node (starts with "code_" prefix from the old
+            // code_node_to_task_id scheme).
+            let stale_from = !from_ok && e.from.starts_with("code_");
+            let stale_to = !to_ok && e.to.starts_with("code_");
+            if stale_from || stale_to {
+                return false; // prune stale code references
+            }
+            return true; // keep project edges with missing endpoints
+        }
+        // Extract/bridge edge with dangling endpoint → prune
+        false
+    });
 }
 
 /// Merge project-layer nodes into an existing graph (preserving code layer).

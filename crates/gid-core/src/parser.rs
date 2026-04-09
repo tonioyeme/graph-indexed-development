@@ -29,8 +29,10 @@ pub fn find_graph_file(project_dir: &Path) -> Option<std::path::PathBuf> {
     let candidates = [
         project_dir.join(".gid/graph.yml"),
         project_dir.join(".gid/graph.yaml"),
+        project_dir.join(".gid/graph.db"),
         project_dir.join("graph.yml"),
         project_dir.join("graph.yaml"),
+        project_dir.join("graph.db"),
     ];
     candidates.into_iter().find(|p| p.exists())
 }

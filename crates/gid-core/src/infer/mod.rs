@@ -24,9 +24,9 @@ pub mod integration;
 
 #[cfg(feature = "infomap")]
 pub use clustering::{
-    auto_name, build_network, cluster, map_to_components, relation_weight, run_clustering,
-    ClusterConfig, ClusterMetrics, ClusterResult, RawCluster, WEIGHT_CALLS, WEIGHT_DEPENDS_ON,
-    WEIGHT_IMPORTS, WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF,
+    auto_config, auto_name, build_network, cluster, map_to_components, relation_weight,
+    run_clustering, ClusterConfig, ClusterMetrics, ClusterResult, RawCluster, WEIGHT_CALLS,
+    WEIGHT_DEPENDS_ON, WEIGHT_IMPORTS, WEIGHT_STRUCTURAL, WEIGHT_TYPE_REF,
 };
 
 #[cfg(feature = "infomap")]
@@ -151,7 +151,25 @@ pub async fn run(
     };
 
     // Step 1: Clustering (always runs)
-    let cluster_result = clustering::cluster(effective_graph, &config.clustering)?;
+    // Auto-tune config if using defaults
+    let effective_clustering_config = {
+        let file_count = effective_graph
+            .nodes
+            .iter()
+            .filter(|n| {
+                n.node_type.as_deref() == Some("file")
+                    || (n.node_type.as_deref() == Some("code")
+                        && n.node_kind.as_deref() == Some("File"))
+            })
+            .count();
+        // If user specified default min_community_size (2), auto-tune
+        if config.clustering.min_community_size == ClusterConfig::default().min_community_size {
+            clustering::auto_config(file_count)
+        } else {
+            config.clustering.clone()
+        }
+    };
+    let cluster_result = clustering::cluster(effective_graph, &effective_clustering_config)?;
 
     if cluster_result.nodes.is_empty() {
         return Ok(InferResult::empty("No communities detected"));

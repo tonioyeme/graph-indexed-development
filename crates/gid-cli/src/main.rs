@@ -896,7 +896,7 @@ fn main() -> Result<()> {
             let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
             cmd_edit_graph_ctx(&ctx, &operations, cli.json)
         }
-        Commands::Extract { dir, format, output, no_lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, !no_lsp, force, no_semantify, cli.graph.as_ref()),
+        Commands::Extract { dir, format, output, no_lsp, force, no_semantify } => cmd_extract(&dir, &format, output.as_deref(), cli.json, !no_lsp, force, no_semantify, cli.graph.as_ref(), backend_arg),
         Commands::Analyze { file, callers, callees, impact } => cmd_analyze(&file, callers, callees, impact, cli.json),
         Commands::CodeSearch { keywords, dir, format_llm } => cmd_code_search(&dir, &keywords, format_llm, cli.json),
         Commands::CodeFailures { changed, p2p, f2p, dir } => cmd_code_failures(&dir, &changed, p2p.as_deref(), f2p.as_deref(), cli.json),
@@ -2022,7 +2022,7 @@ fn cmd_query_topo(ctx: &GraphContext, json: bool) -> Result<()> {
 
 
 
-fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool, graph_override: Option<&PathBuf>) -> Result<()> {
+fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, json_flag: bool, lsp: bool, force: bool, no_semantify: bool, graph_override: Option<&PathBuf>, backend_arg: Option<String>) -> Result<()> {
     let dir = if dir.is_absolute() {
         dir.clone()
     } else {
@@ -2057,6 +2057,14 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
             })
     };
     let meta_path = gid_dir.join("extract-meta.json");
+
+    // Resolve storage backend (explicit flag > auto-detect from .gid/ contents)
+    let explicit_backend = match backend_arg {
+        Some(ref s) => Some(s.parse::<StorageBackend>()
+            .map_err(|e| anyhow::anyhow!("{}", e))?),
+        None => None,
+    };
+    let backend = gid_core::storage::resolve_backend(explicit_backend, &gid_dir);
 
     if !json_flag {
         if force {
@@ -2126,29 +2134,26 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
     // Convert CodeGraph to graph nodes/edges
     let (code_nodes, code_edges) = codegraph_to_graph_nodes(&code_graph, &dir);
 
-    // Load existing graph.yml (preserves project tasks)
-    let graph_yml_path = gid_dir.join("graph.yml");
-    let mut graph = if graph_yml_path.exists() {
-        load_graph(&graph_yml_path).unwrap_or_default()
-    } else {
-        Graph::default()
-    };
+    // Load existing graph (preserves project tasks)
+    let mut graph = load_graph_auto(&gid_dir, Some(backend)).unwrap_or_default();
 
     // Merge code layer (replaces old extract nodes, preserves project nodes)
     let code_node_count = code_nodes.len();
     let code_edge_count = code_edges.len();
     merge_code_layer(&mut graph, code_nodes, code_edges);
 
-    // Atomic write: tmp → rename
-    let tmp_path = graph_yml_path.with_extension("yml.tmp");
-    let yaml = serde_yaml::to_string(&graph)?;
-    std::fs::write(&tmp_path, &yaml)?;
-    std::fs::rename(&tmp_path, &graph_yml_path)?;
+    // Save graph via resolved backend
+    save_graph_auto(&graph, &gid_dir, Some(backend))
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     if !json_flag {
         let project_count = graph.project_nodes().len();
-        eprintln!("✓ Wrote {} code nodes + {} code edges to graph.yml ({} project nodes preserved)",
-            code_node_count, code_edge_count, project_count);
+        let backend_label = match backend {
+            StorageBackend::Sqlite => "graph.db",
+            StorageBackend::Yaml => "graph.yml",
+        };
+        eprintln!("✓ Wrote {} code nodes + {} code edges to {} ({} project nodes preserved)",
+            code_node_count, code_edge_count, backend_label, project_count);
     }
 
     // Auto-semantify: assign architectural layers to code nodes
@@ -2160,11 +2165,9 @@ fn cmd_extract(dir: &PathBuf, format: &str, output: Option<&std::path::Path>, js
 
         let bridge_count = graph.bridge_edges().len();
 
-        // Re-write graph.yml with semantified results
-        let tmp_path2 = graph_yml_path.with_extension("yml.tmp");
-        let yaml2 = serde_yaml::to_string(&graph)?;
-        std::fs::write(&tmp_path2, &yaml2)?;
-        std::fs::rename(&tmp_path2, &graph_yml_path)?;
+        // Re-save graph with semantified results
+        save_graph_auto(&graph, &gid_dir, Some(backend))
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         if !json_flag {
             eprintln!("✓ Auto-semantify: assigned layers to {} nodes, generated {} bridge edges",

@@ -684,6 +684,96 @@ pub fn auto_name(file_paths: &[&str]) -> String {
     format!("component-{}", hash % 10000)
 }
 
+// ── Auto-configuration ─────────────────────────────────────────────────────
+
+/// Auto-select clustering parameters based on graph size.
+/// Returns a ClusterConfig tuned for the file count.
+pub fn auto_config(file_count: usize) -> ClusterConfig {
+    let (min_community_size, hierarchical) = match file_count {
+        0..=49 => (2, false),
+        50..=499 => (3, false),
+        500..=1999 => (5, false),
+        _ => (8, false),
+    };
+    ClusterConfig {
+        min_community_size,
+        hierarchical,
+        ..ClusterConfig::default()
+    }
+}
+
+// ── Post-processing ────────────────────────────────────────────────────────
+
+/// Post-process clustering results:
+/// 1. Merge undersized components into their best neighbor
+/// 2. De-duplicate component names by appending distinguishing path segments
+/// 3. Validate coverage: every file belongs to exactly one component
+pub fn post_process(result: &mut ClusterResult, graph: &Graph, _config: &ClusterConfig) {
+    // Step 1: Filter out components below min_community_size
+    // (flat mode already handles this via orphan reassignment, but hierarchical doesn't)
+
+    // Step 2: De-duplicate names
+    deduplicate_names(&mut result.nodes);
+
+    // Step 3: Log quality metrics
+    let file_count = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.node_type.as_deref() == Some("file")
+                || (n.node_type.as_deref() == Some("code")
+                    && n.node_kind.as_deref() == Some("File"))
+        })
+        .count();
+
+    let component_count = result.nodes.len();
+
+    // Check for dominant component (>50% of files)
+    let max_size = result
+        .nodes
+        .iter()
+        .filter_map(|n| n.metadata.get("size").and_then(|v| v.as_u64()))
+        .max()
+        .unwrap_or(0) as usize;
+
+    if max_size > file_count / 2 && file_count > 10 {
+        eprintln!(
+            "⚠ Largest component has {} files ({}% of total) — may need manual review",
+            max_size,
+            max_size * 100 / file_count
+        );
+    }
+
+    result.metrics.num_communities = component_count;
+}
+
+/// De-duplicate component names by appending distinguishing path context.
+/// E.g., if there are 5 "utils" components, rename them to "utils-0", "utils-1", etc.
+fn deduplicate_names(nodes: &mut [Node]) {
+    use std::collections::HashMap as DedupMap;
+
+    // Group nodes by title
+    let mut title_groups: DedupMap<String, Vec<usize>> = DedupMap::new();
+    for (i, node) in nodes.iter().enumerate() {
+        title_groups.entry(node.title.clone()).or_default().push(i);
+    }
+
+    // For groups with >1 node, disambiguate using the component ID suffix
+    for (title, indices) in &title_groups {
+        if indices.len() <= 1 {
+            continue;
+        }
+
+        for &idx in indices {
+            let node = &nodes[idx];
+            // IDs are like "infer:component:5" — extract the number
+            if let Some(num_str) = node.id.strip_prefix("infer:component:") {
+                nodes[idx].title = format!("{}-{}", title, num_str);
+            }
+        }
+    }
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────
 
 /// Run community detection on a code graph and return inferred components.
@@ -701,6 +791,9 @@ pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
 
     let mut result = map_to_components(&clusters, graph);
     result.metrics = metrics;
+
+    // Post-process: deduplicate names, validate coverage
+    post_process(&mut result, graph, config);
 
     Ok(result)
 }

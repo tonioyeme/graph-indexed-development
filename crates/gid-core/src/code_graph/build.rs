@@ -294,6 +294,11 @@ impl CodeGraph {
             let lang_edge_indices: Vec<usize> = call_edge_indices
                 .iter()
                 .filter(|&&idx| {
+                    // Guard: edges may have been removed/added in a previous language iteration,
+                    // invalidating indices collected before the loop.
+                    if idx >= self.edges.len() {
+                        return false;
+                    }
                     let edge = &self.edges[idx];
                     let caller_file = self
                         .node_by_id(&edge.from)
