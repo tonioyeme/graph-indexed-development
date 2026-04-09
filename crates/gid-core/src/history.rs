@@ -14,7 +14,8 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use crate::graph::Graph;
-use crate::parser::{load_graph, save_graph};
+use crate::parser::load_graph;  // for load_version() — history snapshots are always YAML
+use crate::storage::{load_graph_auto, save_graph_auto, StorageBackend};  // for restore()
 
 /// Maximum number of history entries to keep.
 const MAX_HISTORY_ENTRIES: usize = 50;
@@ -324,19 +325,19 @@ impl HistoryManager {
     }
     
     /// Restore a historical version to the main graph file.
-    pub fn restore(&self, version: &str, graph_path: &Path) -> Result<()> {
+    pub fn restore(&self, version: &str, gid_dir: &Path, backend: Option<StorageBackend>) -> Result<()> {
         let start = std::time::Instant::now();
         let historical = self.load_version(version)?;
         
         // Save current state to history first
-        if graph_path.exists() {
-            if let Ok(current) = load_graph(graph_path) {
+        if let Ok(current) = load_graph_auto(gid_dir, backend) {
+            if !current.nodes.is_empty() || !current.edges.is_empty() {
                 self.save_snapshot(&current, Some("Auto-snapshot before restore"))?;
             }
         }
         
         // Write the historical version as the current graph
-        save_graph(&historical, graph_path)?;
+        save_graph_auto(&historical, gid_dir, backend).map_err(|e| anyhow::anyhow!("{e}"))?;
         
         let elapsed = start.elapsed();
         tracing::info!(
@@ -376,6 +377,7 @@ impl HistoryManager {
 mod tests {
     use super::*;
     use crate::graph::{Node, Edge, NodeStatus, ProjectMeta};
+    use crate::parser::save_graph;
     use tempfile::TempDir;
     
     #[test]
@@ -1025,7 +1027,7 @@ mod tests {
         save_graph(&v2, &graph_path).unwrap();
 
         // Restore v1
-        mgr.restore(&v1_file, &graph_path).unwrap();
+        mgr.restore(&v1_file, &gid_dir, Some(StorageBackend::Yaml)).unwrap();
 
         // Current graph should now be v1
         let current = load_graph(&graph_path).unwrap();
@@ -1059,7 +1061,7 @@ mod tests {
         let before_count = mgr.list_snapshots().unwrap().len();
 
         // Restore v1 — should auto-snapshot v2 first
-        mgr.restore(&v1_file, &graph_path).unwrap();
+        mgr.restore(&v1_file, &gid_dir, Some(StorageBackend::Yaml)).unwrap();
 
         let after = mgr.list_snapshots().unwrap();
         assert_eq!(after.len(), before_count + 1, "restore should create auto-snapshot");
@@ -1095,7 +1097,7 @@ mod tests {
         save_graph(&Graph::new(), &graph_path).unwrap();
 
         // Restore
-        mgr.restore(&filename, &graph_path).unwrap();
+        mgr.restore(&filename, &gid_dir, Some(StorageBackend::Yaml)).unwrap();
 
         let restored = load_graph(&graph_path).unwrap();
         let n = &restored.nodes[0];
@@ -1116,9 +1118,8 @@ mod tests {
         let gid_dir = temp.path().join(".gid");
         fs::create_dir_all(&gid_dir).unwrap();
         let mgr = HistoryManager::new(&gid_dir);
-        let graph_path = gid_dir.join("graph.yml");
 
-        let result = mgr.restore("nonexistent.yml", &graph_path);
+        let result = mgr.restore("nonexistent.yml", &gid_dir, Some(StorageBackend::Yaml));
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("not found"), "Error should mention 'not found': {}", err_msg);
@@ -1431,7 +1432,7 @@ mod tests {
         save_graph(&Graph::new(), &graph_path).unwrap();
 
         // Restore and verify
-        mgr.restore(&f, &graph_path).unwrap();
+        mgr.restore(&f, &gid_dir, Some(StorageBackend::Yaml)).unwrap();
         let restored = load_graph(&graph_path).unwrap();
 
         // Compare against original directly (not re-loading snapshot, which may have been
@@ -1533,7 +1534,7 @@ mod tests {
 
         // graph_path doesn't exist — restore should still work
         assert!(!graph_path.exists());
-        mgr.restore(&filename, &graph_path).unwrap();
+        mgr.restore(&filename, &gid_dir, Some(StorageBackend::Yaml)).unwrap();
 
         let restored = load_graph(&graph_path).unwrap();
         assert_eq!(restored.nodes.len(), 1);

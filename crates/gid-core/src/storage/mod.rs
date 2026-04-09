@@ -50,7 +50,7 @@ impl std::fmt::Display for StorageBackend {
 /// Detection rules:
 /// 1. If `graph.db` exists → SQLite
 /// 2. If `graph.yml` exists → YAML
-/// 3. Neither → default to YAML (new project)
+/// 3. Neither → default to SQLite (new project)
 ///
 /// The user can override via `--backend yaml|sqlite` CLI flag.
 pub fn detect_backend(gid_dir: &std::path::Path) -> StorageBackend {
@@ -62,8 +62,8 @@ pub fn detect_backend(gid_dir: &std::path::Path) -> StorageBackend {
     } else if yaml_path.exists() {
         StorageBackend::Yaml
     } else {
-        // New project — default to YAML for backwards compatibility
-        StorageBackend::Yaml
+        // New project — default to SQLite
+        StorageBackend::Sqlite
     }
 }
 
@@ -202,7 +202,11 @@ pub fn load_graph_auto(
         #[cfg(feature = "sqlite")]
         StorageBackend::Sqlite => {
             let db_path = gid_dir.join("graph.db");
-            load_graph_from_sqlite(&db_path).map_err(|e| e.into())
+            if db_path.exists() {
+                load_graph_from_sqlite(&db_path).map_err(|e| e.into())
+            } else {
+                Ok(crate::Graph::default())
+            }
         }
         #[cfg(not(feature = "sqlite"))]
         StorageBackend::Sqlite => {
@@ -268,9 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_defaults_to_yaml_empty_dir() {
+    fn test_detect_defaults_to_sqlite_empty_dir() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(detect_backend(tmp.path()), StorageBackend::Yaml);
+        assert_eq!(detect_backend(tmp.path()), StorageBackend::Sqlite);
     }
 
     #[test]

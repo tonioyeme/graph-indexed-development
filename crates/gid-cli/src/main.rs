@@ -2423,7 +2423,7 @@ fn cmd_history_restore(ctx: &GraphContext, version: &str, force: bool, json: boo
     }
     
     let mgr = HistoryManager::new(&ctx.gid_dir);
-    mgr.restore(version, &ctx.graph_yml)?;
+    mgr.restore(version, &ctx.gid_dir, Some(ctx.backend))?;
     
     if json {
         println!("{}", serde_json::json!({"success": true, "restored": version}));
@@ -4153,6 +4153,7 @@ fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_lsp: bool, no_semantify: bool, 
         debounce_ms,
         lsp: !no_lsp,
         no_semantify,
+        backend: None,
     };
 
     eprintln!("👁 Watching {} for changes (debounce: {}ms)", dir.display(), debounce_ms);

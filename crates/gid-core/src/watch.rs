@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use crate::code_graph::CodeGraph;
 use crate::graph::Graph;
 use crate::ignore::IgnoreList;
-use crate::parser::load_graph;
+use crate::storage::{load_graph_auto, save_graph_auto, StorageBackend};
 use crate::unify::{codegraph_to_graph_nodes, merge_code_layer, generate_bridge_edges};
 use crate::semantify::apply_heuristic_layers;
 
@@ -46,6 +46,8 @@ pub struct WatchConfig {
     pub lsp: bool,
     /// Whether to skip semantify.
     pub no_semantify: bool,
+    /// Storage backend override (None = auto-detect).
+    pub backend: Option<StorageBackend>,
 }
 
 impl WatchConfig {
@@ -57,6 +59,7 @@ impl WatchConfig {
             debounce_ms: 1000,
             lsp: true,
             no_semantify: false,
+            backend: None,
         }
     }
 }
@@ -154,12 +157,7 @@ pub fn sync_on_change(config: &WatchConfig) -> Result<SyncResult> {
     let code_edge_count = code_edges.len();
 
     // Load existing graph
-    let graph_path = config.gid_dir.join("graph.yml");
-    let mut graph = if graph_path.exists() {
-        load_graph(&graph_path).unwrap_or_default()
-    } else {
-        Graph::default()
-    };
+    let mut graph = load_graph_auto(&config.gid_dir, config.backend).unwrap_or_default();
 
     // Merge code layer
     merge_code_layer(&mut graph, code_nodes, code_edges);
@@ -172,14 +170,9 @@ pub fn sync_on_change(config: &WatchConfig) -> Result<SyncResult> {
 
     let bridge_count = graph.bridge_edges().len();
 
-    // Atomic write: tmp → rename
-    let tmp_path = graph_path.with_extension("yml.tmp");
-    let yaml = serde_yaml::to_string(&graph)
-        .context("failed to serialize graph")?;
-    std::fs::write(&tmp_path, &yaml)
-        .context("failed to write temp graph file")?;
-    std::fs::rename(&tmp_path, &graph_path)
-        .context("failed to rename temp graph file")?;
+    // Save graph via backend-agnostic storage
+    save_graph_auto(&graph, &config.gid_dir, config.backend)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(SyncResult {
         files_changed,
@@ -196,6 +189,7 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+    use crate::parser::load_graph;
 
     fn setup_test_project(source: &str) -> (TempDir, PathBuf, PathBuf) {
         let tmp = TempDir::new().unwrap();
