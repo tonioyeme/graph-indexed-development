@@ -26,7 +26,7 @@ use super::types::{
 use crate::code_graph::CodeGraph;
 
 use crate::advise::analyze as advise_analyze;
-use crate::save_graph;
+use crate::storage::save_graph_auto;
 
 use super::executor::TaskExecutor;
 use super::replanner::Replanner;
@@ -58,7 +58,6 @@ pub async fn execute_plan(
     worktree_mgr: &dyn WorktreeManager,
     gid_root: &Path,
 ) -> Result<ExecutionResult> {
-    let graph_path = gid_root.join("graph.yml");
     let start = Instant::now();
 
     // Load or create execution state
@@ -113,7 +112,7 @@ pub async fn execute_plan(
                     node.status = NodeStatus::Todo;
                 }
             }
-            save_graph(graph, &graph_path).ok();
+            save_graph_auto(graph, gid_root, None).ok();
             exec_state.mark_cancelled();
             exec_state.save(gid_root).ok();
 
@@ -160,7 +159,7 @@ pub async fn execute_plan(
                 if let Some(node) = graph.get_node_mut(&task.id) {
                     node.status = NodeStatus::Blocked;
                 }
-                save_graph(graph, &graph_path).ok();
+                save_graph_auto(graph, gid_root, None).ok();
                 tasks_failed += 1;
                 continue;
             }
@@ -177,7 +176,7 @@ pub async fn execute_plan(
                 if let Some(node) = graph.get_node_mut(&task.id) {
                     node.status = NodeStatus::InProgress;
                 }
-                save_graph(graph, &graph_path).ok();
+                save_graph_auto(graph, gid_root, None).ok();
 
                 telemetry.log_event(&ExecutionEvent::TaskStart {
                     task_id: task.id.clone(),
@@ -192,7 +191,7 @@ pub async fn execute_plan(
                         if let Some(node) = graph.get_node_mut(&task.id) {
                             node.status = NodeStatus::Failed;
                         }
-                        save_graph(graph, &graph_path).ok();
+                        save_graph_auto(graph, gid_root, None).ok();
                         tasks_failed += 1;
                         continue;
                     }
@@ -352,7 +351,7 @@ pub async fn execute_plan(
                                     }
 
                                     // Save graph with new tasks
-                                    save_graph(graph, &graph_path).ok();
+                                    save_graph_auto(graph, gid_root, None).ok();
                                 }
                             }
                         }
@@ -367,7 +366,7 @@ pub async fn execute_plan(
                     }
                 }
 
-                save_graph(graph, &graph_path).ok(); // GUARD-7
+                save_graph_auto(graph, gid_root, None).ok(); // GUARD-7
                 layer_results.push(task.id.clone());
             }
         }

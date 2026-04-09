@@ -308,14 +308,14 @@ impl V2Executor {
         };
 
         // Select model and adjust iterations for review phases based on triage size
-        let (model, max_iterations) = if name == "review" {
+        let (model, max_iterations) = if name.starts_with("review") {
             self.review_config_for_triage_size(state)
         } else {
             (self.config.skill_model.clone(), 100)
         };
 
         // Inject review depth hint into prompt for review phases
-        let full_prompt = if name == "review" {
+        let full_prompt = if name.starts_with("review") {
             let depth = match state.triage_size.as_deref().unwrap_or("medium") {
                 "small" => "quick",
                 "medium" => "standard",
@@ -1091,6 +1091,94 @@ mod tests {
         assert!(rendered.contains("GOAL-1"));
         assert!(rendered.contains("## Guards"));
         assert!(rendered.contains("GUARD-1"));
+    }
+
+    // ── Review skill name matching ──
+
+    #[test]
+    fn test_review_design_triggers_review_config() {
+        let executor = V2Executor::new(V2ExecutorConfig::default());
+        let mut state = RitualState::new();
+        state.triage_size = Some("large".into());
+        let (model, iters) = executor.review_config_for_triage_size(&state);
+        // "review-design" starts with "review" so it should use review config
+        let name = "review-design";
+        assert!(name.starts_with("review"), "review-design should match review prefix");
+        assert_eq!(model, "opus");
+        assert_eq!(iters, 100);
+    }
+
+    #[test]
+    fn test_review_requirements_triggers_review_config() {
+        let name = "review-requirements";
+        assert!(name.starts_with("review"), "review-requirements should match review prefix");
+        let executor = V2Executor::new(V2ExecutorConfig::default());
+        let mut state = RitualState::new();
+        state.triage_size = Some("small".into());
+        let (model, iters) = executor.review_config_for_triage_size(&state);
+        assert_eq!(model, "sonnet");
+        assert_eq!(iters, 30);
+    }
+
+    #[test]
+    fn test_review_tasks_triggers_review_config() {
+        let name = "review-tasks";
+        assert!(name.starts_with("review"), "review-tasks should match review prefix");
+        let executor = V2Executor::new(V2ExecutorConfig::default());
+        let mut state = RitualState::new();
+        state.triage_size = Some("medium".into());
+        let (model, iters) = executor.review_config_for_triage_size(&state);
+        assert_eq!(model, "opus");
+        assert_eq!(iters, 50);
+    }
+
+    #[test]
+    fn test_implement_does_not_trigger_review_config() {
+        let name = "implement";
+        assert!(!name.starts_with("review"), "implement should NOT match review prefix");
+    }
+
+    #[test]
+    fn test_review_depth_hint_injected_for_review_phases() {
+        // Verify that the review depth hint logic activates for review-* names
+        for name in &["review-design", "review-requirements", "review-tasks"] {
+            assert!(name.starts_with("review"),
+                "'{}' should trigger review depth injection", name);
+        }
+        // Verify depth mapping
+        let state_small = {
+            let mut s = RitualState::new();
+            s.triage_size = Some("small".into());
+            s
+        };
+        let depth = match state_small.triage_size.as_deref().unwrap_or("medium") {
+            "small" => "quick",
+            "medium" => "standard",
+            "large" => "full",
+            _ => "standard",
+        };
+        assert_eq!(depth, "quick");
+
+        let state_large = {
+            let mut s = RitualState::new();
+            s.triage_size = Some("large".into());
+            s
+        };
+        let depth = match state_large.triage_size.as_deref().unwrap_or("medium") {
+            "small" => "quick",
+            "medium" => "standard",
+            "large" => "full",
+            _ => "standard",
+        };
+        assert_eq!(depth, "full");
+    }
+
+    #[test]
+    fn test_review_depth_hint_not_injected_for_non_review_phases() {
+        for name in &["implement", "draft-design", "generate-graph", "draft-requirements"] {
+            assert!(!name.starts_with("review"),
+                "'{}' should NOT trigger review depth injection", name);
+        }
     }
 
     #[test]

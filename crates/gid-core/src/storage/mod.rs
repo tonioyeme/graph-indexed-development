@@ -188,7 +188,7 @@ pub fn save_graph_to_sqlite(graph: &crate::Graph, db_path: &std::path::Path) -> 
 pub fn load_graph_auto(
     gid_dir: &std::path::Path,
     explicit_backend: Option<StorageBackend>,
-) -> Result<crate::Graph, Box<dyn std::error::Error>> {
+) -> Result<crate::Graph, Box<dyn std::error::Error + Send + Sync>> {
     let backend = resolve_backend(explicit_backend, gid_dir);
     match backend {
         StorageBackend::Yaml => {
@@ -219,7 +219,7 @@ pub fn save_graph_auto(
     graph: &crate::Graph,
     gid_dir: &std::path::Path,
     explicit_backend: Option<StorageBackend>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let backend = resolve_backend(explicit_backend, gid_dir);
     match backend {
         StorageBackend::Yaml => {

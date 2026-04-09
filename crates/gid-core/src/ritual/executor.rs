@@ -13,6 +13,7 @@ use tracing::{info, debug, warn};
 use super::definition::{PhaseDefinition, PhaseKind, HarnessConfigOverride};
 use super::llm::{LlmClient, ToolDefinition};
 use super::scope::{ToolScope, BashPolicy, default_scope_for_phase};
+use crate::storage::{load_graph_auto, save_graph_auto};
 
 /// Result of executing a single phase.
 #[derive(Debug, Clone)]
@@ -441,11 +442,9 @@ impl GidCommandExecutor {
         args: &[String],
         context: &PhaseContext,
     ) -> Result<String> {
-        let graph_path = context.gid_root.join("graph.yml");
-
         match command {
             "advise" => {
-                let graph = crate::load_graph(&graph_path)?;
+                let graph = load_graph_auto(&context.gid_root, None).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let results = crate::advise::analyze(&graph);
                 let mut output = String::new();
                 for advice in &results.items {
@@ -464,15 +463,15 @@ impl GidCommandExecutor {
                     context.project_root.join(&args[0])
                 };
                 let code_graph = crate::code_graph::CodeGraph::extract_from_dir(&src_dir);
-                let mut graph = crate::load_graph(&graph_path).unwrap_or_default();
+                let mut graph = load_graph_auto(&context.gid_root, None).unwrap_or_default();
                 let (code_nodes, code_edges) = crate::unify::codegraph_to_graph_nodes(&code_graph, &context.project_root);
                 crate::unify::merge_code_layer(&mut graph, code_nodes, code_edges);
                 let stats = graph.summary();
-                crate::save_graph(&graph, &graph_path)?;
+                save_graph_auto(&graph, &context.gid_root, None).map_err(|e| anyhow::anyhow!("{e}"))?;
                 Ok(format!("Extracted code graph: {} total nodes, {} edges", stats.total_nodes, stats.total_edges))
             }
             "plan" => {
-                let graph = crate::load_graph(&graph_path)?;
+                let graph = load_graph_auto(&context.gid_root, None).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let plan = crate::harness::create_plan(&graph)?;
                 Ok(format!(
                     "Plan: {} tasks, {} layers, ~{} estimated turns\nCritical path: {}",
@@ -483,7 +482,7 @@ impl GidCommandExecutor {
                 ))
             }
             "validate" => {
-                let graph = crate::load_graph(&graph_path)?;
+                let graph = load_graph_auto(&context.gid_root, None).map_err(|e| anyhow::anyhow!("{e}"))?;
                 let summary = graph.summary();
                 let health = graph.health();
                 Ok(format!(
