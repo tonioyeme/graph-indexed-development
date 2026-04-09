@@ -512,6 +512,57 @@ enum Commands {
         #[arg(long)]
         no_semantify: bool,
     },
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Infer Commands (requires "infomap" feature via "full")
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Infer architecture: cluster code into components, label with LLM
+    Infer {
+        /// Inference level: component (clustering only), feature (+ LLM), all (= feature)
+        #[arg(long, default_value = "all")]
+        level: String,
+
+        /// Run only a specific phase: clustering, labeling, or integration
+        #[arg(long)]
+        phase: Option<String>,
+
+        /// LLM model for labeling (default: claude-sonnet-4-20250514)
+        #[arg(long, default_value = "claude-sonnet-4-20250514")]
+        model: String,
+
+        /// Skip LLM — clustering only with auto-naming
+        #[arg(long)]
+        no_llm: bool,
+
+        /// Preview results without writing to graph
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output format: summary, yaml, json
+        #[arg(long, default_value = "summary")]
+        format: String,
+
+        /// Max LLM token budget (default: 50000)
+        #[arg(long, default_value = "50000")]
+        max_tokens: usize,
+
+        /// Source directory for auto-extract (if no code nodes in graph)
+        #[arg(long)]
+        source: Option<PathBuf>,
+
+        /// Enable hierarchical clustering
+        #[arg(long)]
+        hierarchical: bool,
+
+        /// Number of Infomap optimization trials
+        #[arg(long)]
+        num_trials: Option<u32>,
+
+        /// Minimum community size (smaller clusters dissolved)
+        #[arg(long)]
+        min_community_size: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -959,6 +1010,11 @@ fn main() -> Result<()> {
         }
         Commands::Watch { dir, debounce, no_lsp, no_semantify } => {
             cmd_watch(&dir, debounce, no_lsp, no_semantify, cli.graph.as_ref())
+        }
+        Commands::Infer { level, phase, model, no_llm, dry_run, format, max_tokens, source, hierarchical, num_trials, min_community_size } => {
+            let ctx = resolve_graph_ctx(cli.graph, backend_arg)?;
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(cmd_infer(&ctx, &level, phase.as_deref(), &model, no_llm, dry_run, &format, max_tokens, source, hierarchical, num_trials, min_community_size, cli.json))
         }
     }
 }
@@ -4223,5 +4279,163 @@ fn cmd_watch(dir: &PathBuf, debounce_ms: u64, no_lsp: bool, no_semantify: bool, 
     }
 
     eprintln!("\n👋 Watch stopped.");
+    Ok(())
+}
+
+// =============================================================================
+// Infer Command
+// =============================================================================
+
+/// Bridge: SimpleLlm trait → claude CLI for the infer pipeline.
+struct CliSimpleLlm {
+    model: String,
+}
+
+#[async_trait::async_trait]
+impl gid_core::infer::SimpleLlm for CliSimpleLlm {
+    async fn complete(&self, prompt: &str) -> Result<String> {
+        let output = tokio::process::Command::new("claude")
+            .arg("-p")
+            .arg(prompt)
+            .arg("--model")
+            .arg(&self.model)
+            .output()
+            .await
+            .context("Failed to run claude CLI. Is it installed?")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!("claude CLI failed: {}", stderr);
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+async fn cmd_infer(
+    ctx: &GraphContext,
+    level_str: &str,
+    phase: Option<&str>,
+    model: &str,
+    no_llm: bool,
+    dry_run: bool,
+    format_str: &str,
+    max_tokens: usize,
+    source: Option<PathBuf>,
+    hierarchical: bool,
+    num_trials: Option<u32>,
+    min_community_size: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    use gid_core::infer;
+
+    let mut graph = ctx.load()?;
+
+    // Parse level
+    let level = match level_str {
+        "component" => infer::InferLevel::Component,
+        "feature" => infer::InferLevel::Feature,
+        "all" => infer::InferLevel::All,
+        other => bail!("Unknown level '{}'. Use: component, feature, all", other),
+    };
+
+    // Parse output format
+    let out_format = match format_str {
+        "summary" => infer::OutputFormat::Summary,
+        "yaml" => infer::OutputFormat::Yaml,
+        "json" => infer::OutputFormat::Json,
+        other => bail!("Unknown format '{}'. Use: summary, yaml, json", other),
+    };
+
+    // Build clustering config
+    let mut cluster_config = infer::ClusterConfig::default();
+    cluster_config.hierarchical = hierarchical;
+    if let Some(n) = num_trials {
+        cluster_config.num_trials = n;
+    }
+    if let Some(n) = min_community_size {
+        cluster_config.min_community_size = n;
+    }
+
+    // Build labeling config
+    let labeling_config = if no_llm {
+        None
+    } else {
+        let mut lc = infer::LabelingConfig::default();
+        lc.token_budget = max_tokens;
+        Some(lc)
+    };
+
+    // Build top-level config
+    let config = infer::InferConfig {
+        clustering: cluster_config,
+        labeling: labeling_config,
+        level,
+        format: out_format,
+        dry_run,
+        source_dir: source,
+    };
+
+    // Create LLM client if needed
+    let llm_client: Option<CliSimpleLlm> = if no_llm || level == infer::InferLevel::Component {
+        None
+    } else {
+        Some(CliSimpleLlm { model: model.to_string() })
+    };
+
+    // Handle --phase for step-by-step execution
+    if let Some(phase_str) = phase {
+        match phase_str {
+            "clustering" => {
+                eprintln!("Running clustering phase only...");
+                let cluster_result = infer::cluster(&graph, &config.clustering)?;
+                eprintln!("✅ Clustering complete: {} communities, codelength={:.3}",
+                    cluster_result.metrics.num_communities, cluster_result.metrics.codelength);
+
+                // In phase mode for clustering, output the component nodes
+                let result = infer::InferResult::from_phases(&cluster_result, &infer::LabelingResult::empty());
+                println!("{}", infer::format_output(&result, config.format));
+                return Ok(());
+            }
+            "labeling" => {
+                eprintln!("Running full pipeline (labeling requires clustering first)...");
+                // Fall through to full run — labeling can't run without clustering
+            }
+            "integration" => {
+                eprintln!("Running full pipeline then merging...");
+                // Fall through to full run — integration needs results
+            }
+            other => bail!("Unknown phase '{}'. Use: clustering, labeling, integration", other),
+        }
+    }
+
+    // Run full pipeline
+    eprintln!("🔍 Running infer pipeline (level={:?})...", config.level);
+    let result = infer::run(&graph, &config, llm_client.as_ref().map(|c| c as &dyn infer::SimpleLlm)).await?;
+
+    if result.node_count() == 0 {
+        eprintln!("⚠ No architecture inferred. Ensure the graph has code nodes (run `gid extract` first).");
+        return Ok(());
+    }
+
+    // Output formatted result
+    let output = infer::format_output(&result, if dry_run { infer::OutputFormat::Yaml } else { config.format });
+
+    if json {
+        // --json global flag overrides format
+        println!("{}", infer::format_output(&result, infer::OutputFormat::Json));
+    } else {
+        println!("{}", output);
+    }
+
+    // Merge into graph (unless dry-run)
+    if !dry_run {
+        let stats = infer::merge_into_graph(&mut graph, &result, true);
+        ctx.save(&graph)?;
+        eprintln!("\n📊 Merged: +{} components, +{} features, +{} edges ({} old removed, {} skipped)",
+            stats.components_added, stats.features_added, stats.edges_added,
+            stats.old_nodes_removed + stats.old_edges_removed, stats.nodes_skipped);
+    }
+
     Ok(())
 }
