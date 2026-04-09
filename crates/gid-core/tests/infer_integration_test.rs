@@ -311,11 +311,7 @@ async fn test_full_pipeline_with_llm() {
 // Test 4: Self-infer on gid-rs codebase (sanity check)
 // ═══════════════════════════════════════════════════════════════════
 
-// Self-infer test currently panics due to an index-out-of-bounds in
-// infomap-rs optimize.rs:232 when processing gid-core's complex graph topology.
-// Filed as a known issue. Test is valid but blocked by upstream bug.
 #[tokio::test]
-#[ignore = "blocked by infomap-rs index-out-of-bounds on complex graphs"]
 async fn test_gid_rs_self_infer() {
     // Check if the gid-rs source directory exists.
     let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");

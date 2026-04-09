@@ -194,7 +194,6 @@ mod tests {
 
     #[cfg(feature = "infomap")]
     #[tokio::test]
-    #[ignore = "blocked by infomap-rs index-out-of-bounds on complex graphs"]
     async fn test_auto_extract_trigger() {
         use std::path::PathBuf;
 
