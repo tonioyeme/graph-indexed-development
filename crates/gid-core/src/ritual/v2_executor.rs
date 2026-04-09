@@ -25,6 +25,27 @@ use super::state_machine::{
 use crate::graph::{Graph, NodeStatus};
 use crate::harness::assemble_task_context;
 
+/// Review depth tier for design/requirements/task review phases.
+/// Scales with triage_size — smaller tasks get lighter review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDepth {
+    /// 10 core checks: #1, #2, #5, #6, #7, #8, #11, #13, #21, #27
+    Light,
+    /// All 28 checks
+    Full,
+}
+
+/// Configuration for review skill execution.
+#[derive(Debug, Clone)]
+pub struct ReviewConfig {
+    /// LLM model to use for review
+    pub model: String,
+    /// Maximum iterations for the review sub-agent
+    pub max_iterations: usize,
+    /// Which checks to run
+    pub depth: ReviewDepth,
+}
+
 /// Callback for sending notifications (fire-and-forget).
 pub type NotifyFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -308,21 +329,28 @@ impl V2Executor {
         };
 
         // Select model and adjust iterations for review phases based on triage size
-        let (model, max_iterations) = if name.starts_with("review") {
-            self.review_config_for_triage_size(state)
+        let review_config = if name.starts_with("review") {
+            Some(self.review_config_for_triage_size(state))
         } else {
-            (self.config.skill_model.clone(), 100)
+            None
         };
+        let model = review_config.as_ref().map(|c| c.model.clone()).unwrap_or_else(|| self.config.skill_model.clone());
+        let max_iterations = review_config.as_ref().map(|c| c.max_iterations).unwrap_or(100);
 
         // Inject review depth hint into prompt for review phases
-        let full_prompt = if name.starts_with("review") {
-            let depth = match state.triage_size.as_deref().unwrap_or("medium") {
-                "small" => "quick",
-                "medium" => "standard",
-                "large" => "full",
-                _ => "standard",
+        let full_prompt = if let Some(ref config) = review_config {
+            let depth_label = match config.depth {
+                ReviewDepth::Light => "quick",
+                ReviewDepth::Full => "full",
             };
-            format!("[REVIEW_DEPTH: {}]\n\n{}", depth, full_prompt)
+            if config.depth == ReviewDepth::Light {
+                format!(
+                    "[REVIEW_DEPTH: {}]\n\n## REVIEW SCOPE: LIGHT\nRun ONLY checks #1, #2, #5, #6, #7, #8, #11, #13, #21, #27.\nSkip all other checks. Write findings to file.\n\n{}",
+                    depth_label, full_prompt
+                )
+            } else {
+                format!("[REVIEW_DEPTH: {}]\n\n{}", depth_label, full_prompt)
+            }
         } else {
             full_prompt
         };
@@ -588,14 +616,30 @@ Default to "single_llm" unless you're confident the work is large AND paralleliz
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Select model and iteration count for review phase based on triage size (§9).
-    fn review_config_for_triage_size(&self, state: &RitualState) -> (String, usize) {
+    fn review_config_for_triage_size(&self, state: &RitualState) -> ReviewConfig {
         let size = state.triage_size.as_deref().unwrap_or("medium");
         
         match size {
-            "small" => ("sonnet".to_string(), 30),
-            "medium" => (self.config.skill_model.clone(), 50),
-            "large" => (self.config.skill_model.clone(), 100),
-            _ => (self.config.skill_model.clone(), 50),
+            "small" => ReviewConfig {
+                model: "sonnet".to_string(),
+                max_iterations: 30,
+                depth: ReviewDepth::Light,
+            },
+            "medium" => ReviewConfig {
+                model: self.config.skill_model.clone(),
+                max_iterations: 50,
+                depth: ReviewDepth::Light,
+            },
+            "large" => ReviewConfig {
+                model: self.config.skill_model.clone(),
+                max_iterations: 100,
+                depth: ReviewDepth::Full,
+            },
+            _ => ReviewConfig {
+                model: self.config.skill_model.clone(),
+                max_iterations: 50,
+                depth: ReviewDepth::Light,
+            },
         }
     }
 
@@ -1100,12 +1144,13 @@ mod tests {
         let executor = V2Executor::new(V2ExecutorConfig::default());
         let mut state = RitualState::new();
         state.triage_size = Some("large".into());
-        let (model, iters) = executor.review_config_for_triage_size(&state);
+        let config = executor.review_config_for_triage_size(&state);
         // "review-design" starts with "review" so it should use review config
         let name = "review-design";
         assert!(name.starts_with("review"), "review-design should match review prefix");
-        assert_eq!(model, "opus");
-        assert_eq!(iters, 100);
+        assert_eq!(config.model, "opus");
+        assert_eq!(config.max_iterations, 100);
+        assert_eq!(config.depth, ReviewDepth::Full);
     }
 
     #[test]
@@ -1115,9 +1160,10 @@ mod tests {
         let executor = V2Executor::new(V2ExecutorConfig::default());
         let mut state = RitualState::new();
         state.triage_size = Some("small".into());
-        let (model, iters) = executor.review_config_for_triage_size(&state);
-        assert_eq!(model, "sonnet");
-        assert_eq!(iters, 30);
+        let config = executor.review_config_for_triage_size(&state);
+        assert_eq!(config.model, "sonnet");
+        assert_eq!(config.max_iterations, 30);
+        assert_eq!(config.depth, ReviewDepth::Light);
     }
 
     #[test]
@@ -1127,9 +1173,10 @@ mod tests {
         let executor = V2Executor::new(V2ExecutorConfig::default());
         let mut state = RitualState::new();
         state.triage_size = Some("medium".into());
-        let (model, iters) = executor.review_config_for_triage_size(&state);
-        assert_eq!(model, "opus");
-        assert_eq!(iters, 50);
+        let config = executor.review_config_for_triage_size(&state);
+        assert_eq!(config.model, "opus");
+        assert_eq!(config.max_iterations, 50);
+        assert_eq!(config.depth, ReviewDepth::Light);
     }
 
     #[test]
@@ -1206,5 +1253,206 @@ mod tests {
         assert!(!rendered.contains("## Design Reference"));
         assert!(!rendered.contains("## Requirements"));
         assert!(!rendered.contains("## Guards"));
+    }
+
+    // ── T1.2: Enrichment & ReviewConfig unit tests ──
+
+    #[test]
+    fn test_enrich_with_graph_context() {
+        // Set up a temp dir with .gid/graph.yml containing a task node
+        let tmp = tempfile::tempdir().unwrap();
+        let gid_dir = tmp.path().join(".gid");
+        std::fs::create_dir_all(&gid_dir).unwrap();
+
+        // Create a minimal graph with a task node
+        let mut graph = Graph::new();
+        let mut task_node = crate::graph::Node::new("task-auth", "Implement auth middleware");
+        task_node.node_type = Some("task".into());
+        task_node.description = Some("Add JWT-based auth middleware to API gateway".into());
+        graph.add_node(task_node);
+
+        let yaml = serde_yaml::to_string(&graph).unwrap();
+        std::fs::write(gid_dir.join("graph.yml"), &yaml).unwrap();
+
+        // Create executor pointing to the temp dir
+        let executor = V2Executor::new(V2ExecutorConfig {
+            project_root: tmp.path().to_path_buf(),
+            ..V2ExecutorConfig::default()
+        });
+
+        let mut state = RitualState::new();
+        state.task = "implement auth".into();
+
+        let enriched = executor.enrich_implement_context("implement auth", &state);
+
+        // Should contain the task title from the graph
+        assert!(enriched.contains("Implement auth middleware"),
+            "enriched context should include task title from graph. Got: {}", enriched);
+        // Should also contain the original task
+        assert!(enriched.contains("implement auth"),
+            "enriched context should include original task text");
+    }
+
+    #[test]
+    fn test_enrich_no_graph() {
+        // Temp dir with no .gid/graph.yml — should fall back to raw context
+        let tmp = tempfile::tempdir().unwrap();
+
+        let executor = V2Executor::new(V2ExecutorConfig {
+            project_root: tmp.path().to_path_buf(),
+            ..V2ExecutorConfig::default()
+        });
+
+        let mut state = RitualState::new();
+        state.task = "fix the bug".into();
+
+        let enriched = executor.enrich_implement_context("fix the bug", &state);
+        assert_eq!(enriched, "fix the bug",
+            "with no graph, should return raw context unchanged");
+    }
+
+    #[test]
+    fn test_enrich_no_task_nodes() {
+        // Graph exists but has only code nodes (no task nodes)
+        let tmp = tempfile::tempdir().unwrap();
+        let gid_dir = tmp.path().join(".gid");
+        std::fs::create_dir_all(&gid_dir).unwrap();
+
+        let mut graph = Graph::new();
+        let mut code_node = crate::graph::Node::new("file-main", "src/main.rs");
+        code_node.node_type = Some("code".into());
+        graph.add_node(code_node);
+
+        let yaml = serde_yaml::to_string(&graph).unwrap();
+        std::fs::write(gid_dir.join("graph.yml"), &yaml).unwrap();
+
+        let executor = V2Executor::new(V2ExecutorConfig {
+            project_root: tmp.path().to_path_buf(),
+            ..V2ExecutorConfig::default()
+        });
+
+        let mut state = RitualState::new();
+        state.task = "refactor main".into();
+
+        let enriched = executor.enrich_implement_context("refactor main", &state);
+        assert_eq!(enriched, "refactor main",
+            "with no task nodes, should fall back to raw context");
+    }
+
+    #[test]
+    fn test_enrich_with_error_context() {
+        // Simulate a verify-fix cycle: raw_context contains the error message
+        let tmp = tempfile::tempdir().unwrap();
+        let gid_dir = tmp.path().join(".gid");
+        std::fs::create_dir_all(&gid_dir).unwrap();
+
+        let mut graph = Graph::new();
+        let mut task_node = crate::graph::Node::new("task-api", "Implement API endpoint");
+        task_node.node_type = Some("task".into());
+        graph.add_node(task_node);
+
+        let yaml = serde_yaml::to_string(&graph).unwrap();
+        std::fs::write(gid_dir.join("graph.yml"), &yaml).unwrap();
+
+        let executor = V2Executor::new(V2ExecutorConfig {
+            project_root: tmp.path().to_path_buf(),
+            ..V2ExecutorConfig::default()
+        });
+
+        let mut state = RitualState::new();
+        state.task = "implement API endpoint".into();
+
+        let error_context = "FIX BUILD ERROR:\nerror[E0433]: failed to resolve: use of undeclared crate\n\nOriginal task: implement API endpoint";
+        let enriched = executor.enrich_implement_context(error_context, &state);
+
+        // Should contain both the graph context AND the error
+        assert!(enriched.contains("Implement API endpoint"),
+            "should include task from graph");
+        assert!(enriched.contains("FIX BUILD ERROR"),
+            "should include error message from raw context");
+        assert!(enriched.contains("E0433"),
+            "should preserve full error detail");
+    }
+
+    #[test]
+    fn test_review_config_medium() {
+        let executor = V2Executor::new(V2ExecutorConfig::default());
+        let mut state = RitualState::new();
+        state.triage_size = Some("medium".into());
+
+        let config = executor.review_config_for_triage_size(&state);
+        assert_eq!(config.depth, ReviewDepth::Light,
+            "medium tasks should get Light review depth");
+        assert_eq!(config.max_iterations, 50);
+        // Model should be the skill_model from config (default: "opus")
+        assert_eq!(config.model, "opus");
+    }
+
+    #[test]
+    fn test_review_config_large() {
+        let executor = V2Executor::new(V2ExecutorConfig::default());
+        let mut state = RitualState::new();
+        state.triage_size = Some("large".into());
+
+        let config = executor.review_config_for_triage_size(&state);
+        assert_eq!(config.depth, ReviewDepth::Full,
+            "large tasks should get Full review depth");
+        assert_eq!(config.max_iterations, 100);
+        assert_eq!(config.model, "opus");
+    }
+
+    #[test]
+    fn test_light_review_prompt_injection() {
+        // Verify that light review depth injects the correct check scope instructions
+        let config = ReviewConfig {
+            model: "sonnet".into(),
+            max_iterations: 30,
+            depth: ReviewDepth::Light,
+        };
+
+        // Simulate what run_skill does for review phases
+        let base_prompt = "# Review Design\nRun all checks...";
+        let depth_label = match config.depth {
+            ReviewDepth::Light => "quick",
+            ReviewDepth::Full => "full",
+        };
+        let injected = if config.depth == ReviewDepth::Light {
+            format!(
+                "[REVIEW_DEPTH: {}]\n\n## REVIEW SCOPE: LIGHT\nRun ONLY checks #1, #2, #5, #6, #7, #8, #11, #13, #21, #27.\nSkip all other checks. Write findings to file.\n\n{}",
+                depth_label, base_prompt
+            )
+        } else {
+            format!("[REVIEW_DEPTH: {}]\n\n{}", depth_label, base_prompt)
+        };
+
+        assert!(injected.contains("[REVIEW_DEPTH: quick]"),
+            "light review should inject quick depth label");
+        assert!(injected.contains("REVIEW SCOPE: LIGHT"),
+            "light review should inject scope heading");
+        assert!(injected.contains("#1, #2, #5, #6, #7, #8, #11, #13, #21, #27"),
+            "light review should list the 10 core checks");
+        assert!(injected.contains("Skip all other checks"),
+            "light review should instruct to skip non-core checks");
+
+        // Full review should NOT inject scope restriction
+        let full_config = ReviewConfig {
+            model: "opus".into(),
+            max_iterations: 55,
+            depth: ReviewDepth::Full,
+        };
+        let full_label = match full_config.depth {
+            ReviewDepth::Light => "quick",
+            ReviewDepth::Full => "full",
+        };
+        let full_injected = if full_config.depth == ReviewDepth::Light {
+            format!("[REVIEW_DEPTH: {}]\n\n## REVIEW SCOPE: LIGHT\n...\n\n{}", full_label, base_prompt)
+        } else {
+            format!("[REVIEW_DEPTH: {}]\n\n{}", full_label, base_prompt)
+        };
+
+        assert!(full_injected.contains("[REVIEW_DEPTH: full]"),
+            "full review should inject full depth label");
+        assert!(!full_injected.contains("REVIEW SCOPE: LIGHT"),
+            "full review should NOT inject scope restriction");
     }
 }

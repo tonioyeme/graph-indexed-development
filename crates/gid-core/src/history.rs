@@ -2,11 +2,9 @@
 //!
 //! Save snapshots with timestamps, list/diff/restore versions.
 
-// TODO: GOAL-3.1 — When SQLite backend is active, use rusqlite::backup::Backup
-// to create history snapshots as .db files instead of serializing to YAML.
-// Current approach: serialize Graph → YAML file (works for both backends)
-// Future approach: if source is .db, use Backup::new() for atomic, consistent snapshots
-// The rusqlite "backup" feature is already enabled in Cargo.toml.
+// GOAL-3.1: SQLite backend snapshots use `save_snapshot_sqlite()` with rusqlite::backup::Backup
+// for atomic, consistent .db snapshots. YAML backend uses `save_snapshot()` with serde_yaml.
+// The rusqlite "backup" feature is enabled in Cargo.toml.
 
 use std::path::{Path, PathBuf};
 use std::fs;
@@ -16,6 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::graph::Graph;
 use crate::parser::load_graph;  // for load_version() — history snapshots are always YAML
 use crate::storage::{load_graph_auto, save_graph_auto, StorageBackend};  // for restore()
+
+#[cfg(feature = "sqlite")]
+use sha2::{Sha256, Digest};
 
 /// Maximum number of history entries to keep.
 const MAX_HISTORY_ENTRIES: usize = 50;
@@ -170,6 +171,111 @@ impl HistoryManager {
         Ok(filename)
     }
     
+    /// Save a snapshot of the current SQLite graph database using the Backup API.
+    ///
+    /// Uses `rusqlite::backup::Backup` for atomic, consistent point-in-time snapshots
+    /// even with concurrent readers and WAL mode enabled.
+    ///
+    /// Returns the snapshot filename (e.g., "2026-04-09T13-45-00Z.db").
+    ///
+    /// [GOAL 3.1]
+    #[cfg(feature = "sqlite")]
+    pub fn save_snapshot_sqlite(
+        &self,
+        db: &rusqlite::Connection,
+        message: Option<&str>,
+    ) -> Result<String> {
+        let start = std::time::Instant::now();
+        self.ensure_dir()?;
+
+        let timestamp = chrono::Utc::now();
+        // Generate unique filename, handle same-second collisions
+        let base = timestamp.format("%Y-%m-%dT%H-%M-%SZ").to_string();
+        let filename = {
+            let candidate = format!("{}.db", base);
+            if !self.history_dir.join(&candidate).exists() {
+                candidate
+            } else {
+                let mut suffix = 1;
+                loop {
+                    let candidate = format!("{}-{}.db", base, suffix);
+                    if !self.history_dir.join(&candidate).exists() {
+                        break candidate;
+                    }
+                    suffix += 1;
+                }
+            }
+        };
+        let dest_path = self.history_dir.join(&filename);
+
+        // Perform backup via SQLite Backup API
+        let mut dest_conn = rusqlite::Connection::open(&dest_path)
+            .with_context(|| format!("Failed to open destination: {}", dest_path.display()))?;
+        {
+            let backup = rusqlite::backup::Backup::new(db, &mut dest_conn)
+                .with_context(|| "Failed to initialize SQLite backup")?;
+            backup
+                .run_to_completion(256, std::time::Duration::from_millis(50), None)
+                .with_context(|| "SQLite backup failed")?;
+        }
+        drop(dest_conn);
+
+        // Verify snapshot integrity
+        {
+            let verify_conn = rusqlite::Connection::open(&dest_path)?;
+            let integrity: String =
+                verify_conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+            if integrity != "ok" {
+                fs::remove_file(&dest_path)?;
+                anyhow::bail!("Snapshot integrity check failed: {}", integrity);
+            }
+        }
+
+        // Compute SHA-256 checksum
+        let checksum = {
+            let mut file = std::fs::File::open(&dest_path)?;
+            let mut hasher = Sha256::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                use std::io::Read;
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+            }
+            format!("sha256:{:x}", hasher.finalize())
+        };
+
+        let file_size = fs::metadata(&dest_path)?.len();
+
+        // Store message as a sidecar .meta file for this snapshot
+        if let Some(msg) = message {
+            let meta_path = dest_path.with_extension("db.meta");
+            let meta = serde_json::json!({
+                "message": msg,
+                "created_at": timestamp.to_rfc3339(),
+                "checksum": checksum,
+                "size_bytes": file_size,
+            });
+            fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+        }
+
+        // Clean up old history entries
+        self.cleanup()?;
+
+        let elapsed = start.elapsed();
+        tracing::info!(
+            filename = %filename,
+            file_size_bytes = file_size,
+            checksum = %checksum,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "saved SQLite history snapshot via backup API"
+        );
+
+        Ok(filename)
+    }
+
     /// List all history snapshots.
     pub fn list_snapshots(&self) -> Result<Vec<HistoryEntry>> {
         if !self.history_dir.exists() {
@@ -1674,5 +1780,125 @@ mod tests {
         // Both nonexistent
         let result = mgr.diff_versions("nope1.yml", "nope2.yml");
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    mod sqlite_backup_tests {
+        use super::*;
+        use rusqlite::Connection;
+
+        fn create_test_db(path: &Path) -> Connection {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch("
+                CREATE TABLE nodes (id TEXT PRIMARY KEY, title TEXT, status TEXT);
+                CREATE TABLE edges (from_id TEXT, to_id TEXT, relation TEXT);
+                INSERT INTO nodes VALUES ('task-1', 'Auth', 'todo');
+                INSERT INTO nodes VALUES ('task-2', 'Dashboard', 'done');
+                INSERT INTO edges VALUES ('task-2', 'task-1', 'depends_on');
+            ").unwrap();
+            conn
+        }
+
+        #[test]
+        fn test_sqlite_snapshot_save() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gid_dir = tmp.path().join(".gid");
+            fs::create_dir_all(&gid_dir).unwrap();
+            let mgr = HistoryManager::new(&gid_dir);
+
+            let db_path = gid_dir.join("graph.db");
+            let conn = create_test_db(&db_path);
+
+            let filename = mgr.save_snapshot_sqlite(&conn, Some("test snapshot")).unwrap();
+            assert!(filename.ends_with(".db"));
+
+            // Verify the snapshot file exists and is valid SQLite
+            let snap_path = gid_dir.join("history").join(&filename);
+            assert!(snap_path.exists());
+
+            let snap_conn = Connection::open(&snap_path).unwrap();
+            let count: i64 = snap_conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+            assert_eq!(count, 2);
+
+            let edge_count: i64 = snap_conn.query_row("SELECT COUNT(*) FROM edges", [], |r| r.get(0)).unwrap();
+            assert_eq!(edge_count, 1);
+        }
+
+        #[test]
+        fn test_sqlite_snapshot_integrity_verified() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gid_dir = tmp.path().join(".gid");
+            fs::create_dir_all(&gid_dir).unwrap();
+            let mgr = HistoryManager::new(&gid_dir);
+
+            let db_path = gid_dir.join("graph.db");
+            let conn = create_test_db(&db_path);
+
+            // Should succeed — integrity check passes on valid DB
+            let filename = mgr.save_snapshot_sqlite(&conn, None).unwrap();
+            assert!(filename.ends_with(".db"));
+        }
+
+        #[test]
+        fn test_sqlite_snapshot_meta_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gid_dir = tmp.path().join(".gid");
+            fs::create_dir_all(&gid_dir).unwrap();
+            let mgr = HistoryManager::new(&gid_dir);
+
+            let db_path = gid_dir.join("graph.db");
+            let conn = create_test_db(&db_path);
+
+            let filename = mgr.save_snapshot_sqlite(&conn, Some("v1 release")).unwrap();
+
+            // Check meta file exists
+            let meta_path = gid_dir.join("history").join(format!("{}.meta", filename));
+            assert!(meta_path.exists());
+
+            let meta: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+            assert_eq!(meta["message"], "v1 release");
+            assert!(meta["checksum"].as_str().unwrap().starts_with("sha256:"));
+        }
+
+        #[test]
+        fn test_sqlite_snapshot_no_meta_without_message() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gid_dir = tmp.path().join(".gid");
+            fs::create_dir_all(&gid_dir).unwrap();
+            let mgr = HistoryManager::new(&gid_dir);
+
+            let db_path = gid_dir.join("graph.db");
+            let conn = create_test_db(&db_path);
+
+            let filename = mgr.save_snapshot_sqlite(&conn, None).unwrap();
+
+            // No meta file when message is None
+            let meta_path = gid_dir.join("history").join(format!("{}.meta", filename));
+            assert!(!meta_path.exists());
+        }
+
+        #[test]
+        fn test_sqlite_snapshot_collision_handling() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gid_dir = tmp.path().join(".gid");
+            fs::create_dir_all(&gid_dir).unwrap();
+            let mgr = HistoryManager::new(&gid_dir);
+
+            let db_path = gid_dir.join("graph.db");
+            let conn = create_test_db(&db_path);
+
+            // Save two snapshots rapidly — should get different filenames
+            let f1 = mgr.save_snapshot_sqlite(&conn, Some("first")).unwrap();
+            let f2 = mgr.save_snapshot_sqlite(&conn, Some("second")).unwrap();
+            assert_ne!(f1, f2);
+
+            // Both should be valid
+            let snap1 = Connection::open(gid_dir.join("history").join(&f1)).unwrap();
+            let snap2 = Connection::open(gid_dir.join("history").join(&f2)).unwrap();
+            let c1: i64 = snap1.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+            let c2: i64 = snap2.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0)).unwrap();
+            assert_eq!(c1, 2);
+            assert_eq!(c2, 2);
+        }
     }
 }
