@@ -1354,91 +1354,70 @@ fn detect_modules(graph: &Graph) -> Vec<Advice> {
 
 /// Public API for running Infomap module detection independently.
 /// Returns a list of detected modules with their file paths and metadata.
+///
+/// Delegates to [`crate::infer::clustering::build_network`] for shared
+/// network-construction logic, then runs Infomap directly and maps results
+/// back to `DetectedModule` structs (preserving the existing public API).
 #[cfg(feature = "infomap")]
 pub fn detect_code_modules(graph: &Graph) -> Vec<DetectedModule> {
-    use infomap_rs::{Network, Infomap};
-    
-    let code_files: Vec<&Node> = graph.nodes.iter()
-        .filter(|n| n.node_type.as_deref() == Some("file"))
-        .collect();
-    
-    if code_files.len() < 2 {
+    use infomap_rs::Infomap;
+    use crate::infer::clustering::build_network;
+
+    let (net, idx_to_id) = build_network(graph);
+
+    if net.num_nodes() < 2 || net.num_edges() < 1 {
         return vec![];
     }
-    
-    let id_to_idx: HashMap<&str, usize> = code_files.iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), i))
+
+    // Build a reverse lookup: node_id → &Node for file-path resolution.
+    let node_map: HashMap<&str, &Node> = graph
+        .nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n))
         .collect();
-    
-    // Map code nodes to file indices
-    let mut node_to_file_idx: HashMap<&str, usize> = HashMap::new();
-    for (i, file_node) in code_files.iter().enumerate() {
-        node_to_file_idx.insert(file_node.id.as_str(), i);
-    }
-    for node in &graph.nodes {
-        if node.node_type.as_deref() == Some("file") {
-            continue;
-        }
-        if let Some(fp) = node.file_path.as_deref()
-            .or_else(|| node.metadata.get("file_path").and_then(|v| v.as_str()))
-        {
-            let file_id = format!("file:{}", fp);
-            if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
-                node_to_file_idx.insert(node.id.as_str(), idx);
-            }
-        }
-    }
-    
-    let mut net = Network::new();
-    let coupling_relations = ["calls", "imports", "depends_on", "inherits", "implements"];
-    
-    for edge in &graph.edges {
-        if !coupling_relations.contains(&edge.relation.as_str()) {
-            continue;
-        }
-        let from_idx = node_to_file_idx.get(edge.from.as_str())
-            .or_else(|| id_to_idx.get(edge.from.as_str()));
-        let to_idx = node_to_file_idx.get(edge.to.as_str())
-            .or_else(|| id_to_idx.get(edge.to.as_str()));
-        
-        if let (Some(&from), Some(&to)) = (from_idx, to_idx) {
-            if from != to {
-                net.add_edge(from, to, edge.weight.unwrap_or(1.0));
-            }
-        }
-    }
-    
-    if net.num_edges() < 1 {
-        return vec![];
-    }
-    
+
     let result = Infomap::new(&net)
         .seed(42)
         .num_trials(5)
         .hierarchical(false)
         .run();
-    
-    result.modules().iter().map(|m| {
-        let files: Vec<String> = m.nodes.iter()
-            .filter_map(|&idx| code_files.get(idx))
-            .map(|n| n.file_path.as_deref()
-                .or_else(|| n.metadata.get("file_path").and_then(|v| v.as_str()))
-                .unwrap_or(&n.title)
-                .to_string())
-            .collect();
-        let node_ids: Vec<String> = m.nodes.iter()
-            .filter_map(|&idx| code_files.get(idx))
-            .map(|n| n.id.clone())
-            .collect();
-        DetectedModule {
-            id: m.id,
-            files,
-            node_ids,
-            flow: m.flow,
-            size: m.num_nodes,
-        }
-    }).collect()
+
+    result
+        .modules()
+        .iter()
+        .map(|m| {
+            let files: Vec<String> = m
+                .nodes
+                .iter()
+                .filter_map(|&idx| idx_to_id.get(idx))
+                .filter_map(|nid| node_map.get(nid.as_str()))
+                .map(|n| {
+                    n.file_path
+                        .as_deref()
+                        .or_else(|| {
+                            n.metadata
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                        })
+                        .unwrap_or(&n.title)
+                        .to_string()
+                })
+                .collect();
+            let node_ids: Vec<String> = m
+                .nodes
+                .iter()
+                .filter_map(|&idx| idx_to_id.get(idx))
+                .map(|nid| nid.clone())
+                .collect();
+            DetectedModule {
+                id: m.id,
+                files,
+                node_ids,
+                flow: m.flow,
+                size: m.num_nodes,
+            }
+        })
+        .collect()
 }
 
 /// A detected code module (community) from Infomap analysis.

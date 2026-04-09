@@ -5,7 +5,7 @@
 
 ---
 
-## ISS-001 [bug] [P1] [closed] ✅
+## ISS-001 [bug] [P1] [closed]
 **发现日期**: 2026-04-02
 **发现者**: potato + RustClaw
 **组件**: gid-core, gid_extract / save_gid_graph
@@ -20,7 +20,7 @@
 
 ---
 
-## ISS-002 [improvement] [P0] [closed] ✅
+## ISS-002 [improvement] [P0] [closed]
 **发现日期**: 2026-04-05
 **更新日期**: 2026-04-05
 **发现者**: potato + RustClaw
@@ -70,7 +70,7 @@ Call edge 解析是纯 name-only matching，没有 receiver type 信息，导致
 
 ---
 
-## ISS-004 [improvement] [P1] [closed] ✅
+## ISS-004 [improvement] [P1] [closed]
 **发现日期**: 2026-04-05
 **发现者**: RustClaw
 **组件**: gid-core, lsp_client.rs
@@ -150,7 +150,7 @@ for start in 1..parts.len() {
 
 ---
 
-## ISS-006 [improvement] [P2] [closed] ✅
+## ISS-006 [improvement] [P2] [closed]
 **发现日期**: 2026-04-05
 **发现者**: RustClaw
 **组件**: gid-core, code_graph.rs
@@ -304,6 +304,42 @@ GID graph 应该是多层结构，层内有细分层级，层间有 edges 连接
 - **已定义的类型（Module, TestsFor）从未被使用** — 说明设计时想到了，实现时没做完
 
 **优先级**: P0 — 比 LSP (ISS-002) 更基础。LSP 提高代码层精度，但如果代码层和任务层连不起来，精度高了也没用
+
+---
+
+## ISS-011 [improvement] [P1] [open]
+**GID 工具缺少 workspace 参数 — 无法跨项目操作 graph**
+
+**发现日期**: 2026-04-09
+**发现者**: potato
+**组件**: gid-core, 所有 graph 操作 API + RustClaw gid tool bindings
+
+### 问题描述
+
+GID 的所有工具（`gid_add_task`、`gid_update_task`、`gid_tasks`、`gid_read` 等）只能操作当前 workspace 的 `.gid/graph.yml`，没有参数指定目标 workspace。
+
+**影响**:
+- RustClaw agent 的 workspace 是 `/Users/potato/rustclaw/`，要操作 gid-rs（`/Users/potato/clawd/projects/gid-rs/`）的 graph 只能通过 `exec` 调 CLI 或 `spawn_specialist` 设 workspace
+- Sub-agent 使用 `spawn_specialist` 时，即使设了 `workspace` 参数，其 GID 工具仍指向主 agent 的 workspace（需验证）
+- 跨项目任务管理被迫绕路，效率低且容易出错（如上个 session "添加了 subtask"实际没加进去）
+
+### 修复方案
+
+**gid-core API 层**:
+- 所有 graph 操作函数增加可选的 `workspace: Option<&Path>` 参数
+- None = 当前目录（向后兼容），Some(path) = 指定目录的 `.gid/graph.yml`
+
+**RustClaw tool binding 层**:
+- `gid_add_task`、`gid_update_task`、`gid_tasks` 等所有 GID 工具增加可选的 `workspace` 参数
+- Sub-agent 的 GID 工具应自动使用其 `workspace` 设置，而不是主 agent 的 workspace
+
+**CLI 层**:
+- `gid --workspace /path/to/project tasks` — 已有 `--workspace` 全局参数？需确认
+
+### 验证标准
+1. `gid_add_task(id="test", title="test", workspace="/Users/potato/clawd/projects/gid-rs/")` 成功写入 gid-rs 的 graph
+2. `spawn_specialist(workspace="/some/project/")` 内的 GID 工具自动指向该 workspace 的 graph
+3. 向后兼容：不传 workspace 参数时行为不变
 
 ---
 
