@@ -128,7 +128,24 @@ pub(crate) fn extract_typescript_node(
                     });
                 }
                 imports.insert(module.to_string());
-                
+
+                // Detect type-only imports and add TypeReference edge
+                let is_type_import = import_text.starts_with("import type ")
+                    || import_text.contains("{ type ");
+                if is_type_import && (module.starts_with('.') || module.starts_with("@/")) {
+                    edges.push(CodeEdge {
+                        from: file_id.to_string(),
+                        to: format!("module_ref:{}", module),
+                        relation: EdgeRelation::TypeReference,
+                        weight: 0.3,
+                        call_count: 1,
+                        in_error_path: false,
+                        confidence: 0.9,
+                        call_site_line: None,
+                        call_site_column: None,
+                    });
+                }
+
                 // Extract imported names
                 if let Some(start) = import_text.find('{') {
                     if let Some(end) = import_text.find('}') {

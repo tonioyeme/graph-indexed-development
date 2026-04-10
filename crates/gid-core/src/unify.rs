@@ -137,6 +137,7 @@ pub fn graph_to_codegraph(graph: &Graph) -> CodeGraph {
             "overrides" => EdgeRelation::Overrides,
             "implements" => EdgeRelation::Implements,
             "belongs_to" => EdgeRelation::BelongsTo,
+            "type_reference" => EdgeRelation::TypeReference,
             _ => continue, // skip non-code relations
         };
 

@@ -40,6 +40,8 @@ pub struct MergeStats {
     pub old_edges_removed: usize,
     /// Number of nodes skipped (user-modified, preserved).
     pub nodes_skipped: usize,
+    /// Batch identifier for this merge operation.
+    pub batch_id: String,
 }
 
 // ── InferResult ────────────────────────────────────────────────────────────
@@ -179,7 +181,11 @@ pub fn merge_into_graph(
     result: &InferResult,
     incremental: bool,
 ) -> MergeStats {
-    let mut stats = MergeStats::default();
+    let batch_id = chrono::Utc::now().format("%Y%m%dT%H%M%S").to_string();
+    let mut stats = MergeStats {
+        batch_id: batch_id.clone(),
+        ..Default::default()
+    };
 
     // ── Step 1: Incremental cleanup ────────────────────────────────────────
     if incremental {
@@ -211,6 +217,7 @@ pub fn merge_into_graph(
     add_nodes(
         graph,
         &result.component_nodes,
+        &batch_id,
         &mut stats.components_added,
         &mut stats.nodes_skipped,
     );
@@ -219,6 +226,7 @@ pub fn merge_into_graph(
     add_nodes(
         graph,
         &result.feature_nodes,
+        &batch_id,
         &mut stats.features_added,
         &mut stats.nodes_skipped,
     );
@@ -233,10 +241,37 @@ pub fn merge_into_graph(
     stats
 }
 
+/// Remove all infer nodes from a specific batch.
+/// Returns the number of nodes and edges removed.
+pub fn rollback_infer_batch(graph: &mut Graph, batch_id: &str) -> (usize, usize) {
+    let ids_to_remove: Vec<String> = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            n.source.as_deref() == Some("infer")
+                && n.metadata.get("infer_batch")
+                    .and_then(|v| v.as_str())
+                    == Some(batch_id)
+        })
+        .map(|n| n.id.clone())
+        .collect();
+
+    let mut nodes_removed = 0;
+    let mut edges_removed = 0;
+    for id in &ids_to_remove {
+        let edge_count_before = graph.edges.len();
+        graph.remove_node(id);
+        edges_removed += edge_count_before - graph.edges.len();
+        nodes_removed += 1;
+    }
+    (nodes_removed, edges_removed)
+}
+
 /// Add nodes to the graph with guard checks and upsert semantics.
 fn add_nodes(
     graph: &mut Graph,
     nodes: &[Node],
+    batch_id: &str,
     added: &mut usize,
     skipped: &mut usize,
 ) {
@@ -252,23 +287,30 @@ fn add_nodes(
             continue;
         }
 
+        // Clone the node and add batch metadata
+        let mut node_with_batch = node.clone();
+        node_with_batch.metadata.insert(
+            "infer_batch".to_string(),
+            serde_json::Value::String(batch_id.to_string())
+        );
+
         // Check if a node with this ID already exists.
         if let Some(existing) = graph.get_node(&node.id) {
             if existing.source.as_deref() == Some("infer") {
                 // Same source — replace entirely (remove old, add new).
                 graph.remove_node(&node.id);
-                graph.add_node(node.clone());
+                graph.add_node(node_with_batch);
                 *added += 1;
             } else {
                 // GUARD-2: User-created node — upsert merge.
                 // Infer keys win on conflict, but preserve user metadata keys
                 // not present in infer output.
-                upsert_node(graph, node);
+                upsert_node(graph, &node_with_batch);
                 *skipped += 1;
             }
         } else {
             // New node — just add.
-            graph.add_node(node.clone());
+            graph.add_node(node_with_batch);
             *added += 1;
         }
     }

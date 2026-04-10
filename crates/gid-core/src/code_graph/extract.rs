@@ -780,8 +780,9 @@ fn generate_rust_tests_for_edges(file_entries: &[(String, String, Language)]) ->
 fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> Vec<CodeEdge> {
     let mut edges = Vec::new();
 
-    // Collect source files (non-test)
+    // Collect source files (non-test) — both by full stem and by basename
     let mut source_stems: HashMap<String, String> = HashMap::new();
+    let mut source_basenames: HashMap<String, Vec<String>> = HashMap::new();
     for (path, _, lang) in file_entries {
         if *lang != Language::TypeScript {
             continue;
@@ -794,7 +795,14 @@ fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> V
             .trim_end_matches(".tsx")
             .trim_end_matches(".js")
             .trim_end_matches(".jsx");
-        source_stems.insert(stem.to_string(), format!("file:{}", path));
+        let file_id = format!("file:{}", path);
+        source_stems.insert(stem.to_string(), file_id.clone());
+        // Also index by basename for fallback matching
+        let basename = stem.rsplit('/').next().unwrap_or(stem);
+        source_basenames
+            .entry(basename.to_string())
+            .or_default()
+            .push(file_id);
     }
 
     for (path, _, lang) in file_entries {
@@ -827,6 +835,26 @@ fn generate_ts_tests_for_edges(file_entries: &[(String, String, Language)]) -> V
                 EdgeRelation::TestsFor,
                 0.8, // naming convention match
             ));
+        } else {
+            // Fallback: strip common test directory prefixes and match by basename
+            let stripped = source_stem
+                .strip_prefix("tests/")
+                .or_else(|| source_stem.strip_prefix("test/"))
+                .or_else(|| source_stem.strip_prefix("__tests__/"))
+                .unwrap_or(&source_stem);
+            let test_basename = stripped.rsplit('/').next().unwrap_or(stripped);
+
+            if let Some(source_ids) = source_basenames.get(test_basename) {
+                // If unique match, use it. If ambiguous, take first (alphabetically).
+                if let Some(source_id) = source_ids.first() {
+                    edges.push(CodeEdge::new_heuristic(
+                        &test_file_id,
+                        source_id,
+                        EdgeRelation::TestsFor,
+                        0.6, // lower confidence for basename-only match
+                    ));
+                }
+            }
         }
     }
 

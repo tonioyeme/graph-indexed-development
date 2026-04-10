@@ -560,6 +560,7 @@ impl CodeGraph {
             EdgeRelation::Overrides => "overrides",
             EdgeRelation::Implements => "implements",
             EdgeRelation::BelongsTo => "belongs_to",
+            EdgeRelation::TypeReference => "type_reference",
         }).collect();
 
         format!(

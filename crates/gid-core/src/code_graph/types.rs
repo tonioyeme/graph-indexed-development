@@ -472,6 +472,8 @@ pub enum EdgeRelation {
     Implements,
     /// Entity belongs to a container (file→module, module→parent module)
     BelongsTo,
+    /// File references a type defined in another file (type-only import, type annotation)
+    TypeReference,
 }
 
 impl std::fmt::Display for EdgeRelation {
@@ -485,6 +487,7 @@ impl std::fmt::Display for EdgeRelation {
             EdgeRelation::Overrides => write!(f, "overrides"),
             EdgeRelation::Implements => write!(f, "implements"),
             EdgeRelation::BelongsTo => write!(f, "belongs_to"),
+            EdgeRelation::TypeReference => write!(f, "type_reference"),
         }
     }
 }
@@ -502,6 +505,7 @@ impl std::str::FromStr for EdgeRelation {
             "overrides" => Ok(EdgeRelation::Overrides),
             "implements" => Ok(EdgeRelation::Implements),
             "belongs_to" | "belongsto" => Ok(EdgeRelation::BelongsTo),
+            "type_reference" | "typereference" => Ok(EdgeRelation::TypeReference),
             _ => Err(format!("Unknown edge relation: '{}'", s)),
         }
     }

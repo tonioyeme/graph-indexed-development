@@ -249,6 +249,46 @@ namespace MyNamespace {
     }
 
     #[test]
+    fn test_ts_type_import_produces_type_reference_edge() {
+        let content = r#"
+import type { User } from './types';
+import { createUser } from './factory';
+import { type Config, buildConfig } from './config';
+
+export function greet(user: User): string {
+    return user.name;
+}
+"#;
+        let mut parser = Parser::new();
+        let mut class_map = HashMap::new();
+        let (_, edges, _) = extract_typescript_tree_sitter("app.ts", content, &mut parser, &mut class_map, "ts");
+
+        // `import type { User } from './types'` should produce a TypeReference edge
+        let type_ref_edges: Vec<_> = edges.iter()
+            .filter(|e| e.relation == EdgeRelation::TypeReference)
+            .collect();
+        assert!(!type_ref_edges.is_empty(), "Should produce TypeReference edges for type-only imports. All edges: {:?}", 
+            edges.iter().map(|e| format!("{} -> {} ({:?})", e.from, e.to, e.relation)).collect::<Vec<_>>());
+
+        // Should have TypeReference for './types' (import type)
+        assert!(type_ref_edges.iter().any(|e| e.to.contains("./types")),
+            "Should have TypeReference to ./types");
+
+        // Should have TypeReference for './config' (import { type Config })
+        assert!(type_ref_edges.iter().any(|e| e.to.contains("./config")),
+            "Should have TypeReference to ./config");
+
+        // Should NOT have TypeReference for './factory' (regular import)
+        assert!(!type_ref_edges.iter().any(|e| e.to.contains("./factory")),
+            "Should NOT have TypeReference for regular import");
+
+        // All TypeReference edges should have confidence 0.9
+        for edge in &type_ref_edges {
+            assert_eq!(edge.confidence, 0.9, "TypeReference confidence should be 0.9");
+        }
+    }
+
+    #[test]
     fn test_rust_call_extraction() {
         let content = r#"
 pub struct Calculator {
@@ -783,6 +823,36 @@ class Helper {
     }
 
     #[test]
+    fn test_ts_tests_for_basename_fallback() {
+        // Test file in separate tests/ dir, source in src/components/
+        // Full stem won't match, should fallback to basename matching
+        let entries = vec![
+            ("src/components/Button.tsx".to_string(), "export {}".to_string(), Language::TypeScript),
+            ("tests/Button.test.tsx".to_string(), "test('btn', () => {})".to_string(), Language::TypeScript),
+        ];
+        let edges = super::super::extract::generate_ts_tests_for_edges_pub(&entries);
+        assert_eq!(edges.len(), 1, "Should match via basename fallback: {:?}", edges);
+        assert_eq!(edges[0].from, "file:tests/Button.test.tsx");
+        assert_eq!(edges[0].to, "file:src/components/Button.tsx");
+        assert_eq!(edges[0].relation, EdgeRelation::TestsFor);
+        assert_eq!(edges[0].confidence, 0.6); // lower confidence for basename match
+    }
+
+    #[test]
+    fn test_ts_tests_for_separate_tests_dir() {
+        // Common pattern: tests/integration/auth.test.ts → src/auth.ts
+        let entries = vec![
+            ("src/auth.ts".to_string(), "export {}".to_string(), Language::TypeScript),
+            ("tests/integration/auth.test.ts".to_string(), "test('auth', () => {})".to_string(), Language::TypeScript),
+        ];
+        let edges = super::super::extract::generate_ts_tests_for_edges_pub(&entries);
+        assert_eq!(edges.len(), 1, "Should match via basename fallback: {:?}", edges);
+        assert_eq!(edges[0].from, "file:tests/integration/auth.test.ts");
+        assert_eq!(edges[0].to, "file:src/auth.ts");
+        assert_eq!(edges[0].confidence, 0.6);
+    }
+
+    #[test]
     fn test_python_tests_for_naming() {
         let entries = vec![
             ("auth.py".to_string(), "class Auth: pass".to_string(), Language::Python),
@@ -812,7 +882,18 @@ class Helper {
         assert_eq!(EdgeRelation::from_str("belongs_to").unwrap(), EdgeRelation::BelongsTo);
         assert_eq!(EdgeRelation::from_str("tests_for").unwrap(), EdgeRelation::TestsFor);
         assert_eq!(EdgeRelation::from_str("CALLS").unwrap(), EdgeRelation::Calls);
+        assert_eq!(EdgeRelation::from_str("type_reference").unwrap(), EdgeRelation::TypeReference);
+        assert_eq!(EdgeRelation::from_str("typereference").unwrap(), EdgeRelation::TypeReference);
         assert!(EdgeRelation::from_str("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_type_reference_display_roundtrip() {
+        use std::str::FromStr;
+        let rel = EdgeRelation::TypeReference;
+        let s = rel.to_string();
+        assert_eq!(s, "type_reference");
+        assert_eq!(EdgeRelation::from_str(&s).unwrap(), EdgeRelation::TypeReference);
     }
 
     #[test]

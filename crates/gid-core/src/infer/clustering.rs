@@ -30,6 +30,12 @@ pub const WEIGHT_CO_CITATION: f64 = 0.4;
 pub const CO_CITATION_MIN_SHARED: usize = 2;
 /// Weight for synthetic directory co-location edges between files in the same directory.
 pub const WEIGHT_DIR_COLOCATION: f64 = 0.3;
+/// Weight for synthetic symbol-similarity edges.
+pub const WEIGHT_SYMBOL_SIMILARITY: f64 = 0.5;
+/// Default minimum shared tokens for symbol similarity edges.
+pub const SYMBOL_MIN_SHARED_TOKENS: usize = 2;
+/// Default minimum Jaccard threshold for symbol similarity edges.
+pub const SYMBOL_MIN_JACCARD: f64 = 0.15;
 /// Legacy constant — no longer used.  Co-location edges now only apply to
 /// code-isolated files (zero edges in the network), so O(n²) explosion in
 /// large directories is structurally impossible.
@@ -77,6 +83,15 @@ pub struct ClusterConfig {
     /// Weight for synthetic directory co-location edges (default: 0.3).
     /// Set to 0.0 to disable directory co-location.
     pub dir_colocation_weight: f64,
+    /// Weight for synthetic symbol-similarity edges (default: 0.5).
+    /// Two files exporting symbols with overlapping domain vocabulary get
+    /// a weighted edge proportional to Jaccard similarity.
+    /// Set to 0.0 to disable.
+    pub symbol_similarity_weight: f64,
+    /// Minimum number of shared tokens to create a symbol similarity edge (default: 2).
+    pub symbol_min_shared_tokens: usize,
+    /// Minimum Jaccard similarity threshold (default: 0.15).
+    pub symbol_min_jaccard: f64,
     /// Random seed for reproducibility (default: 42).
     pub seed: u64,
     /// Maximum cluster size. Clusters exceeding this are sub-clustered.
@@ -93,6 +108,9 @@ impl Default for ClusterConfig {
             co_citation_weight: WEIGHT_CO_CITATION,
             co_citation_min_shared: CO_CITATION_MIN_SHARED,
             dir_colocation_weight: WEIGHT_DIR_COLOCATION,
+            symbol_similarity_weight: WEIGHT_SYMBOL_SIMILARITY,
+            symbol_min_shared_tokens: SYMBOL_MIN_SHARED_TOKENS,
+            symbol_min_jaccard: SYMBOL_MIN_JACCARD,
             hierarchical: false,
             seed: 42,
             max_cluster_size: None,
@@ -477,6 +495,216 @@ fn add_pairwise_edges(net: &mut Network, files: &[usize], weight: f64) {
             net.add_edge(files[i], files[j], weight);
             net.add_edge(files[j], files[i], weight);
         }
+    }
+}
+
+// ── Symbol similarity helpers ──────────────────────────────────────────────
+
+/// Split a camelCase/PascalCase identifier into words.
+/// "getOAuthToken" → ["get", "OAuth", "Token"]
+/// "AwsAuthStatusManager" → ["Aws", "Auth", "Status", "Manager"]
+/// "HTMLParser" → ["HTML", "Parser"]
+fn split_camel_case(s: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if current.is_empty() {
+            current.push(c);
+            continue;
+        }
+
+        let prev_upper = chars[i - 1].is_uppercase();
+        let curr_upper = c.is_uppercase();
+        let next_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
+
+        if !curr_upper {
+            // lowercase or non-alpha: just append
+            current.push(c);
+        } else if !prev_upper {
+            // lowercase→uppercase transition: start new word
+            words.push(current);
+            current = String::new();
+            current.push(c);
+        } else if next_lower {
+            // uppercase run ending (e.g. "HTML" + "Parser" — split before last uppercase)
+            words.push(current);
+            current = String::new();
+            current.push(c);
+        } else {
+            // continuing uppercase run (e.g. "HTM" in "HTML")
+            current.push(c);
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+/// Check if a word is a programming stop word that carries no clustering signal.
+fn is_stop_word(word: &str) -> bool {
+    matches!(
+        word,
+        "get" | "set" | "is" | "has" | "on" | "from" | "to" | "new" | "create"
+            | "make" | "with" | "for" | "the" | "an" | "default" | "init" | "handle"
+            | "process" | "do" | "run" | "execute" | "test" | "spec" | "mock" | "stub"
+            | "should" | "expect" | "describe" | "it" | "before" | "after"
+            | "use" | "fn" | "func" | "function" | "method" | "class" | "type"
+            | "value" | "data" | "item" | "result" | "response" | "request"
+            | "index" | "main" | "app" | "module" | "export" | "import"
+            | "self" | "this" | "super" | "that" | "then" | "else" | "if"
+            | "return" | "async" | "await" | "try" | "catch" | "throw" | "error"
+            | "null" | "undefined" | "true" | "false" | "none" | "some"
+            | "add" | "remove" | "delete" | "update" | "check" | "can" | "will"
+            | "of" | "in" | "at" | "by" | "or" | "and" | "not" | "all" | "any"
+    )
+}
+
+/// Split a symbol name (camelCase/snake_case) into a set of lowercase domain tokens.
+/// Removes programming stop words that carry no clustering signal.
+fn tokenize_symbol_name(name: &str) -> HashSet<String> {
+    let mut tokens = HashSet::new();
+    for part in name.split('_') {
+        for word in split_camel_case(part) {
+            let lower = word.to_lowercase();
+            if lower.len() >= 2 && !is_stop_word(&lower) {
+                tokens.insert(lower);
+            }
+        }
+    }
+    tokens
+}
+
+/// Add synthetic symbol-similarity edges based on tokenized function/class names.
+///
+/// For each file node, collects all function/class/method names it defines,
+/// tokenizes them (camelCase/snake_case split + stop word removal), then
+/// computes pairwise Jaccard similarity. File pairs exceeding thresholds
+/// get weighted edges.
+///
+/// Uses inverted index for efficient pair enumeration — avoids O(n²) full scan.
+pub fn add_symbol_similarity_edges(
+    net: &mut Network,
+    graph: &Graph,
+    idx_to_id: &[String],
+    weight: f64,
+    min_shared: usize,
+    min_jaccard: f64,
+) {
+    if weight <= 0.0 || idx_to_id.is_empty() {
+        return;
+    }
+
+    // Build id → index map
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (idx, id) in idx_to_id.iter().enumerate() {
+        id_to_idx.insert(id.as_str(), idx);
+    }
+
+    // Step 1: Build file_idx → token_set mapping
+    // For each non-file code node (Function, Class, Method, Module), find its parent file,
+    // tokenize its title (the symbol name), add tokens to the file's set.
+    let mut file_tokens: HashMap<usize, HashSet<String>> = HashMap::new();
+
+    for node in &graph.nodes {
+        // Skip file nodes themselves
+        let is_file = node.node_type.as_deref() == Some("file")
+            || (node.node_type.as_deref() == Some("code")
+                && node.node_kind.as_deref() == Some("File"));
+        if is_file {
+            continue;
+        }
+
+        // Only process code symbol nodes
+        let is_symbol = matches!(
+            node.node_kind.as_deref(),
+            Some("Function") | Some("Class") | Some("Method") | Some("Module")
+        );
+        if !is_symbol {
+            continue;
+        }
+
+        // Resolve to parent file index
+        let file_idx = node.file_path.as_ref().and_then(|fp| {
+            let file_id = format!("file:{}", fp);
+            id_to_idx.get(file_id.as_str()).copied()
+        });
+
+        if let Some(idx) = file_idx {
+            let tokens = tokenize_symbol_name(&node.title);
+            file_tokens.entry(idx).or_default().extend(tokens);
+        }
+    }
+
+    // Step 2: Build inverted index: token → set of file indices
+    let mut inverted_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (&file_idx, tokens) in &file_tokens {
+        for token in tokens {
+            inverted_index
+                .entry(token.clone())
+                .or_default()
+                .push(file_idx);
+        }
+    }
+
+    // Step 3: Count shared tokens per file pair using inverted index
+    let mut shared_counts: HashMap<(usize, usize), usize> = HashMap::new();
+    for (_token, files) in &inverted_index {
+        if files.len() < 2 || files.len() > 200 {
+            // Skip tokens appearing in too many files — they're effectively stop words
+            continue;
+        }
+        for i in 0..files.len() {
+            for j in (i + 1)..files.len() {
+                let pair = if files[i] < files[j] {
+                    (files[i], files[j])
+                } else {
+                    (files[j], files[i])
+                };
+                *shared_counts.entry(pair).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Step 4: For qualifying pairs, compute full Jaccard and add edges
+    let mut edges_added = 0usize;
+    for (&(a, b), &shared) in &shared_counts {
+        if shared < min_shared {
+            continue;
+        }
+
+        let tokens_a = &file_tokens[&a];
+        let tokens_b = &file_tokens[&b];
+        let union_size = tokens_a.union(tokens_b).count();
+
+        if union_size == 0 {
+            continue;
+        }
+
+        let jaccard = shared as f64 / union_size as f64;
+        if jaccard < min_jaccard {
+            continue;
+        }
+
+        let edge_weight = weight * jaccard;
+        net.add_edge(a, b, edge_weight);
+        net.add_edge(b, a, edge_weight);
+        edges_added += 1;
+    }
+
+    if edges_added > 0 {
+        eprintln!(
+            "🏷️  Symbol similarity: {} files with symbols → {} edges (min_shared={}, min_jaccard={:.2})",
+            file_tokens.len(),
+            edges_added,
+            min_shared,
+            min_jaccard,
+        );
     }
 }
 
@@ -1595,6 +1823,16 @@ pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
         config.co_citation_weight,
         config.co_citation_min_shared,
         2.0, // max edge weight cap
+    );
+
+    // Add symbol similarity edges (semantic signal).
+    add_symbol_similarity_edges(
+        &mut net,
+        graph,
+        &idx_to_id,
+        config.symbol_similarity_weight,
+        config.symbol_min_shared_tokens,
+        config.symbol_min_jaccard,
     );
 
     // Add directory co-location edges if configured.
@@ -3734,5 +3972,331 @@ mod tests {
             edges_before,
             "structural edges should not create co-citation"
         );
+    }
+
+    // ── Symbol similarity tests ────────────────────────────────────────
+
+    #[test]
+    fn test_split_camel_case() {
+        // lowercase→uppercase boundary
+        assert_eq!(
+            split_camel_case("getAuthToken"),
+            vec!["get", "Auth", "Token"]
+        );
+        // Consecutive uppercase run: "OAuth" → "O" + "Auth" (splits before last
+        // uppercase when followed by lowercase)
+        assert_eq!(
+            split_camel_case("getOAuthToken"),
+            vec!["get", "O", "Auth", "Token"]
+        );
+        assert_eq!(
+            split_camel_case("AwsAuthStatusManager"),
+            vec!["Aws", "Auth", "Status", "Manager"]
+        );
+        // All-uppercase run followed by PascalCase
+        assert_eq!(split_camel_case("HTMLParser"), vec!["HTML", "Parser"]);
+        // Simple words
+        assert_eq!(split_camel_case("simple"), vec!["simple"]);
+        assert_eq!(split_camel_case("URL"), vec!["URL"]);
+        assert_eq!(split_camel_case(""), Vec::<String>::new());
+        assert_eq!(split_camel_case("a"), vec!["a"]);
+        // Trailing uppercase run
+        assert_eq!(split_camel_case("parseJSON"), vec!["parse", "JSON"]);
+        assert_eq!(
+            split_camel_case("XMLHttpRequest"),
+            vec!["XML", "Http", "Request"]
+        );
+    }
+
+    #[test]
+    fn test_tokenize_symbol_name() {
+        // camelCase: "getOAuthToken" → split → ["get","O","Auth","Token"]
+        //   → lowercase → ["get","o","auth","token"]
+        //   → filter len<2 → ["get","auth","token"]
+        //   → stop words → ["auth","token"]
+        let tokens = tokenize_symbol_name("getOAuthToken");
+        assert!(tokens.contains("auth"));
+        assert!(tokens.contains("token"));
+        assert!(!tokens.contains("get")); // stop word
+        assert!(!tokens.contains("o")); // too short
+
+        // snake_case
+        let tokens = tokenize_symbol_name("parse_auth_token");
+        assert!(tokens.contains("parse"));
+        assert!(tokens.contains("auth"));
+        assert!(tokens.contains("token"));
+
+        // PascalCase class name
+        let tokens = tokenize_symbol_name("AwsAuthStatusManager");
+        assert!(tokens.contains("aws"));
+        assert!(tokens.contains("auth"));
+        assert!(tokens.contains("status"));
+        assert!(tokens.contains("manager"));
+
+        // All stop words
+        let tokens = tokenize_symbol_name("getDefaultValue");
+        // "get" = stop, "default" = stop, "value" = stop
+        assert!(tokens.is_empty());
+
+        // Short tokens filtered
+        let tokens = tokenize_symbol_name("aB");
+        // "a" is 1 char → filtered, "b" is 1 char → filtered
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_is_stop_word() {
+        assert!(is_stop_word("get"));
+        assert!(is_stop_word("set"));
+        assert!(is_stop_word("create"));
+        assert!(is_stop_word("default"));
+        assert!(is_stop_word("value"));
+        assert!(!is_stop_word("auth"));
+        assert!(!is_stop_word("oauth"));
+        assert!(!is_stop_word("token"));
+        assert!(!is_stop_word("parser"));
+        assert!(!is_stop_word("manager"));
+    }
+
+    #[test]
+    fn test_symbol_similarity_edges_basic() {
+        // Two auth files (similar symbols) + two format files (similar symbols)
+        // Auth files should connect to each other, format files to each other,
+        // but NOT cross-domain.
+        let mut g = Graph::default();
+
+        // Auth group
+        g.nodes.push(make_file_node("src/auth/login.ts"));
+        g.nodes.push(make_file_node("src/auth/token.ts"));
+        // Format group
+        g.nodes.push(make_file_node("src/utils/formatDate.ts"));
+        g.nodes.push(make_file_node("src/utils/formatCurrency.ts"));
+
+        // Auth symbols
+        let mut n = Node::new("func:validateAuthToken", "validateAuthToken");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/auth/login.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:refreshAuthCredential", "refreshAuthCredential");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/auth/login.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:storeAuthToken", "storeAuthToken");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/auth/token.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:revokeAuthCredential", "revokeAuthCredential");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/auth/token.ts".into());
+        g.nodes.push(n);
+
+        // Format symbols
+        let mut n = Node::new("func:formatLocalDate", "formatLocalDate");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/utils/formatDate.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:parseDateString", "parseDateString");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/utils/formatDate.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:formatLocalCurrency", "formatLocalCurrency");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/utils/formatCurrency.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:parseCurrencyString", "parseCurrencyString");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("src/utils/formatCurrency.ts".into());
+        g.nodes.push(n);
+
+        let (mut net, idx_to_id) = build_network(&g);
+        assert_eq!(net.num_nodes(), 4);
+        assert_eq!(net.num_edges(), 0); // no import edges
+
+        add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.5, 2, 0.15);
+
+        // Auth files should have edges between them (shared: "auth", "credential", "token")
+        let login_idx = idx_to_id
+            .iter()
+            .position(|id| id.contains("login"))
+            .unwrap();
+        let token_idx = idx_to_id
+            .iter()
+            .position(|id| id.contains("token.ts"))
+            .unwrap();
+
+        let login_out = net.out_neighbors(login_idx);
+        let has_auth_edge = login_out.iter().any(|&(t, _)| t == token_idx);
+        assert!(
+            has_auth_edge,
+            "Auth files should be connected by symbol similarity"
+        );
+
+        // Format files should have edges between them (shared: "format", "local", "string", "parse")
+        let date_idx = idx_to_id
+            .iter()
+            .position(|id| id.contains("formatDate"))
+            .unwrap();
+        let currency_idx = idx_to_id
+            .iter()
+            .position(|id| id.contains("formatCurrency"))
+            .unwrap();
+
+        let date_out = net.out_neighbors(date_idx);
+        let has_format_edge = date_out.iter().any(|&(t, _)| t == currency_idx);
+        assert!(
+            has_format_edge,
+            "Format files should be connected by symbol similarity"
+        );
+
+        // Cross-domain edges should NOT exist (auth ↔ format have no shared domain tokens)
+        let login_connects_to_date = login_out.iter().any(|&(t, _)| t == date_idx);
+        let login_connects_to_currency = login_out.iter().any(|&(t, _)| t == currency_idx);
+        assert!(
+            !login_connects_to_date,
+            "Auth should not connect to format (date)"
+        );
+        assert!(
+            !login_connects_to_currency,
+            "Auth should not connect to format (currency)"
+        );
+    }
+
+    #[test]
+    fn test_symbol_similarity_threshold_enforcement() {
+        // Two files sharing only 1 token — should NOT get an edge when min_shared=2
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.ts"));
+        g.nodes.push(make_file_node("b.ts"));
+
+        let mut n = Node::new("func:authHandler", "authHandler");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("a.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:authValidator", "authValidator");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("b.ts".into());
+        g.nodes.push(n);
+
+        let (mut net, idx_to_id) = build_network(&g);
+
+        // With min_shared=2, single shared token "auth" should NOT create edge
+        add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.5, 2, 0.15);
+        assert_eq!(
+            net.num_edges(),
+            0,
+            "Single shared token should not create edge with min_shared=2"
+        );
+
+        // With min_shared=1, it SHOULD create edge
+        let (mut net2, idx_to_id2) = build_network(&g);
+        add_symbol_similarity_edges(&mut net2, &g, &idx_to_id2, 0.5, 1, 0.0);
+        assert!(
+            net2.num_edges() > 0,
+            "Single shared token should create edge with min_shared=1"
+        );
+    }
+
+    #[test]
+    fn test_symbol_similarity_weight_scaling() {
+        // Verify edge weight = base_weight * jaccard
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.ts"));
+        g.nodes.push(make_file_node("b.ts"));
+
+        // File A: tokens = {auth, token, validate, credential} (after stop word removal)
+        let mut n = Node::new("func:validateAuthToken", "validateAuthToken");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("a.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:authCredentialStore", "authCredentialStore");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("a.ts".into());
+        g.nodes.push(n);
+
+        // File B: tokens = {auth, token, refresh, session} (after stop word removal)
+        let mut n = Node::new("func:refreshAuthToken", "refreshAuthToken");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("b.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:authSessionStore", "authSessionStore");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("b.ts".into());
+        g.nodes.push(n);
+
+        let (mut net, idx_to_id) = build_network(&g);
+        let base_weight = 0.5;
+        add_symbol_similarity_edges(&mut net, &g, &idx_to_id, base_weight, 2, 0.0);
+
+        let a_idx = idx_to_id
+            .iter()
+            .position(|id| id.contains("a.ts"))
+            .unwrap();
+        let out = net.out_neighbors(a_idx);
+        assert!(!out.is_empty(), "Should have symbol similarity edge");
+
+        let edge_weight = out[0].1;
+        // Weight should be base_weight * jaccard, and jaccard < 1.0
+        assert!(edge_weight > 0.0);
+        assert!(edge_weight <= base_weight);
+    }
+
+    #[test]
+    fn test_symbol_similarity_empty_files() {
+        // Files with no symbols should not cause errors or spurious edges
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.ts"));
+        g.nodes.push(make_file_node("b.ts"));
+        // No function/class nodes
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.5, 2, 0.15);
+        assert_eq!(net.num_edges(), 0);
+    }
+
+    #[test]
+    fn test_symbol_similarity_disabled() {
+        // weight=0.0 should skip entirely
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("a.ts"));
+        g.nodes.push(make_file_node("b.ts"));
+
+        let mut n = Node::new("func:authLogin", "authLogin");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("a.ts".into());
+        g.nodes.push(n);
+
+        let mut n = Node::new("func:authLogout", "authLogout");
+        n.node_type = Some("code".into());
+        n.node_kind = Some("Function".into());
+        n.file_path = Some("b.ts".into());
+        g.nodes.push(n);
+
+        let (mut net, idx_to_id) = build_network(&g);
+        add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.0, 1, 0.0);
+        assert_eq!(net.num_edges(), 0, "Weight 0.0 should add no edges");
     }
 }
