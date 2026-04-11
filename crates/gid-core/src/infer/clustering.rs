@@ -97,6 +97,16 @@ pub struct ClusterConfig {
     /// Maximum cluster size. Clusters exceeding this are sub-clustered.
     /// `None` means auto-compute: `max(20, total_file_count / 5)`.
     pub max_cluster_size: Option<usize>,
+    /// Hub exclusion threshold as fraction of total file count (default: 0.05).
+    /// Files with in-degree > max(threshold * total_files, hub_min_degree) are
+    /// excluded from the Infomap network and placed into a separate Infrastructure
+    /// component. Set to 0.0 to disable hub exclusion.
+    pub hub_exclusion_threshold: f64,
+    /// Minimum absolute in-degree to qualify as a hub (default: 10).
+    /// Prevents hub exclusion from firing on small projects where every file
+    /// naturally has a few imports. The effective cutoff is
+    /// `max(threshold * total_files, hub_min_degree)`.
+    pub hub_min_degree: usize,
 }
 
 impl Default for ClusterConfig {
@@ -114,6 +124,8 @@ impl Default for ClusterConfig {
             hierarchical: false,
             seed: 42,
             max_cluster_size: None,
+            hub_exclusion_threshold: 0.05,
+            hub_min_degree: 10,
         }
     }
 }
@@ -1804,6 +1816,217 @@ fn deduplicate_names(nodes: &mut [Node]) {
     }
 }
 
+// ── Hub exclusion ──────────────────────────────────────────────────────────
+
+/// Identify hub files that should be excluded from the clustering network.
+///
+/// A hub is a file with in-degree exceeding `threshold * total_file_count`.
+/// These are typically infrastructure files (utils, types, constants, debug)
+/// that create artificial connectivity between unrelated domain modules.
+///
+/// Returns the set of network indices to exclude.
+pub fn identify_hubs(
+    graph: &Graph,
+    idx_to_id: &[String],
+    threshold: f64,
+    min_degree: usize,
+) -> HashSet<usize> {
+    if threshold <= 0.0 || idx_to_id.is_empty() {
+        return HashSet::new();
+    }
+
+    // Build id → index map from idx_to_id
+    let mut id_to_idx: HashMap<&str, usize> = HashMap::new();
+    for (idx, id) in idx_to_id.iter().enumerate() {
+        id_to_idx.insert(id.as_str(), idx);
+    }
+
+    // Map non-file nodes to their parent file index (same logic as build_network)
+    let mut node_to_file_idx: HashMap<&str, usize> = HashMap::new();
+    for node in &graph.nodes {
+        let is_file = node.node_type.as_deref() == Some("file")
+            || (node.node_type.as_deref() == Some("code")
+                && node.node_kind.as_deref() == Some("File"));
+        if is_file {
+            continue;
+        }
+        if let Some(ref fp) = node.file_path {
+            let file_id = format!("file:{}", fp);
+            if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                node_to_file_idx.insert(&node.id, idx);
+                continue;
+            }
+        }
+        if let Some(fp_val) = node.metadata.get("file_path") {
+            if let Some(fp) = fp_val.as_str() {
+                let file_id = format!("file:{}", fp);
+                if let Some(&idx) = id_to_idx.get(file_id.as_str()) {
+                    node_to_file_idx.insert(&node.id, idx);
+                }
+            }
+        }
+    }
+
+    // Count in-degree for each file node from import-like edges
+    let mut in_degree: HashMap<usize, usize> = HashMap::new();
+    for edge in &graph.edges {
+        let is_import_like = matches!(
+            edge.relation.as_str(),
+            "imports" | "calls" | "uses" | "type_reference" | "depends_on"
+        );
+        if !is_import_like {
+            continue;
+        }
+
+        let from_idx = node_to_file_idx
+            .get(edge.from.as_str())
+            .or_else(|| id_to_idx.get(edge.from.as_str()))
+            .copied();
+        let to_idx = node_to_file_idx
+            .get(edge.to.as_str())
+            .or_else(|| id_to_idx.get(edge.to.as_str()))
+            .copied();
+
+        if let (Some(from), Some(to)) = (from_idx, to_idx) {
+            if from != to {
+                // `from` imports `to`, so increment `to`'s in-degree
+                // Count unique importers (not duplicate edges from same file)
+                *in_degree.entry(to).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let total_files = idx_to_id.len();
+    // Cutoff = max(threshold * total_files, min_degree).
+    // The min_degree floor prevents hub exclusion from firing on small graphs
+    // where every file naturally has a few imports.
+    let cutoff = (threshold * total_files as f64).ceil().max(min_degree as f64) as usize;
+
+    let mut hub_indices: HashSet<usize> = HashSet::new();
+    let mut hub_info: Vec<(usize, &str, usize)> = Vec::new(); // (idx, id, degree)
+
+    for (&idx, &degree) in &in_degree {
+        if degree > cutoff {
+            hub_indices.insert(idx);
+            hub_info.push((idx, &idx_to_id[idx], degree));
+        }
+    }
+
+    if !hub_indices.is_empty() {
+        // Sort by degree descending for logging
+        hub_info.sort_by(|a, b| b.2.cmp(&a.2));
+        let top5: Vec<String> = hub_info
+            .iter()
+            .take(5)
+            .map(|(_, id, deg)| format!("{}({})", id, deg))
+            .collect();
+        eprintln!(
+            "🔌 Hub exclusion: {} files excluded (threshold: {:.0}%, cutoff: {}), top hubs: [{}]",
+            hub_indices.len(),
+            threshold * 100.0,
+            cutoff,
+            top5.join(", "),
+        );
+    }
+
+    hub_indices
+}
+
+/// Remove hub nodes from a network by building a new network without them.
+///
+/// Returns `(new_network, new_idx_to_id, excluded_hub_ids)`.
+pub fn exclude_hubs_from_network(
+    net: &Network,
+    idx_to_id: &[String],
+    hub_indices: &HashSet<usize>,
+) -> (Network, Vec<String>, Vec<String>) {
+    // Build mapping from old indices to new (excluding hubs)
+    let mut old_to_new: HashMap<usize, usize> = HashMap::new();
+    let mut new_idx_to_id: Vec<String> = Vec::new();
+    let mut excluded_ids: Vec<String> = Vec::new();
+
+    for (old_idx, id) in idx_to_id.iter().enumerate() {
+        if hub_indices.contains(&old_idx) {
+            excluded_ids.push(id.clone());
+        } else {
+            let new_idx = new_idx_to_id.len();
+            old_to_new.insert(old_idx, new_idx);
+            new_idx_to_id.push(id.clone());
+        }
+    }
+
+    // Build new network
+    let mut new_net = Network::new();
+
+    // Add all non-hub nodes
+    for (new_idx, id) in new_idx_to_id.iter().enumerate() {
+        new_net.add_node_name(new_idx, id);
+    }
+
+    // Add edges between non-hub nodes only
+    for old_from in 0..idx_to_id.len() {
+        if hub_indices.contains(&old_from) {
+            continue;
+        }
+        let new_from = old_to_new[&old_from];
+        for &(old_to, weight) in net.out_neighbors(old_from) {
+            if hub_indices.contains(&old_to) {
+                continue;
+            }
+            if let Some(&new_to) = old_to_new.get(&old_to) {
+                new_net.add_edge(new_from, new_to, weight);
+            }
+        }
+    }
+
+    eprintln!(
+        "🔌 Network after hub exclusion: {} nodes (was {}), {} edges (was {})",
+        new_net.num_nodes(),
+        net.num_nodes(),
+        new_net.num_edges(),
+        net.num_edges(),
+    );
+
+    (new_net, new_idx_to_id, excluded_ids)
+}
+
+/// Create a component node for excluded infrastructure hub files.
+fn create_infra_component(
+    excluded_ids: &[String],
+    _graph: &Graph,
+) -> (Node, Vec<Edge>) {
+    let component_id = "infer:component:infrastructure";
+    let title = "Infrastructure & Shared Utilities";
+
+    let mut node = Node::new(component_id, title);
+    node.node_type = Some("component".into());
+    node.source = Some("infer".into());
+    node.metadata
+        .insert("flow".into(), serde_json::json!(0.0));
+    node.metadata
+        .insert("size".into(), serde_json::json!(excluded_ids.len()));
+    node.metadata
+        .insert("hub_excluded".into(), serde_json::json!(true));
+
+    let infer_meta = serde_json::json!({"source": "infer"});
+    let edges: Vec<Edge> = excluded_ids
+        .iter()
+        .map(|mid| {
+            let mut edge = Edge::new(component_id, mid, "contains");
+            edge.metadata = Some(infer_meta.clone());
+            edge
+        })
+        .collect();
+
+    eprintln!(
+        "🏗️  Infrastructure component: {} hub files → '{}'",
+        excluded_ids.len(),
+        title,
+    );
+
+    (node, edges)
+}
+
 // ── Main entry point ───────────────────────────────────────────────────────
 
 /// Run community detection on a code graph and return inferred components.
@@ -1811,7 +2034,21 @@ fn deduplicate_names(nodes: &mut [Node]) {
 /// This is the main entry point. It builds a file-level network, runs Infomap,
 /// and maps results back to component nodes and membership edges.
 pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
-    let (mut net, idx_to_id) = build_network(graph);
+    let (net, idx_to_id) = build_network(graph);
+
+    // Hub exclusion — remove infrastructure files from the network before
+    // adding synthetic edges (co-citation, symbol similarity, colocation).
+    // This must happen on the ORIGINAL network to avoid circular reasoning.
+    let (mut net, idx_to_id, excluded_hub_ids) = if config.hub_exclusion_threshold > 0.0 {
+        let hub_indices = identify_hubs(graph, &idx_to_id, config.hub_exclusion_threshold, config.hub_min_degree);
+        if hub_indices.is_empty() {
+            (net, idx_to_id, Vec::new())
+        } else {
+            exclude_hubs_from_network(&net, &idx_to_id, &hub_indices)
+        }
+    } else {
+        (net, idx_to_id, Vec::new())
+    };
 
     // Add co-citation edges (indirect usage signal).
     // Must come before dir_colocation so that co-citation structure
@@ -1885,6 +2122,14 @@ pub fn cluster(graph: &Graph, config: &ClusterConfig) -> Result<ClusterResult> {
 
     let mut result = map_to_components(&clusters, graph);
     result.metrics = metrics;
+
+    // Post-process: add infrastructure component for excluded hubs
+    if !excluded_hub_ids.is_empty() {
+        let (infra_node, infra_edges) = create_infra_component(&excluded_hub_ids, graph);
+        result.nodes.push(infra_node);
+        result.edges.extend(infra_edges);
+        result.metrics.num_communities += 1;
+    }
 
     // Post-process: deduplicate names, validate coverage
     post_process(&mut result, graph, config);
@@ -4298,5 +4543,213 @@ mod tests {
         let (mut net, idx_to_id) = build_network(&g);
         add_symbol_similarity_edges(&mut net, &g, &idx_to_id, 0.0, 1, 0.0);
         assert_eq!(net.num_edges(), 0, "Weight 0.0 should add no edges");
+    }
+
+    // ── Hub exclusion tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_identify_hubs_basic() {
+        // Create a graph where one file (hub.ts) is imported by many others
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("src/hub.ts"));
+        for i in 0..10 {
+            g.nodes.push(make_file_node(&format!("src/consumer{}.ts", i)));
+        }
+        // All 10 consumers import hub.ts
+        for i in 0..10 {
+            g.edges.push(Edge::new(
+                &format!("file:src/consumer{}.ts", i),
+                "file:src/hub.ts",
+                "imports",
+            ));
+        }
+
+        let (_, idx_to_id) = build_network(&g);
+        // threshold=0.05, min_degree=1 → cutoff = max(ceil(0.05*11), 1) = 1
+        // hub.ts has in_degree=10 > 1 → hub
+        let hubs = identify_hubs(&g, &idx_to_id, 0.05, 1);
+        assert!(
+            !hubs.is_empty(),
+            "hub.ts with in_degree=10 should be identified as a hub"
+        );
+
+        // Verify the hub index corresponds to hub.ts
+        let hub_idx = idx_to_id.iter().position(|id| id == "file:src/hub.ts").unwrap();
+        assert!(hubs.contains(&hub_idx), "hub.ts index should be in the hub set");
+        assert_eq!(hubs.len(), 1, "Only hub.ts should be a hub");
+    }
+
+    #[test]
+    fn test_identify_hubs_threshold_sensitivity() {
+        // 20 files, one hub imported by 5
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("src/shared.ts"));
+        for i in 0..19 {
+            g.nodes.push(make_file_node(&format!("src/f{}.ts", i)));
+        }
+        for i in 0..5 {
+            g.edges.push(Edge::new(
+                &format!("file:src/f{}.ts", i),
+                "file:src/shared.ts",
+                "imports",
+            ));
+        }
+
+        let (_, idx_to_id) = build_network(&g);
+
+        // threshold=0.05, min_degree=1 → cutoff = max(ceil(0.05*20), 1) = 1
+        // shared.ts(5) > 1 → hub
+        let hubs_low = identify_hubs(&g, &idx_to_id, 0.05, 1);
+        assert!(!hubs_low.is_empty(), "Low threshold should catch shared.ts");
+
+        // threshold=0.5 → cutoff = max(ceil(0.5*20), 1) = 10 → shared.ts(5) <= 10 → not a hub
+        let hubs_high = identify_hubs(&g, &idx_to_id, 0.5, 1);
+        assert!(hubs_high.is_empty(), "High threshold should not catch shared.ts with in_degree=5");
+    }
+
+    #[test]
+    fn test_hub_exclusion_produces_cleaner_clusters() {
+        // Two domain clusters connected only through a shared hub
+        let mut g = Graph::default();
+
+        // Domain A: 4 tightly connected files
+        let domain_a = ["src/auth/login.ts", "src/auth/logout.ts", "src/auth/session.ts", "src/auth/token.ts"];
+        for p in &domain_a {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..domain_a.len() {
+            for j in 0..domain_a.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", domain_a[i]),
+                        &format!("file:{}", domain_a[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // Domain B: 4 tightly connected files
+        let domain_b = ["src/db/pool.ts", "src/db/query.ts", "src/db/migrate.ts", "src/db/schema.ts"];
+        for p in &domain_b {
+            g.nodes.push(make_file_node(p));
+        }
+        for i in 0..domain_b.len() {
+            for j in 0..domain_b.len() {
+                if i != j {
+                    g.edges.push(Edge::new(
+                        &format!("file:{}", domain_b[i]),
+                        &format!("file:{}", domain_b[j]),
+                        "calls",
+                    ));
+                }
+            }
+        }
+
+        // Hub file imported by ALL 8 domain files
+        g.nodes.push(make_file_node("src/utils/ink.ts"));
+        for p in domain_a.iter().chain(domain_b.iter()) {
+            g.edges.push(Edge::new(
+                &format!("file:{}", p),
+                "file:src/utils/ink.ts",
+                "imports",
+            ));
+        }
+
+        // With hub exclusion enabled (threshold=0.05, min_degree=5 to only catch ink.ts
+        // which has in-degree=8, not the domain files with in-degree=3)
+        let config_with = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 2,
+            hub_exclusion_threshold: 0.05,
+            hub_min_degree: 5,
+            ..Default::default()
+        };
+        let result_with = cluster(&g, &config_with).unwrap();
+
+        // Should have at least 2 domain clusters + 1 infrastructure component = 3+
+        assert!(
+            result_with.metrics.num_communities >= 3,
+            "Hub exclusion should produce at least 3 components (2 domains + 1 infra), got {}",
+            result_with.metrics.num_communities,
+        );
+
+        // Verify infrastructure component exists
+        let infra = result_with.nodes.iter().find(|n| n.id == "infer:component:infrastructure");
+        assert!(infra.is_some(), "Infrastructure component should exist");
+        let infra_node = infra.unwrap();
+        assert_eq!(infra_node.title, "Infrastructure & Shared Utilities");
+
+        // Verify hub file is in infrastructure component
+        let infra_edges: Vec<&Edge> = result_with
+            .edges
+            .iter()
+            .filter(|e| e.from == "infer:component:infrastructure" && e.relation == "contains")
+            .collect();
+        assert_eq!(infra_edges.len(), 1, "Infrastructure should contain exactly 1 hub file");
+        assert_eq!(infra_edges[0].to, "file:src/utils/ink.ts");
+    }
+
+    #[test]
+    fn test_hub_exclusion_disabled() {
+        let mut g = Graph::default();
+        g.nodes.push(make_file_node("src/hub.ts"));
+        for i in 0..10 {
+            g.nodes.push(make_file_node(&format!("src/f{}.ts", i)));
+            g.edges.push(Edge::new(
+                &format!("file:src/f{}.ts", i),
+                "file:src/hub.ts",
+                "imports",
+            ));
+        }
+
+        // threshold=0.0 disables hub exclusion
+        let config = ClusterConfig {
+            seed: 42,
+            num_trials: 10,
+            min_community_size: 1,
+            hub_exclusion_threshold: 0.0,
+            ..Default::default()
+        };
+        let result = cluster(&g, &config).unwrap();
+
+        // No infrastructure component should exist
+        let infra = result.nodes.iter().find(|n| n.id == "infer:component:infrastructure");
+        assert!(infra.is_none(), "Hub exclusion disabled should produce no infrastructure component");
+    }
+
+    #[test]
+    fn test_infra_component_created() {
+        // Verify the infrastructure component has correct metadata
+        let excluded_ids = vec![
+            "file:src/utils/ink.ts".to_string(),
+            "file:src/utils/debug.ts".to_string(),
+        ];
+        let g = Graph::default();
+
+        let (node, edges) = create_infra_component(&excluded_ids, &g);
+
+        assert_eq!(node.id, "infer:component:infrastructure");
+        assert_eq!(node.title, "Infrastructure & Shared Utilities");
+        assert_eq!(node.node_type.as_deref(), Some("component"));
+        assert_eq!(node.source.as_deref(), Some("infer"));
+        assert_eq!(
+            node.metadata.get("size").and_then(|v| v.as_u64()),
+            Some(2),
+        );
+        assert_eq!(
+            node.metadata.get("hub_excluded").and_then(|v| v.as_bool()),
+            Some(true),
+        );
+
+        assert_eq!(edges.len(), 2);
+        for edge in &edges {
+            assert_eq!(edge.from, "infer:component:infrastructure");
+            assert_eq!(edge.relation, "contains");
+        }
+        let edge_targets: Vec<&str> = edges.iter().map(|e| e.to.as_str()).collect();
+        assert!(edge_targets.contains(&"file:src/utils/ink.ts"));
+        assert!(edge_targets.contains(&"file:src/utils/debug.ts"));
     }
 }

@@ -32,6 +32,7 @@ pub use clustering::{
     auto_config, auto_config_with_network, auto_name, auto_name_hierarchical,
     add_co_citation_edges, add_dir_colocation_edges, add_symbol_similarity_edges,
     build_network, cluster, map_to_components, relation_weight, run_clustering,
+    identify_hubs, exclude_hubs_from_network,
     ClusterConfig, ClusterMetrics, ClusterResult, RawCluster,
     WEIGHT_CALLS, WEIGHT_CO_CITATION, WEIGHT_DEPENDS_ON, WEIGHT_DIR_COLOCATION, WEIGHT_IMPORTS,
     WEIGHT_STRUCTURAL, WEIGHT_SYMBOL_SIMILARITY, WEIGHT_TYPE_REF,

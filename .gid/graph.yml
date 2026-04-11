@@ -1,0 +1,438 @@
+# GID Graph: Mega-cluster splitting implementation
+# Feature: Post-hoc sub-clustering for oversized Infomap clusters
+project:
+  name: gid-rs
+  description: Implementing Path A - split_mega_clusters() for handling oversized clusters in infer module
+
+nodes:
+  # ── Component: Feature area ────────────────────────────────────────────
+  - id: comp-infer-clustering
+    title: Infer Clustering Module
+    type: component
+    status: in_progress
+    description: Infomap-based community detection on code graphs with mega-cluster handling
+
+  # ── Feature: The main feature being implemented ────────────────────────
+  - id: feat-mega-cluster-splitting
+    title: Mega-cluster Post-hoc Sub-clustering
+    type: feature
+    status: in_progress
+    description: Add split_mega_clusters() to handle oversized clusters by recursive sub-clustering
+    tags:
+      - p0
+      - clustering
+      - algorithm
+    metadata:
+      threshold_formula: "max(20, file_count / 5)"
+      max_recursion_depth: 3
+      teleportation_rate_subclustering: 0.10
+
+  # ── File nodes: Files to be modified ────────────────────────────────────
+  - id: file-clustering
+    title: crates/gid-core/src/infer/clustering.rs
+    type: file
+    status: in_progress
+    file_path: crates/gid-core/src/infer/clustering.rs
+    lang: rust
+    description: Main clustering implementation - add split_mega_clusters() and supporting code
+
+  - id: file-infer-mod
+    title: crates/gid-core/src/infer/mod.rs
+    type: file
+    status: todo
+    file_path: crates/gid-core/src/infer/mod.rs
+    lang: rust
+    description: Infer module - update config passing if needed
+
+  # ── Task nodes: Implementation tasks ────────────────────────────────────
+  - id: task-add-max-cluster-size-config
+    title: Add max_cluster_size field to ClusterConfig
+    type: task
+    status: todo
+    description: |
+      Add Option<usize> field to ClusterConfig struct.
+      Auto-compute as max(20, file_count / 5) if None.
+      Document the threshold rationale in comments.
+    tags:
+      - p0
+      - config
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      location: "ClusterConfig struct"
+
+  - id: task-implement-split-mega-clusters
+    title: Implement split_mega_clusters() core logic
+    type: task
+    status: todo
+    description: |
+      Create split_mega_clusters() function that:
+      1. Scans all clusters for oversized ones (exceeding max_cluster_size)
+      2. For each oversized cluster:
+         - Extracts subgraph (internal files + internal edges only)
+         - Runs Infomap with higher teleportation rate (0.10)
+         - Replaces original cluster if sub-clustering produces >1 cluster
+         - Stops if subgraph yields only 1 cluster (monolithic)
+      3. Recursively processes sub-results up to max depth (3)
+      4. Returns modified cluster list
+    tags:
+      - p0
+      - algorithm
+      - core-logic
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      estimated_complexity: high
+
+  - id: task-implement-extract-subgraph
+    title: Implement extract_subgraph() helper
+    type: task
+    status: todo
+    description: |
+      Create helper function to extract subgraph from a cluster:
+      - Input: Network, cluster member indices, idx_to_id mapping
+      - Output: New Network containing only internal edges
+      - Keep only edges where both endpoints are in the cluster
+      - Build new idx_to_id mapping for the subgraph
+    tags:
+      - p0
+      - helper
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+
+  - id: task-implement-recursive-split
+    title: Implement recursive splitting with depth limit
+    type: task
+    status: todo
+    description: |
+      Add recursion depth tracking to split_mega_clusters():
+      - Pass current_depth parameter
+      - Stop if depth >= max_depth (3)
+      - Recursively check sub-cluster results
+      - Track and log recursion events
+    tags:
+      - p0
+      - recursion
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+
+  - id: task-integrate-into-cluster-pipeline
+    title: Integrate split_mega_clusters() into cluster() function
+    type: task
+    status: todo
+    description: |
+      Modify cluster() to call split_mega_clusters() after run_clustering()
+      and before map_to_components():
+      - Calculate max_cluster_size from config or auto-compute
+      - Call split_mega_clusters(raw_clusters, net, idx_to_id, max_size, config)
+      - Update cluster metrics if splits occurred
+    tags:
+      - p0
+      - integration
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      location: "cluster() function"
+
+  - id: task-add-logging-diagnostics
+    title: Add diagnostic logging for split events
+    type: task
+    status: todo
+    description: |
+      Add eprintln! diagnostics when splitting occurs:
+      - Log when a mega-cluster is detected
+      - Show before/after cluster counts
+      - Report recursion depth
+      - Show final split statistics
+    tags:
+      - p1
+      - observability
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+
+  - id: task-update-cluster-metrics
+    title: Update ClusterMetrics with split statistics
+    type: task
+    status: todo
+    description: |
+      Add new fields to ClusterMetrics:
+      - mega_clusters_split: usize
+      - split_recursion_max_depth: usize
+      Track these during split_mega_clusters() execution
+    tags:
+      - p1
+      - metrics
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      location: "ClusterMetrics struct"
+
+  # ── Test tasks ──────────────────────────────────────────────────────────
+  - id: task-test-split-mega-cluster
+    title: Write test_split_mega_cluster
+    type: task
+    status: todo
+    description: |
+      Create test that:
+      - Builds a graph with one dense cluster (30+ nodes)
+      - Verifies split_mega_clusters() splits it into multiple clusters
+      - Checks that all original nodes are preserved
+    tags:
+      - p0
+      - testing
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      test_name: test_split_mega_cluster
+
+  - id: task-test-preserves-small-clusters
+    title: Write test_split_preserves_small_clusters
+    type: task
+    status: todo
+    description: |
+      Create test that:
+      - Builds a graph with multiple small clusters (< threshold)
+      - Verifies split_mega_clusters() leaves them untouched
+      - Checks cluster count remains the same
+    tags:
+      - p0
+      - testing
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      test_name: test_split_preserves_small_clusters
+
+  - id: task-test-stops-on-monolith
+    title: Write test_split_stops_on_monolith
+    type: task
+    status: todo
+    description: |
+      Create test that:
+      - Builds a truly monolithic subgraph (one strongly connected component)
+      - Verifies recursion stops (doesn't force-split)
+      - Checks that final cluster is left as-is
+    tags:
+      - p0
+      - testing
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      test_name: test_split_stops_on_monolith
+
+  - id: task-test-max-depth
+    title: Write test_split_max_depth
+    type: task
+    status: todo
+    description: |
+      Create test that:
+      - Builds a graph that would recurse beyond depth 3
+      - Verifies recursion stops at max_depth
+      - Checks that depth limit is respected
+    tags:
+      - p0
+      - testing
+    metadata:
+      file: crates/gid-core/src/infer/clustering.rs
+      test_name: test_split_max_depth
+
+  - id: task-run-existing-tests
+    title: Verify all existing tests pass
+    type: task
+    status: todo
+    description: |
+      Run cargo test -p gid-core to ensure no regressions:
+      - All existing clustering tests pass
+      - No breaking changes to public API
+    tags:
+      - p0
+      - testing
+      - verification
+
+  - id: task-run-clippy
+    title: Run clippy on gid-core
+    type: task
+    status: todo
+    description: |
+      Run cargo clippy -p gid-core and fix any warnings:
+      - No new clippy warnings
+      - Follow Rust best practices
+    tags:
+      - p1
+      - quality
+      - verification
+
+edges:
+  # ── Component contains files ────────────────────────────────────────────
+  - from: file-clustering
+    to: comp-infer-clustering
+    relation: belongs_to
+
+  - from: file-infer-mod
+    to: comp-infer-clustering
+    relation: belongs_to
+
+  # ── Feature implemented by tasks ────────────────────────────────────────
+  - from: task-add-max-cluster-size-config
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-implement-split-mega-clusters
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-implement-extract-subgraph
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-implement-recursive-split
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-integrate-into-cluster-pipeline
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-add-logging-diagnostics
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-update-cluster-metrics
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-test-split-mega-cluster
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-test-preserves-small-clusters
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-test-stops-on-monolith
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-test-max-depth
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-run-existing-tests
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  - from: task-run-clippy
+    to: feat-mega-cluster-splitting
+    relation: implements
+
+  # ── Task dependencies ───────────────────────────────────────────────────
+  # Config must be added first
+  - from: task-implement-split-mega-clusters
+    to: task-add-max-cluster-size-config
+    relation: depends_on
+
+  # Extract subgraph is a helper needed by split logic
+  - from: task-implement-split-mega-clusters
+    to: task-implement-extract-subgraph
+    relation: depends_on
+
+  # Recursive split builds on core split logic
+  - from: task-implement-recursive-split
+    to: task-implement-split-mega-clusters
+    relation: depends_on
+
+  # Integration requires core implementation
+  - from: task-integrate-into-cluster-pipeline
+    to: task-implement-recursive-split
+    relation: depends_on
+
+  # Logging can be added after integration
+  - from: task-add-logging-diagnostics
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  # Metrics update can be done after integration
+  - from: task-update-cluster-metrics
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  # Tests depend on implementation being complete
+  - from: task-test-split-mega-cluster
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  - from: task-test-preserves-small-clusters
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  - from: task-test-stops-on-monolith
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  - from: task-test-max-depth
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  # Verification tasks depend on all tests being written
+  - from: task-run-existing-tests
+    to: task-test-split-mega-cluster
+    relation: depends_on
+
+  - from: task-run-existing-tests
+    to: task-test-preserves-small-clusters
+    relation: depends_on
+
+  - from: task-run-existing-tests
+    to: task-test-stops-on-monolith
+    relation: depends_on
+
+  - from: task-run-existing-tests
+    to: task-test-max-depth
+    relation: depends_on
+
+  # Clippy can run after implementation is complete
+  - from: task-run-clippy
+    to: task-integrate-into-cluster-pipeline
+    relation: depends_on
+
+  # ── Tasks modify files ──────────────────────────────────────────────────
+  - from: task-add-max-cluster-size-config
+    to: file-clustering
+    relation: modifies
+
+  - from: task-implement-split-mega-clusters
+    to: file-clustering
+    relation: modifies
+
+  - from: task-implement-extract-subgraph
+    to: file-clustering
+    relation: modifies
+
+  - from: task-implement-recursive-split
+    to: file-clustering
+    relation: modifies
+
+  - from: task-integrate-into-cluster-pipeline
+    to: file-clustering
+    relation: modifies
+
+  - from: task-add-logging-diagnostics
+    to: file-clustering
+    relation: modifies
+
+  - from: task-update-cluster-metrics
+    to: file-clustering
+    relation: modifies
+
+  - from: task-test-split-mega-cluster
+    to: file-clustering
+    relation: modifies
+
+  - from: task-test-preserves-small-clusters
+    to: file-clustering
+    relation: modifies
+
+  - from: task-test-stops-on-monolith
+    to: file-clustering
+    relation: modifies
+
+  - from: task-test-max-depth
+    to: file-clustering
+    relation: modifies
+
+  # ── Feature relates to component ────────────────────────────────────────
+  - from: feat-mega-cluster-splitting
+    to: comp-infer-clustering
+    relation: enhances
